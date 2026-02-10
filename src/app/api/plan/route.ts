@@ -1,6 +1,8 @@
 import { openai } from "@ai-sdk/openai";
 import { generateText } from "ai";
 
+console.log("OPENAI_API_KEY present:", !!process.env.OPENAI_API_KEY);
+
 // Hackathon-safe: compute tomorrow at 3pm New York (EST in Feb)
 function tomorrowAt3pmNYISO(): string {
   const now = new Date();
