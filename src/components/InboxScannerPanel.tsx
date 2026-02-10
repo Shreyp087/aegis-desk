@@ -251,7 +251,6 @@ export default function InboxScannerPanel({
 
       return {
         id: uid(),
-        raw,
         ...base,
         deadlines,
         ...scored,
