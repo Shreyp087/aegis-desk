@@ -1,0 +1,4 @@
+- [x] Update src/app/page.tsx: Change grid to single column on mobile/tablet, increase height to 90vh, adjust row proportions for larger panels.
+- [x] Modify src/components/CommandPanel.tsx: Remove expand/collapse functionality, make textareas taller (h-48), and ensure inputs are always visible.
+- [x] Add responsive classes for better mobile experience.
+- [x] Test responsiveness on different screen sizes.

@@ -116,7 +116,7 @@ export default function Home() {
       </div>
 
       {activeTab === "inbox" ? (
-        <div className="h-[86vh] min-h-0 overflow-hidden">
+        <div className="min-h-0">
           <PanelFrame
             title="Inbox Scanner"
             subtitle="Manual inbox triage + escalation to the main agent."
@@ -135,8 +135,8 @@ export default function Home() {
         </div>
       ) : (
         <>
-          {/* One dashboard: 3 rows, 2 cols (desktop). No zoom needed. */}
-          <div className="agent-dashboard grid grid-cols-1 lg:grid-cols-2 gap-3 h-[86vh] min-h-0">
+          {/* One dashboard: 3 rows, 2 cols (tablet+). Scrollable. */}
+          <div className="agent-dashboard grid grid-cols-1 md:grid-cols-2 gap-3 min-h-0">
             {/* Row 1 */}
             <PanelFrame
               title="Command + Inputs"
@@ -186,11 +186,11 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Desktop row proportions: make Command/Plan bigger, Research/Ledger smaller */}
+          {/* Desktop row proportions: make Command/Inputs much bigger, others smaller */}
           <style jsx global>{`
             @media (min-width: 1024px) {
               .agent-dashboard {
-                grid-template-rows: 1.5fr 1fr 1.25fr;
+                grid-template-rows: 2.5fr 1fr 1fr;
               }
             }
           `}</style>
