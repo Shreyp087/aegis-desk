@@ -28,6 +28,9 @@ const InboxRequestSchema = z.object({
     .optional(),
 });
 
+const PriorityEnum = z.enum(["high", "medium", "low"]);
+type Priority = z.infer<typeof PriorityEnum>;
+
 const AlertSchema = z.object({
   id: z.string(),
   from: z.string(),
@@ -35,7 +38,7 @@ const AlertSchema = z.object({
   senderDomain: z.string(),
   subject: z.string(),
   priorityScore: z.number().min(0).max(100),
-  priority: z.enum(["high", "medium", "low"]),
+  priority: PriorityEnum,
   riskTags: z.array(z.string()),
   signals: z.array(z.string()),
   suggestedAction: z.string(),
@@ -46,6 +49,8 @@ const AlertSchema = z.object({
     urls: z.array(z.string()),
   }),
 });
+
+type Alert = z.infer<typeof AlertSchema>;
 
 const InboxResponseSchema = z.object({
   ok: z.literal(true),
@@ -104,8 +109,7 @@ const SIGNALS: Array<{
   },
 ];
 
-// Basic extraction helpers
-
+// ---------- Basic extraction helpers ----------
 function senderEmailFromFromHeader(from: string): string {
   const m = from.match(/<([^>]+)>/);
   const email = (m?.[1] || from).trim();
@@ -164,7 +168,6 @@ function extractUrls(raw: string): string[] {
 }
 
 function domainFromFromHeader(from: string): string {
-  // simple: try email inside <>
   const emailMatch = from.match(/<([^>]+)>/);
   const email = (emailMatch?.[1] || from).trim();
   const at = email.indexOf("@");
@@ -198,11 +201,10 @@ function scoreEmail(raw: string, orgDomains: string[]) {
     }
   }
 
-  // Cap + priority label
+  // Cap + priority label (IMPORTANT: annotate to keep literal union)
   score = Math.max(0, Math.min(100, Math.round(score)));
-  const priority = score >= 80 ? "high" : score >= 45 ? "medium" : "low";
+  const priority: Priority = score >= 80 ? "high" : score >= 45 ? "medium" : "low";
 
-  // De-dup tags/signals
   return {
     priorityScore: score,
     priority,
@@ -211,7 +213,7 @@ function scoreEmail(raw: string, orgDomains: string[]) {
   };
 }
 
-// LLM: generate suggested action + draft reply (uses signals & extracted fields)
+// ---------- LLM: generate suggested action + draft reply ----------
 const LLMOutSchema = z.object({
   suggestedAction: z.string(),
   draftReply: z.string(),
@@ -221,7 +223,7 @@ async function llmAssist(args: {
   rawEmail: string;
   from: string;
   subject: string;
-  priority: "high" | "medium" | "low";
+  priority: Priority;
   priorityScore: number;
   riskTags: string[];
   signals: string[];
@@ -264,15 +266,27 @@ ${args.rawEmail}
   return obj.object;
 }
 
-// Connector-ready email getter
+// ---------- Connector-ready email getter ----------
 async function getEmails(input: { mode: "manual" | "gmail"; emails: string[] }) {
   if (input.mode === "manual") return input.emails;
 
   // FUTURE: Gmail integration point (keep shape stable)
-  // - fetch from Gmail API / IMAP / Outlook Graph
-  // - return array of raw email strings
   return [];
 }
+
+type ScoredEmail = {
+  id: string;
+  raw: string;
+  from: string;
+  senderEmail: string;
+  senderDomain: string;
+  subject: string;
+  extracted: { deadlines: string[]; moneyMentions: string[]; urls: string[] };
+  priorityScore: number;
+  priority: Priority;
+  riskTags: string[];
+  signals: string[];
+};
 
 export async function POST(req: Request) {
   try {
@@ -283,31 +297,30 @@ export async function POST(req: Request) {
     const emails = await getEmails({ mode: parsed.mode, emails: parsed.emails });
 
     // Scan + score deterministically first
-    const scored = emails.map((raw, idx) => {
+    const scored: ScoredEmail[] = emails.map((raw, idx) => {
       const subject = extractSubject(raw);
-    //   const from = extractFrom(raw);
-    const from = extractFrom(raw);
-    const senderEmail = senderEmailFromFromHeader(from);
-    const senderDomain = domainFromFromHeader(from);
+      const from = extractFrom(raw);
+      const senderEmail = senderEmailFromFromHeader(from);
+      const senderDomain = domainFromFromHeader(from);
 
       const extracted = {
         deadlines: extractDeadlines(raw),
         moneyMentions: extractMoneyMentions(raw),
         urls: extractUrls(raw),
       };
+
       const s = scoreEmail(raw, orgDomains);
 
       return {
-  id: `email-${idx + 1}`,
-  raw,
-  from,
-  senderEmail,
-  senderDomain,
-  subject,
-  extracted,
-  ...s,
-};
-
+        id: `email-${idx + 1}`,
+        raw,
+        from,
+        senderEmail,
+        senderDomain,
+        subject,
+        extracted,
+        ...s,
+      };
     });
 
     // Sort by priorityScore desc
@@ -316,7 +329,8 @@ export async function POST(req: Request) {
     // LLM assistance only for top N (keeps it fast + cheaper)
     const TOP_N = Math.min(8, scored.length);
 
-    const alerts: any[] = [];
+    const alerts: Alert[] = [];
+
     for (let i = 0; i < TOP_N; i++) {
       const e = scored[i];
       const llm = await llmAssist({
@@ -352,6 +366,8 @@ export async function POST(req: Request) {
       alerts.push({
         id: e.id,
         from: e.from,
+        senderEmail: e.senderEmail || "",
+        senderDomain: e.senderDomain || "",
         subject: e.subject,
         priorityScore: e.priorityScore,
         priority: e.priority,
