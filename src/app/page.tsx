@@ -16,10 +16,12 @@ function PanelFrame({
   title,
   subtitle,
   children,
+  className,
 }: {
   title: string;
   subtitle?: string;
   children: React.ReactNode;
+  className?: string;
 }) {
   return (
     <div className="h-full min-h-0 rounded-2xl border border-neutral-800 bg-neutral-950 flex flex-col overflow-hidden">
@@ -30,7 +32,7 @@ function PanelFrame({
         ) : null}
       </div>
 
-      <div className="min-h-0 flex-1 overflow-auto p-4">{children}</div>
+      <div className={`min-h-0 flex-1 overflow-auto p-4 ${className || ""}`}>{children}</div>
     </div>
   );
 }
@@ -135,12 +137,13 @@ export default function Home() {
         </div>
       ) : (
         <>
-          {/* One dashboard: 3 rows, 2 cols (tablet+). Scrollable. */}
-          <div className="agent-dashboard grid grid-cols-1 md:grid-cols-2 gap-3 min-h-0">
-            {/* Row 1 */}
+          {/* One dashboard: 3 rows. Row 1 full width, Row 2 3 cols, Row 3 full width. */}
+          <div className="agent-dashboard grid grid-cols-1 gap-0 min-h-0">
+            {/* Row 1: Full width Command + Inputs */}
             <PanelFrame
               title="Command + Inputs"
               subtitle="Paste email + doc text, then give one natural-language instruction."
+              className="pb-0"
             >
               <CommandPanel
                 emailText={emailText}
@@ -153,44 +156,47 @@ export default function Home() {
               />
             </PanelFrame>
 
-            <PanelFrame
-              title="Intent Compiler (Plan)"
-              subtitle="What the agent intends to do (step-based, tool-driven)."
-            >
-              <PlanPanel plan={plan} stream={stream} />
-            </PanelFrame>
-
-            {/* Row 2 */}
-            <PanelFrame
-              title="Web Research (Linkup + Redaction)"
-              subtitle="Redacted queries + sources used to ground decisions."
-            >
-              <ResearchPanel research={research} />
-            </PanelFrame>
-
-            <PanelFrame
-              title="Trust Ledger (Replay)"
-              subtitle="Auditable timeline of actions, decisions, and tool calls."
-            >
-              <LedgerPanel ledger={ledger} />
-            </PanelFrame>
-
-            {/* Row 3 (full width) */}
-            <div className="lg:col-span-2 min-h-0">
+            {/* Row 2: 3 parallel columns for panels */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 h-96">
               <PanelFrame
-                title="Outputs (Drafts + Evidence)"
-                subtitle="Final deliverable: verdicts, risks, drafts, and artifacts."
+                title="Intent Compiler (Plan)"
+                subtitle="What the agent intends to do (step-based, tool-driven)."
+                className="pt-0"
               >
-                <OutputPanel stream={stream} outputs={outputs} />
+                <PlanPanel plan={plan} stream={stream} />
+              </PanelFrame>
+
+              <PanelFrame
+                title="Trust Ledger (Replay)"
+                subtitle="Auditable timeline of actions, decisions, and tool calls."
+                className="pt-0"
+              >
+                <LedgerPanel ledger={ledger} />
+              </PanelFrame>
+
+              <PanelFrame
+                title="Web Research (Linkup + Redaction)"
+                subtitle="Redacted queries + sources used to ground decisions."
+                className="pt-0"
+              >
+                <ResearchPanel research={research} />
               </PanelFrame>
             </div>
+
+            {/* Row 3: Full width Output */}
+            <PanelFrame
+              title="Outputs (Drafts + Evidence)"
+              subtitle="Final deliverable: verdicts, risks, drafts, and artifacts."
+            >
+              <OutputPanel stream={stream} outputs={outputs} />
+            </PanelFrame>
           </div>
 
-          {/* Desktop row proportions: make Command/Inputs much bigger, others smaller */}
+          {/* Desktop row proportions: Command/Inputs larger, panels equal, Output smaller */}
           <style jsx global>{`
             @media (min-width: 1024px) {
               .agent-dashboard {
-                grid-template-rows: 2.5fr 1fr 1fr;
+                grid-template-rows: 3fr 1fr 1fr;
               }
             }
           `}</style>

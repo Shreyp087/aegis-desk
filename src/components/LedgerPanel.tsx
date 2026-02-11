@@ -5,7 +5,7 @@ export default function LedgerPanel({ ledger }: any) {
         Timeline of what the agent did and why.
       </div>
 
-      <div className="min-h-0 flex-1 overflow-auto space-y-3">
+      <div className="min-h-0 flex-1 overflow-auto space-y-3 max-h-96">
         {ledger.length === 0 ? (
           <div className="text-neutral-500 text-sm">No ledger events yet.</div>
         ) : (
@@ -22,7 +22,7 @@ export default function LedgerPanel({ ledger }: any) {
                   {e.stepId ? `Step ${e.stepId}` : ""}
                 </span>
               </div>
-              <div className="mt-2 text-sm text-neutral-200">{e.message}</div>
+              <div className="mt-2 text-sm text-neutral-200 break-all">{e.message}</div>
             </div>
           ))
         )}

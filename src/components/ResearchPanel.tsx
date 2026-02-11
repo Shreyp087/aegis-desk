@@ -5,7 +5,7 @@ export default function ResearchPanel({ research }: any) {
         Shows what was redacted and what was searched.
       </div>
 
-      <div className="min-h-0 flex-1 overflow-auto space-y-3">
+      <div className="min-h-0 flex-1 overflow-auto space-y-3 max-h-96">
         {research.length === 0 ? (
           <div className="text-neutral-500 text-sm">No research events yet.</div>
         ) : (
@@ -22,7 +22,7 @@ export default function ResearchPanel({ research }: any) {
               </div>
 
               {e.data ? (
-                <pre className="mt-2 text-sm leading-relaxed whitespace-pre-wrap font-mono text-neutral-200">
+                <pre className="mt-2 text-sm leading-relaxed whitespace-pre-wrap font-mono text-neutral-200 break-all">
                   {JSON.stringify(e.data, null, 2)}
                 </pre>
               ) : null}

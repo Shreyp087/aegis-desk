@@ -10,13 +10,13 @@ export default function CommandPanel({
   onRun,
 }: any) {
   return (
-    <div className="h-full min-h-0 rounded-xl border border-neutral-800 bg-neutral-950 p-3 flex flex-col">
+    <div className="h-full min-h-0 flex flex-col">
       {/* Header */}
-      <div className="flex items-start justify-between mb-3">
+      <div className="flex items-start justify-between mb-3 px-4 py-3 border-b border-neutral-800">
         <div>
           <div className="font-semibold text-sm">Command + Inputs</div>
           <div className="text-xs text-neutral-500">
-            Always expanded for easy input
+            Paste email + doc text, then give one natural-language instruction.
           </div>
         </div>
         <button
@@ -27,50 +27,40 @@ export default function CommandPanel({
         </button>
       </div>
 
-      {/* Content (fit all inputs without scrolling) */}
-      <div className="space-y-3">
-        {/* EMAIL CARD */}
-        <div className="rounded-xl border border-neutral-800 bg-neutral-900/40">
-          <div className="px-3 py-2 border-b border-neutral-800">
-            <div className="text-xs text-neutral-300 font-semibold">Email</div>
-          </div>
-          <div className="px-3 py-2">
+      {/* Content: 2 sub-rows */}
+      <div className="flex-1 min-h-0 p-4 pb-0 space-y-2">
+        {/* Sub-row 1: 2 columns for Email and Doc */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {/* Email */}
+          <div className="flex flex-col">
+            <label className="block text-xs text-neutral-300 font-semibold mb-2">
+              Email
+            </label>
             <textarea
-              className="w-full p-2 rounded-lg bg-neutral-950 border border-neutral-800 h-48 resize-none focus:outline-none focus:ring-1 focus:ring-neutral-600 text-sm"
+              className="flex-1 min-h-[300px] p-2 rounded-lg bg-neutral-950 border border-neutral-800 resize-none focus:outline-none focus:ring-1 focus:ring-neutral-600 text-sm"
               value={emailText}
               onChange={(e) => setEmailText(e.target.value)}
               placeholder="Paste email thread here..."
             />
-            <div className="mt-1 text-[11px] text-neutral-500">
-              Tip: include sender + subject lines for better entity extraction.
-            </div>
           </div>
-        </div>
 
-        {/* DOCUMENT CARD */}
-        <div className="rounded-xl border border-neutral-800 bg-neutral-900/40">
-          <div className="px-3 py-2 border-b border-neutral-800">
-            <div className="text-xs text-neutral-300 font-semibold">
-              Document text
-              <span className="text-neutral-500 font-normal"> (PDF pasted for MVP)</span>
-            </div>
-          </div>
-          <div className="px-3 py-2">
+          {/* Document */}
+          <div className="flex flex-col">
+            <label className="block text-xs text-neutral-300 font-semibold mb-2">
+              Document text <span className="text-neutral-500 font-normal">(PDF pasted for MVP)</span>
+            </label>
             <textarea
-              className="w-full p-2 rounded-lg bg-neutral-950 border border-neutral-800 h-48 resize-none focus:outline-none focus:ring-1 focus:ring-neutral-600 text-sm"
+              className="flex-1 min-h-[300px] p-2 rounded-lg bg-neutral-950 border border-neutral-800 resize-none focus:outline-none focus:ring-1 focus:ring-neutral-600 text-sm"
               value={docText}
               onChange={(e) => setDocText(e.target.value)}
               placeholder="Paste report / attachment text here..."
             />
-            <div className="mt-1 text-[11px] text-neutral-500">
-              Tip: paste only the relevant excerpt to keep latency low.
-            </div>
           </div>
         </div>
 
-        {/* COMMAND */}
-        <div className="rounded-xl border border-neutral-800 bg-neutral-900/40 px-3 py-2">
-          <label className="block text-xs text-neutral-300 font-semibold mb-1">
+        {/* Sub-row 2: Full width Command */}
+        <div className="flex flex-col">
+          <label className="block text-xs text-neutral-300 font-semibold mb-2">
             Command
           </label>
           <input

@@ -343,7 +343,7 @@ export default function InboxScannerPanel({
   return (
     <div className="h-full min-h-0 flex flex-col gap-3">
       {/* Input */}
-      <div className="rounded-xl border border-neutral-800 bg-neutral-950 p-3">
+      <div className="rounded-xl border border-neutral-800 bg-neutral-950 p-3 flex flex-col">
         <div className="flex items-center justify-between gap-2 mb-2">
           <div className="font-semibold">Inbox Scanner</div>
           <button
@@ -361,7 +361,7 @@ export default function InboxScannerPanel({
         </div>
 
         <textarea
-          className="w-full p-3 rounded-lg bg-neutral-900 border border-neutral-800 min-h-[150px] text-sm"
+          className="w-full p-3 rounded-lg bg-neutral-900 border border-neutral-800 flex-1 text-sm"
           value={rawInbox}
           onChange={(e) => setRawInbox(e.target.value)}
           placeholder={`From: alice@vendor.com
@@ -430,7 +430,7 @@ From: ...`}
       {/* List */}
       <div className="min-h-0 flex-1 grid grid-cols-1 lg:grid-cols-2 gap-3">
         {/* Left: list */}
-        <div className="min-h-0 overflow-auto rounded-xl border border-neutral-800 bg-neutral-950">
+        <div className="min-h-0 overflow-auto rounded-xl border border-neutral-800 bg-neutral-950 max-h-96">
           {filtered.length === 0 ? (
             <div className="p-4 text-sm text-neutral-500">No emails in this category.</div>
           ) : (
@@ -494,7 +494,7 @@ From: ...`}
         </div>
 
         {/* Right: detail */}
-        <div className="min-h-0 overflow-auto rounded-xl border border-neutral-800 bg-neutral-950 p-4">
+        <div className="min-h-0 overflow-auto rounded-xl border border-neutral-800 bg-neutral-950 p-4 max-h-96">
           {!expandedId ? (
             <div className="text-sm text-neutral-500">Select an email to view details.</div>
           ) : (
@@ -548,7 +548,7 @@ From: ...`}
 
                   <div className="rounded-xl border border-neutral-800 bg-neutral-900/40 p-3">
                     <div className="text-sm font-semibold mb-2">Email body</div>
-                    <pre className="text-sm whitespace-pre-wrap leading-relaxed text-neutral-200">
+                    <pre className="text-sm whitespace-pre-wrap leading-relaxed text-neutral-200 break-all">
                       {e.body || "(No body)"}
                     </pre>
                   </div>
