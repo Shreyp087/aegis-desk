@@ -17,22 +17,27 @@ function PanelFrame({
   subtitle,
   children,
   className,
+  actionButton,
 }: {
   title: string;
   subtitle?: string;
   children: React.ReactNode;
   className?: string;
+  actionButton?: React.ReactNode;
 }) {
   return (
-    <div className="h-full min-h-0 rounded-2xl border border-neutral-800 bg-neutral-950 flex flex-col overflow-hidden">
-      <div className="px-4 py-3 border-b border-neutral-800">
-        <div className="text-base font-semibold truncate">{title}</div>
-        {subtitle ? (
-          <div className="text-sm text-neutral-500 truncate">{subtitle}</div>
-        ) : null}
+    <div className="h-full min-h-0 rounded-2xl border border-white/10 bg-white/5 backdrop-blur-md flex flex-col overflow-hidden shadow-xl hover:shadow-2xl transition-shadow duration-300">
+      <div className="px-5 py-4 border-b border-white/10 flex items-center justify-between bg-gradient-to-r from-white/5 to-transparent">
+        <div>
+          <div className="text-base font-semibold truncate bg-gradient-to-r from-white to-neutral-300 bg-clip-text text-transparent">{title}</div>
+          {subtitle ? (
+            <div className="text-sm text-neutral-400 truncate">{subtitle}</div>
+          ) : null}
+        </div>
+        {actionButton}
       </div>
 
-      <div className={`min-h-0 flex-1 overflow-auto p-4 ${className || ""}`}>{children}</div>
+      <div className={`min-h-0 flex-1 overflow-auto p-5 ${className || ""}`}>{children}</div>
     </div>
   );
 }
@@ -86,15 +91,15 @@ export default function Home() {
   return (
     <DesktopShell>
       {/* Tabs */}
-      <div className="flex items-center justify-between mb-3">
-        <div className="flex gap-2">
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex gap-3 p-1.5 bg-white/5 backdrop-blur-md rounded-2xl border border-white/10">
           <button
             type="button"
             onClick={() => setActiveTab("agent")}
-            className={`px-3 py-2 rounded-xl text-sm border transition ${
+            className={`px-5 py-2.5 rounded-xl text-sm font-medium transition-all duration-300 ${
               activeTab === "agent"
-                ? "bg-white text-black border-white"
-                : "bg-neutral-950 text-neutral-200 border-neutral-800 hover:bg-neutral-900"
+                ? "bg-white text-black shadow-lg shadow-white/20"
+                : "text-neutral-300 hover:text-white hover:bg-white/10"
             }`}
           >
             Agent
@@ -102,17 +107,17 @@ export default function Home() {
           <button
             type="button"
             onClick={() => setActiveTab("inbox")}
-            className={`px-3 py-2 rounded-xl text-sm border transition ${
+            className={`px-5 py-2.5 rounded-xl text-sm font-medium transition-all duration-300 ${
               activeTab === "inbox"
-                ? "bg-white text-black border-white"
-                : "bg-neutral-950 text-neutral-200 border-neutral-800 hover:bg-neutral-900"
+                ? "bg-white text-black shadow-lg shadow-white/20"
+                : "text-neutral-300 hover:text-white hover:bg-white/10"
             }`}
           >
             Inbox Scanner
           </button>
         </div>
 
-        <div className="hidden md:block text-sm text-neutral-500">
+        <div className="hidden md:block text-sm text-neutral-400 bg-white/5 px-4 py-2 rounded-full border border-white/10 backdrop-blur-sm">
           Demo flow: Inbox → Escalate → Agent executes plan + Linkup evidence.
         </div>
       </div>
@@ -138,12 +143,27 @@ export default function Home() {
       ) : (
         <>
           {/* One dashboard: 3 rows. Row 1 full width, Row 2 3 cols, Row 3 full width. */}
-          <div className="agent-dashboard grid grid-cols-1 gap-0 min-h-0">
+          <div className="agent-dashboard gap-2 min-h-0">
             {/* Row 1: Full width Command + Inputs */}
             <PanelFrame
               title="Command + Inputs"
               subtitle="Paste email + doc text, then give one natural-language instruction."
               className="pb-0"
+              actionButton={
+                <button
+                  onClick={runAgent}
+                  className="group px-4 py-3 rounded-xl bg-gradient-to-r from-white to-neutral-100 text-black font-bold hover:from-neutral-100 hover:to-white shadow-lg hover:shadow-xl active:scale-95 active:shadow-md cursor-pointer transition-all duration-200 text-sm flex items-center gap-2"
+                >
+                  <span>Run Agent</span>
+                  <svg 
+                    className="w-4 h-4 opacity-0 group-hover:opacity-100 transition-opacity duration-200" 
+                    fill="currentColor" 
+                    viewBox="0 0 24 24"
+                  >
+                    <path d="M21 10.5c0-1.5-1-2.5-2.5-2.5h-1.5v-2c0-1.5-1-2.5-2.5-2.5s-2.5 1-2.5 2.5v6.5l-2.2-1.1c-.5-.3-1.1-.3-1.6 0l-5.2 2.6c-.8.4-1.1 1.3-.7 2.1.4.8 1.3 1.1 2.1.7l4.6-2.3 3.5 1.8c.3.1.6.2.9.2h4c1.5 0 2.5-1 2.5-2.5v-5z"/>
+                  </svg>
+                </button>
+              }
             >
               <CommandPanel
                 emailText={emailText}

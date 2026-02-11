@@ -7,22 +7,22 @@ export default function LedgerPanel({ ledger }: any) {
 
       <div className="min-h-0 flex-1 overflow-auto space-y-3 max-h-96">
         {ledger.length === 0 ? (
-          <div className="text-neutral-500 text-sm">No ledger events yet.</div>
+          <div className="text-neutral-500 text-sm italic">No ledger events yet.</div>
         ) : (
           ledger.map((e: any, idx: number) => (
             <div
               key={idx}
-              className="rounded-xl border border-neutral-800 bg-neutral-900/40 p-3"
+              className="rounded-xl border border-white/10 bg-white/5 backdrop-blur-sm p-4 hover:bg-white/10 transition-all duration-300 shadow-sm hover:shadow-md"
             >
               <div className="flex items-center gap-2">
-                <span className="text-xs px-2 py-1 rounded-full border border-neutral-700 text-neutral-300">
+                <span className="text-xs px-3 py-1 rounded-full border border-blue-500/30 bg-blue-500/10 text-blue-300 font-medium">
                   {e.type}
                 </span>
                 <span className="text-sm text-neutral-200 font-semibold">
                   {e.stepId ? `Step ${e.stepId}` : ""}
                 </span>
               </div>
-              <div className="mt-2 text-sm text-neutral-200 break-all">{e.message}</div>
+              <div className="mt-2 text-sm text-neutral-300 break-all leading-relaxed">{e.message}</div>
             </div>
           ))
         )}

@@ -5,8 +5,8 @@ export default function PlanPanel({ plan }: any) {
         Step-based plan generated from your command.
       </div>
 
-      <div className="min-h-0 flex-1 overflow-auto rounded-xl border border-neutral-800 bg-neutral-900/40 p-3 max-h-96">
-         <pre className="text-sm leading-relaxed whitespace-pre-wrap font-mono break-all">
+      <div className="min-h-0 flex-1 overflow-auto rounded-xl border border-white/10 bg-white/5 backdrop-blur-sm p-4 max-h-96 shadow-inner">
+         <pre className="text-sm leading-relaxed whitespace-pre-wrap font-mono break-all text-neutral-300">
           {plan ? JSON.stringify(plan, null, 2) : "Plan will appear here after you run the agent."}
         </pre>
     

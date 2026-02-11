@@ -333,10 +333,10 @@ export default function InboxScannerPanel({
   }, [emails, activeFilter]);
 
   function pillClass(active: boolean) {
-    return `text-xs px-3 py-1 rounded-full border transition ${
+    return `text-xs px-3 py-1.5 rounded-full border transition-all duration-300 ${
       active
-        ? "bg-white text-black border-white"
-        : "bg-neutral-950 text-neutral-200 border-neutral-800 hover:bg-neutral-900"
+        ? "bg-white text-black border-white shadow-lg shadow-white/20"
+        : "bg-white/5 text-neutral-300 border-white/10 hover:bg-white/10 hover:text-white"
     }`;
   }
 
