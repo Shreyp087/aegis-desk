@@ -37,7 +37,7 @@ function PanelFrame({
         {actionButton}
       </div>
 
-      <div className={`min-h-0 flex-1 overflow-auto p-5 ${className || ""}`}>{children}</div>
+      <div className={`min-h-0 flex-1 p-5 ${className || ""}`}>{children}</div>
     </div>
   );
 }
@@ -56,6 +56,10 @@ export default function Home() {
   const [ledger, setLedger] = useState<any[]>([]);
   const [research, setResearch] = useState<any[]>([]);
   const [outputs, setOutputs] = useState<any>(null);
+
+  const [expandedPlan, setExpandedPlan] = useState(false);
+  const [expandedLedger, setExpandedLedger] = useState(false);
+  const [expandedResearch, setExpandedResearch] = useState(false);
 
   async function runAgent() {
     setStream("");
@@ -175,33 +179,67 @@ export default function Home() {
                 onRun={runAgent}
               />
             </PanelFrame>
-
+              <br></br>
             {/* Row 2: 3 parallel columns for panels */}
             <div className="grid grid-cols-1 md:grid-cols-3 gap-3 h-96">
               <PanelFrame
                 title="Intent Compiler (Plan)"
                 subtitle="What the agent intends to do (step-based, tool-driven)."
                 className="pt-0"
+                actionButton={
+                  <button
+                    onClick={() => setExpandedPlan(!expandedPlan)}
+                    className="text-neutral-400 hover:text-white transition-colors duration-200"
+                  >
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={expandedPlan ? "M6 18L18 6M6 6l12 12" : "M4 8V4m0 0h4m-4 0l5 5m11-1V4m0 0h-4m4 0l-5 5"} />
+                    </svg>
+                  </button>
+                }
               >
-                <PlanPanel plan={plan} stream={stream} />
+                <PlanPanel plan={plan} stream={stream} expanded={expandedPlan} />
               </PanelFrame>
 
               <PanelFrame
                 title="Trust Ledger (Replay)"
                 subtitle="Auditable timeline of actions, decisions, and tool calls."
                 className="pt-0"
+                actionButton={
+                  <button
+                    onClick={() => setExpandedLedger(!expandedLedger)}
+                    className="text-neutral-400 hover:text-white transition-colors duration-200"
+                    title={expandedLedger ? "Collapse Ledger Panel" : "Expand Ledger Panel"}
+                  >
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={expandedLedger ? "M6 18L18 6M6 6l12 12" : "M4 8V4m0 0h4m-4 0l5 5m11-1V4m0 0h-4m4 0l-5 5"} />
+                    </svg>
+                  </button>
+                }
               >
-                <LedgerPanel ledger={ledger} />
+                <LedgerPanel ledger={ledger} expanded={expandedLedger} />
               </PanelFrame>
 
               <PanelFrame
                 title="Web Research (Linkup + Redaction)"
                 subtitle="Redacted queries + sources used to ground decisions."
                 className="pt-0"
+                actionButton={
+                  <button
+                    onClick={() => setExpandedResearch(!expandedResearch)}
+                    className="text-neutral-400 hover:text-white transition-colors duration-200"
+                    title={expandedResearch ? "Collapse Research Panel" : "Expand Research Panel"}
+                  >
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={expandedResearch ? "M6 18L18 6M6 6l12 12" : "M4 8V4m0 0h4m-4 0l5 5m11-1V4m0 0h-4m4 0l-5 5"} />
+                    </svg>
+                  </button>
+                }
               >
-                <ResearchPanel research={research} />
+                <ResearchPanel research={research} expanded={expandedResearch} />
               </PanelFrame>
             </div>
+
+              <br></br>
 
             {/* Row 3: Full width Output */}
             <PanelFrame

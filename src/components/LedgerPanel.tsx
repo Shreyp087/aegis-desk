@@ -1,11 +1,11 @@
-export default function LedgerPanel({ ledger }: any) {
+export default function LedgerPanel({ ledger, expanded }: any) {
   return (
     <div className="h-full min-h-0 flex flex-col gap-3">
       <div className="text-sm text-neutral-400">
         Timeline of what the agent did and why.
       </div>
 
-      <div className="min-h-0 flex-1 overflow-auto space-y-3 max-h-96">
+      <div className={`min-h-0 flex-1 overflow-auto space-y-3 ${expanded ? 'max-h-none' : 'max-h-96'}`}>
         {ledger.length === 0 ? (
           <div className="text-neutral-500 text-sm italic">No ledger events yet.</div>
         ) : (
