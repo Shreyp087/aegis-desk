@@ -1,5 +1,14 @@
 "use client";
 
+type CommandPanelProps = {
+  emailText: string;
+  setEmailText: (value: string) => void;
+  docText: string;
+  setDocText: (value: string) => void;
+  command: string;
+  setCommand: (value: string) => void;
+};
+
 export default function CommandPanel({
   emailText,
   setEmailText,
@@ -7,8 +16,7 @@ export default function CommandPanel({
   setDocText,
   command,
   setCommand,
-  onRun,
-}: any) {
+}: CommandPanelProps) {
   return (
     <div className="h-full min-h-0 flex flex-col">
       {/* Content: 2 sub-rows */}

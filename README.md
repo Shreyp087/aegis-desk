@@ -4,6 +4,35 @@ This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-
 
 For testing and demonstration purposes, you can use the provided [sample input file](./samples/sample_input.txt) which contains example email data to simulate inbox scanning functionality.
 
+## Gmail Inbox Connection
+
+The Inbox Scanner now supports direct Gmail connection (OAuth) and server-side scan with:
+- deterministic risk/priority scoring
+- uncertainty percentage per email
+- suggested action + reply draft
+
+### Required environment variables
+
+Add these to `.env.local`:
+
+```bash
+GOOGLE_CLIENT_ID=your_google_oauth_client_id
+GOOGLE_CLIENT_SECRET=your_google_oauth_client_secret
+GOOGLE_REDIRECT_URI=http://localhost:3000/api/inbox/gmail/callback
+```
+
+Also ensure your Google Cloud OAuth client has:
+- Authorized redirect URI: `http://localhost:3000/api/inbox/gmail/callback`
+- Gmail API enabled
+- Scope allowed: `https://www.googleapis.com/auth/gmail.readonly`
+
+### Flow
+
+1. Open the Inbox Scanner tab.
+2. Click `Connect Gmail`.
+3. Complete Google consent.
+4. Select `Gmail` mode and click `Scan Inbox`.
+
 ## Getting Started
 
 First, run the development server:

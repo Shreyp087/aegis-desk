@@ -50,18 +50,25 @@ export default function Home() {
   const [command, setCommand] = useState(
     "Summarize, verify key claims with sources, draft a reply, and create a follow-up meeting invite."
   );
-  const [plan, setPlan] = useState<any>(null);
+  const [plan, setPlan] = useState<Record<string, unknown> | null>(null);
 
   const [stream, setStream] = useState<string>("");
-  const [ledger, setLedger] = useState<any[]>([]);
-  const [research, setResearch] = useState<any[]>([]);
-  const [outputs, setOutputs] = useState<any>(null);
+  const [ledger, setLedger] = useState<Array<Record<string, unknown>>>([]);
+  const [research, setResearch] = useState<Array<Record<string, unknown>>>([]);
+  const [outputs, setOutputs] = useState<unknown>(null);
 
   const [expandedPlan, setExpandedPlan] = useState(false);
   const [expandedLedger, setExpandedLedger] = useState(false);
   const [expandedResearch, setExpandedResearch] = useState(false);
+  const canRunAgent = emailText.trim().length > 0 && command.trim().length > 0;
 
   async function runAgent() {
+    if (!canRunAgent) {
+      setOutputs(null);
+      setStream("Run Agent requires both Email and Command.");
+      return;
+    }
+
     setStream("");
     setLedger([]);
     setResearch([]);
@@ -75,7 +82,7 @@ export default function Home() {
     });
     const planData = await planRes.json();
     if (!planData.ok) {
-      setStream(JSON.stringify(planData, null, 2));
+      setStream(planData?.detail || planData?.error || "Plan failed.");
       return;
     }
     setPlan(planData.plan);
@@ -87,9 +94,15 @@ export default function Home() {
     });
 
     const runData = await runRes.json();
+    if (!runRes.ok || !runData?.ok) {
+      setStream(runData?.detail || runData?.error || "Run failed.");
+      return;
+    }
+
     setLedger(runData.ledger || []);
     setResearch(runData.research || []);
-    setStream(JSON.stringify(runData.final || runData, null, 2));
+    setOutputs(runData.final || null);
+    setStream("");
   }
 
   return (
@@ -156,7 +169,9 @@ export default function Home() {
               actionButton={
                 <button
                   onClick={runAgent}
-                  className="group px-4 py-3 rounded-xl bg-gradient-to-r from-white to-neutral-100 text-black font-bold hover:from-neutral-100 hover:to-white shadow-lg hover:shadow-xl active:scale-95 active:shadow-md cursor-pointer transition-all duration-200 text-sm flex items-center gap-2"
+                  disabled={!canRunAgent}
+                  title={!canRunAgent ? "Add Email and Command to run the agent." : "Run Agent"}
+                  className="group px-4 py-3 rounded-xl bg-gradient-to-r from-white to-neutral-100 text-black font-bold hover:from-neutral-100 hover:to-white shadow-lg hover:shadow-xl active:scale-95 active:shadow-md cursor-pointer transition-all duration-200 text-sm flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:from-white disabled:hover:to-neutral-100"
                 >
                   <span>Run Agent</span>
                   <svg 
@@ -176,7 +191,6 @@ export default function Home() {
                 setDocText={setDocText}
                 command={command}
                 setCommand={setCommand}
-                onRun={runAgent}
               />
             </PanelFrame>
               <br></br>
