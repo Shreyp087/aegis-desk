@@ -1,5 +1,6 @@
 import { openai } from "@ai-sdk/openai";
 import { generateText } from "ai";
+import { getOfflineRuntimeConfig, isOfflineEnforced } from "@/lib/offline";
 
 console.log("OPENAI_API_KEY present:", !!process.env.OPENAI_API_KEY);
 
@@ -18,6 +19,19 @@ function tomorrowAt3pmNYISO(): string {
 
 export async function POST(req: Request) {
   try {
+    const offline = getOfflineRuntimeConfig();
+    if (isOfflineEnforced(offline)) {
+      return Response.json(
+        {
+          error: "Offline mode enforced",
+          detail:
+            "Plan generation is disabled in enforced offline mode because it relies on remote model calls.",
+          offlineState: offline.state,
+        },
+        { status: 503 }
+      );
+    }
+
     const { emailText, docText, command } = await req.json();
 
     const fixedMeetingISO = tomorrowAt3pmNYISO();

@@ -5,6 +5,7 @@ import { createICS } from "@/lib/tools/ics";
 import { openai } from "@ai-sdk/openai";
 import { generateObject } from "ai";
 import { z } from "zod";
+import { getOfflineRuntimeConfig, isOfflineEnforced } from "@/lib/offline";
 
 const linkup = new LinkupClient({ apiKey: process.env.LINKUP_API_KEY! });
 
@@ -163,6 +164,19 @@ function extractDeadlines(text: string): string[] {
 
 export async function POST(req: Request) {
   try {
+    const offline = getOfflineRuntimeConfig();
+    if (isOfflineEnforced(offline)) {
+      return Response.json(
+        {
+          error: "Offline mode enforced",
+          detail:
+            "Run execution is disabled in enforced offline mode because it depends on remote web/model tools.",
+          offlineState: offline.state,
+        },
+        { status: 503 }
+      );
+    }
+
     const { plan, emailText = "", docText = "", command = "" } = await req.json();
 
     const ledger: any[] = [];

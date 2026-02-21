@@ -67,9 +67,23 @@
 
 import { openai } from "@ai-sdk/openai";
 import { generateText } from "ai";
+import { getOfflineRuntimeConfig, isOfflineEnforced } from "@/lib/offline";
 
 export async function POST(req: Request) {
   try {
+    const offline = getOfflineRuntimeConfig();
+    if (isOfflineEnforced(offline)) {
+      return Response.json(
+        {
+          error: "Offline mode enforced",
+          detail:
+            "Agent endpoint is disabled in enforced offline mode because it relies on remote model calls.",
+          offlineState: offline.state,
+        },
+        { status: 503 }
+      );
+    }
+
     const { emailText, docText, command } = await req.json();
 
     console.log("Agent request received");

@@ -69,39 +69,39 @@ export default function OutputPanel({ stream, outputs }: { stream: string; outpu
 
   return (
     <div className="h-full min-h-0 flex flex-col gap-3">
-      <div className="text-sm text-neutral-400">Readable final output with verification evidence and actions.</div>
+      <div className="panel-note">Readable final output with verification evidence and actions.</div>
 
-      <div className="min-h-0 flex-1 overflow-auto rounded-xl border border-white/10 bg-white/5 backdrop-blur-sm p-4 max-h-96 shadow-inner space-y-4">
+      <div className="scroll-surface min-h-0 flex-1 overflow-auto p-4 max-h-96 space-y-4">
         {!final ? (
-          <div className="text-sm text-neutral-300 whitespace-pre-wrap">
+          <div className="text-sm text-[var(--muted)] whitespace-pre-wrap">
             {stream || "Outputs will appear here after execution."}
           </div>
         ) : (
           <>
-            <section className="rounded-xl border border-white/10 bg-black/20 p-4">
-              <div className="text-sm font-semibold text-white mb-2">Executive Summary</div>
-              <div className="text-sm text-neutral-200 mb-2">{final.summary.email}</div>
-              <div className="text-sm text-neutral-300">{final.summary.document}</div>
+            <section className="output-section p-4">
+              <div className="output-heading text-sm font-semibold mb-2">Executive Summary</div>
+              <div className="text-sm text-[var(--text)] mb-2">{final.summary.email}</div>
+              <div className="text-sm text-[var(--muted)]">{final.summary.document}</div>
               <div className="mt-3 flex flex-wrap gap-2">
                 {(final.summary.deadlines || []).map((deadline) => (
-                  <span key={deadline} className="text-xs px-2 py-1 rounded-full border border-white/15 text-neutral-200">
+                  <span key={deadline} className="meta-pill text-xs px-2 py-1 rounded-full">
                     Deadline: {deadline}
                   </span>
                 ))}
                 {(final.summary.entities || []).map((entity) => (
-                  <span key={entity} className="text-xs px-2 py-1 rounded-full border border-white/15 text-neutral-200">
+                  <span key={entity} className="meta-pill text-xs px-2 py-1 rounded-full">
                     Entity: {entity}
                   </span>
                 ))}
               </div>
             </section>
 
-            <section className="rounded-xl border border-white/10 bg-black/20 p-4">
-              <div className="text-sm font-semibold text-white mb-2">Entity Verification</div>
+            <section className="output-section p-4">
+              <div className="output-heading text-sm font-semibold mb-2">Entity Verification</div>
               <div className="overflow-x-auto">
                 <table className="w-full text-sm border-collapse">
                   <thead>
-                    <tr className="text-left text-neutral-300 border-b border-white/10">
+                    <tr className="text-left text-[var(--muted)] border-b border-[var(--stroke)]">
                       <th className="py-2 pr-3">Entity</th>
                       <th className="py-2 pr-3">Type</th>
                       <th className="py-2 pr-3">Verdict</th>
@@ -111,12 +111,12 @@ export default function OutputPanel({ stream, outputs }: { stream: string; outpu
                   </thead>
                   <tbody>
                     {(final.entityVerdicts || []).map((verdict) => (
-                      <tr key={`${verdict.entity}-${verdict.verdict}`} className="border-b border-white/5 align-top">
-                        <td className="py-2 pr-3 text-neutral-100">{verdict.entity}</td>
-                        <td className="py-2 pr-3 text-neutral-300">{verdict.entityType}</td>
+                      <tr key={`${verdict.entity}-${verdict.verdict}`} className="border-b border-[rgba(255,255,255,0.05)] align-top">
+                        <td className="py-2 pr-3 text-[var(--text)]">{verdict.entity}</td>
+                        <td className="py-2 pr-3 text-[var(--muted)]">{verdict.entityType}</td>
                         <td className={`py-2 pr-3 font-semibold ${verdictClass(verdict.verdict)}`}>{verdict.verdict}</td>
-                        <td className="py-2 pr-3 text-neutral-300">{verdict.uncertaintyPct}%</td>
-                        <td className="py-2 text-neutral-300">{(verdict.redFlags || []).join(", ") || "None"}</td>
+                        <td className="py-2 pr-3 text-[var(--muted)]">{verdict.uncertaintyPct}%</td>
+                        <td className="py-2 text-[var(--muted)]">{(verdict.redFlags || []).join(", ") || "None"}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -124,12 +124,12 @@ export default function OutputPanel({ stream, outputs }: { stream: string; outpu
               </div>
             </section>
 
-            <section className="rounded-xl border border-white/10 bg-black/20 p-4">
-              <div className="text-sm font-semibold text-white mb-2">Contract Risks</div>
+            <section className="output-section p-4">
+              <div className="output-heading text-sm font-semibold mb-2">Contract Risks</div>
               <div className="overflow-x-auto">
                 <table className="w-full text-sm border-collapse">
                   <thead>
-                    <tr className="text-left text-neutral-300 border-b border-white/10">
+                    <tr className="text-left text-[var(--muted)] border-b border-[var(--stroke)]">
                       <th className="py-2 pr-3">Risk</th>
                       <th className="py-2 pr-3">Severity</th>
                       <th className="py-2 pr-3">Why It Matters</th>
@@ -138,15 +138,15 @@ export default function OutputPanel({ stream, outputs }: { stream: string; outpu
                   </thead>
                   <tbody>
                     {(final.contractRisks || []).map((risk, idx) => (
-                      <tr key={`${risk.risk}-${idx}`} className="border-b border-white/5 align-top">
-                        <td className="py-2 pr-3 text-neutral-100">{risk.risk}</td>
+                      <tr key={`${risk.risk}-${idx}`} className="border-b border-[rgba(255,255,255,0.05)] align-top">
+                        <td className="py-2 pr-3 text-[var(--text)]">{risk.risk}</td>
                         <td className="py-2 pr-3">
                           <span className={`text-xs px-2 py-1 rounded-full border ${severityClass(risk.severity)}`}>
                             {risk.severity}
                           </span>
                         </td>
-                        <td className="py-2 pr-3 text-neutral-300">{risk.whyItMatters}</td>
-                        <td className="py-2 text-neutral-300">{risk.suggestedEdit}</td>
+                        <td className="py-2 pr-3 text-[var(--muted)]">{risk.whyItMatters}</td>
+                        <td className="py-2 text-[var(--muted)]">{risk.suggestedEdit}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -154,22 +154,22 @@ export default function OutputPanel({ stream, outputs }: { stream: string; outpu
               </div>
             </section>
 
-            <section className="rounded-xl border border-white/10 bg-black/20 p-4">
-              <div className="text-sm font-semibold text-white mb-1">Reply Draft</div>
-              <div className="text-xs text-neutral-400 mb-2">Subject: {final.replyDraft?.subject || "(No subject)"}</div>
-              <pre className="text-sm whitespace-pre-wrap leading-relaxed text-neutral-200">
+            <section className="output-section p-4">
+              <div className="output-heading text-sm font-semibold mb-1">Reply Draft</div>
+              <div className="text-xs text-[var(--muted)] mb-2">Subject: {final.replyDraft?.subject || "(No subject)"}</div>
+              <pre className="text-sm whitespace-pre-wrap leading-relaxed text-[var(--text)]">
                 {final.replyDraft?.body || "No draft generated."}
               </pre>
             </section>
 
-            <section className="rounded-xl border border-white/10 bg-black/20 p-4">
-              <div className="text-sm font-semibold text-white mb-1">Meeting Invite</div>
-              <div className="text-sm text-neutral-200">Title: {final.meetingInvite?.title || "-"}</div>
-              <div className="text-sm text-neutral-300 mb-2">Time: {final.meetingInvite?.datetimeISO || "-"}</div>
+            <section className="output-section p-4">
+              <div className="output-heading text-sm font-semibold mb-1">Meeting Invite</div>
+              <div className="text-sm text-[var(--text)]">Title: {final.meetingInvite?.title || "-"}</div>
+              <div className="text-sm text-[var(--muted)] mb-2">Time: {final.meetingInvite?.datetimeISO || "-"}</div>
               <button
                 type="button"
                 onClick={() => navigator.clipboard.writeText(final.meetingInvite?.ics || "")}
-                className="px-3 py-1.5 rounded-lg border border-white/15 hover:bg-white/10 text-sm"
+                className="secondary-ghost px-3 py-1.5 rounded-lg text-sm"
               >
                 Copy ICS
               </button>

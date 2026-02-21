@@ -53,14 +53,18 @@ type GmailHeader = {
 
 type GmailPart = {
   mimeType?: string;
+  filename?: string;
   body?: {
     data?: string;
+    attachmentId?: string;
   };
   parts?: GmailPart[];
   headers?: GmailHeader[];
 };
 
 type GmailMessage = {
+  id?: string;
+  threadId?: string;
   snippet?: string;
   payload?: GmailPart;
 };
@@ -297,6 +301,18 @@ function collectBodyText(part?: GmailPart): { plain: string[]; html: string[] } 
   return { plain, html };
 }
 
+function collectAttachmentNames(part?: GmailPart): string[] {
+  const out = new Set<string>();
+  const walk = (node?: GmailPart) => {
+    if (!node) return;
+    const name = (node.filename || "").trim();
+    if (name) out.add(name);
+    for (const child of node.parts || []) walk(child);
+  };
+  walk(part);
+  return Array.from(out).slice(0, 12);
+}
+
 function headerValue(headers: GmailHeader[] | undefined, headerName: string): string {
   const match = (headers || []).find((h) => h.name.toLowerCase() === headerName.toLowerCase());
   return (match?.value || "").trim();
@@ -308,7 +324,9 @@ function toRawEmail(message: GmailMessage): string {
   const to = headerValue(headers, "To");
   const subject = headerValue(headers, "Subject") || "(No subject)";
   const date = headerValue(headers, "Date");
+  const threadId = (message.threadId || "").trim();
   const body = collectBodyText(message.payload);
+  const attachments = collectAttachmentNames(message.payload);
   const plainBody = body.plain.join("\n\n").trim();
   const htmlFallback = stripHtml(body.html.join("\n\n"));
   const finalBody = plainBody || htmlFallback || (message.snippet || "").trim() || "(No body)";
@@ -318,6 +336,8 @@ function toRawEmail(message: GmailMessage): string {
     to ? `To: ${to}` : "",
     `Subject: ${subject}`,
     date ? `Date: ${date}` : "",
+    threadId ? `Thread-Id: ${threadId}` : "",
+    attachments.length ? `Attachments: ${attachments.join(", ")}` : "",
     "",
     "Body:",
     finalBody,
