@@ -20,6 +20,38 @@ type TicketLike = {
   resolvedAt?: Date | string | null;
 };
 
+function isObjectLike(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isObjectIdLike(value: unknown): value is { toString(): string } | string {
+  return typeof value === "string" || (isObjectLike(value) && typeof value.toString === "function");
+}
+
+function isDateLike(value: unknown): value is Date | string {
+  return typeof value === "string" || value instanceof Date;
+}
+
+function isTicketLike(value: unknown): value is TicketLike {
+  if (!isObjectLike(value)) return false;
+
+  const candidate = value as Partial<TicketLike>;
+  const validStatus = candidate.status === "open" || candidate.status === "in_progress" || candidate.status === "resolved";
+  const validPriority = candidate.priority === "low" || candidate.priority === "medium" || candidate.priority === "high";
+
+  return (
+    isObjectIdLike(candidate._id) &&
+    typeof candidate.title === "string" &&
+    typeof candidate.description === "string" &&
+    validStatus &&
+    validPriority &&
+    "createdBy" in candidate &&
+    "assignedAdmin" in candidate &&
+    isDateLike(candidate.createdAt) &&
+    isDateLike(candidate.updatedAt)
+  );
+}
+
 function mapParty(party: PartyRef): { _id: string; name: string; email: string } | null {
   if (!party) return null;
   return {
@@ -35,7 +67,14 @@ function asIso(value: Date | string | null | undefined): string | null {
   return value.toISOString();
 }
 
-export function toTicketDto(ticket: TicketLike): TicketDto {
+export function toTicketDto(ticketInput: unknown): TicketDto {
+  const candidate = Array.isArray(ticketInput) ? ticketInput[0] : ticketInput;
+  if (!isTicketLike(candidate)) {
+    throw new Error("Ticket payload has unexpected shape");
+  }
+
+  const ticket = candidate;
+
   const createdBy = mapParty(ticket.createdBy);
   if (!createdBy) {
     throw new Error("Ticket is missing createdBy reference");

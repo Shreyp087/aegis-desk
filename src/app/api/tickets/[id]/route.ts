@@ -21,15 +21,16 @@ export async function GET(
     }
 
     await connectMongo();
-    const ticket = await TicketModel.findById(id)
+    const ticketResult = await TicketModel.findById(id)
       .populate("createdBy", "name email")
       .populate("assignedAdmin", "name email")
       .lean();
+    const ticket = Array.isArray(ticketResult) ? ticketResult[0] : ticketResult;
     if (!ticket) {
       return NextResponse.json({ ok: false, error: "Ticket not found" }, { status: 404 });
     }
 
-    const createdBy = ticket.createdBy as { _id?: { toString(): string } | string } | null;
+    const createdBy = (ticket as { createdBy?: { _id?: { toString(): string } | string } | null }).createdBy ?? null;
     const createdById =
       createdBy && createdBy._id
         ? typeof createdBy._id === "string"
