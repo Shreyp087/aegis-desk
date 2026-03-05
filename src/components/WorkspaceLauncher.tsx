@@ -18,6 +18,11 @@ type WorkspaceCard = {
   badge?: string;
 };
 
+type GuideItem = {
+  title: string;
+  summary: string;
+};
+
 const PRIMARY_WORKSPACES: WorkspaceCard[] = [
   {
     href: "/inbox-scanner",
@@ -86,6 +91,107 @@ const SECONDARY_FEATURES: Record<SecondaryTab, WorkspaceCard[]> = {
   ],
 };
 
+const GET_STARTED_CHECKLIST: GuideItem[] = [
+  {
+    title: "Choose your source",
+    summary: "Open Inbox Scanner and scan manual input or Gmail-connected inbox messages.",
+  },
+  {
+    title: "Review risk signal",
+    summary: "Use score, category, and confidence to identify which message needs escalation first.",
+  },
+  {
+    title: "Escalate with context",
+    summary: "Send the selected message to Agent Desk so email + intent are prefilled automatically.",
+  },
+  {
+    title: "Measure outcomes",
+    summary: "Track follow-up in Tickets and use QueueGuard when you need queue risk measurement.",
+  },
+];
+
+const WORKFLOW_STEPS: GuideItem[] = [
+  {
+    title: "1. Inbox Scan",
+    summary: "Run scanner, filter by severity, and shortlist suspicious or high-impact messages.",
+  },
+  {
+    title: "2. Escalate",
+    summary: "Use Escalate action to pass raw email and recommended command to Main Agent.",
+  },
+  {
+    title: "3. Agent Analysis",
+    summary: "Run plan + tools, inspect intent plan, trust ledger, research sources, and output draft.",
+  },
+  {
+    title: "4. Measure + Operate",
+    summary: "Create or update Tickets and monitor downstream operations or queue controls in QueueGuard.",
+  },
+];
+
+const AGENT_FEATURE_GUIDE: GuideItem[] = [
+  {
+    title: "Command + Inputs",
+    summary: "Paste email/document context and define the exact outcome you want from the agent.",
+  },
+  {
+    title: "Intent Compiler (Plan)",
+    summary: "Preview planned tool-driven steps before trusting the generated final output.",
+  },
+  {
+    title: "Trust Ledger",
+    summary: "Audit what happened during execution, including decisions and tool call events.",
+  },
+  {
+    title: "Research Panel",
+    summary: "Review grounded sources and redacted queries used for evidence-backed reasoning.",
+  },
+  {
+    title: "Outputs",
+    summary: "Use the final deliverables for reply drafts, risk summary, and next actions.",
+  },
+];
+
+const INBOX_FEATURE_GUIDE: GuideItem[] = [
+  {
+    title: "Inbox Risk Scanner",
+    summary: "Classifies messages into risk buckets and prioritizes review order for triage.",
+  },
+  {
+    title: "Filters + Review",
+    summary: "Narrow by sender, category, or risk score to focus on highest-value investigations first.",
+  },
+  {
+    title: "Escalation Bridge",
+    summary: "One-click escalation carries email context into Agent Desk to reduce re-entry work.",
+  },
+  {
+    title: "Offline-aware behavior",
+    summary: "Shows offline mode state so users know when external integrations are unavailable.",
+  },
+];
+
+const ESCALATE_MEASURE_LINKS: WorkspaceCard[] = [
+  {
+    href: "/agent",
+    title: "Escalated Analysis",
+    summary: "Finalize reasoning and response strategy inside Main Agent.",
+    cta: "Open Agent Desk",
+  },
+  {
+    href: "/tickets",
+    title: "Incident Measurement",
+    summary: "Track ownership, status, and closure metrics for escalated cases.",
+    cta: "Open Tickets",
+  },
+  {
+    href: "/queueguard",
+    title: "Queue Risk Measure",
+    summary: "Use QueueGuard to simulate friction and step-up impact on risky traffic.",
+    cta: "Open QueueGuard",
+  },
+];
+
 export default function WorkspaceLauncher({ offlinePublicEnabled, offlinePublicState }: WorkspaceLauncherProps) {
   const [activeTab, setActiveTab] = useState<SecondaryTab>("operations");
 
@@ -140,6 +246,104 @@ export default function WorkspaceLauncher({ offlinePublicEnabled, offlinePublicS
             </div>
           </div>
         ))}
+      </section>
+
+      <section className="surface-card p-4 md:p-5">
+        <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3 mb-4">
+          <div>
+            <div className="text-lg font-semibold text-slate-100">User Guide Manual</div>
+            <div className="text-sm text-[var(--muted)]">
+              Complete usage guide for Main Agent, Inbox Scanner, and the Escalate to Measure workflow.
+            </div>
+          </div>
+          <div className="subtle-pill px-3 py-2 rounded-full text-xs text-[var(--muted)]">
+            Workflow: Scan -&gt; Escalate -&gt; Analyze -&gt; Measure
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 mb-3">
+          <article className="surface-subcard p-3">
+            <div className="text-sm font-semibold text-slate-100 mb-2">Getting Started Checklist</div>
+            <ul className="space-y-2 text-sm text-[var(--muted)] list-disc list-inside">
+              {GET_STARTED_CHECKLIST.map((item) => (
+                <li key={item.title}>
+                  <span className="text-slate-100 font-semibold">{item.title}:</span> {item.summary}
+                </li>
+              ))}
+            </ul>
+          </article>
+
+          <article className="surface-subcard p-3">
+            <div className="text-sm font-semibold text-slate-100 mb-2">Step-by-Step Workflow</div>
+            <ol className="space-y-2 text-sm text-[var(--muted)] list-decimal list-inside">
+              {WORKFLOW_STEPS.map((step) => (
+                <li key={step.title}>
+                  <span className="text-slate-100 font-semibold">{step.title}:</span> {step.summary}
+                </li>
+              ))}
+            </ol>
+          </article>
+        </div>
+
+        <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 mb-3">
+          <article className="surface-subcard p-3">
+            <div className="text-sm font-semibold text-slate-100 mb-2">Main Agent Features</div>
+            <ul className="space-y-2 text-sm text-[var(--muted)] list-disc list-inside">
+              {AGENT_FEATURE_GUIDE.map((feature) => (
+                <li key={feature.title}>
+                  <span className="text-slate-100 font-semibold">{feature.title}:</span> {feature.summary}
+                </li>
+              ))}
+            </ul>
+            <div className="mt-3">
+              <Link
+                href="/agent"
+                className="secondary-ghost px-3 py-2 rounded-lg text-sm font-semibold no-underline inline-flex"
+              >
+                Open Main Agent
+              </Link>
+            </div>
+          </article>
+
+          <article className="surface-subcard p-3">
+            <div className="text-sm font-semibold text-slate-100 mb-2">Inbox Scanner Features</div>
+            <ul className="space-y-2 text-sm text-[var(--muted)] list-disc list-inside">
+              {INBOX_FEATURE_GUIDE.map((feature) => (
+                <li key={feature.title}>
+                  <span className="text-slate-100 font-semibold">{feature.title}:</span> {feature.summary}
+                </li>
+              ))}
+            </ul>
+            <div className="mt-3">
+              <Link
+                href="/inbox-scanner"
+                className="secondary-ghost px-3 py-2 rounded-lg text-sm font-semibold no-underline inline-flex"
+              >
+                Open Inbox Scanner
+              </Link>
+            </div>
+          </article>
+        </div>
+
+        <article className="surface-subcard p-3">
+          <div className="text-sm font-semibold text-slate-100 mb-1">Escalate to Measure</div>
+          <div className="text-xs text-[var(--muted)] mb-3">
+            After escalation, use these destinations to measure impact, ownership, and operational risk outcomes.
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {ESCALATE_MEASURE_LINKS.map((item) => (
+              <Link
+                key={item.href}
+                href={item.href}
+                className="surface-subcard p-3 no-underline hover:border-cyan-300/45 hover:bg-cyan-400/10"
+              >
+                <div className="text-sm font-semibold text-slate-100 mb-1">{item.title}</div>
+                <div className="text-xs text-[var(--muted)] leading-relaxed mb-3">{item.summary}</div>
+                <div className="text-xs font-semibold text-[var(--accent-cyan)]">{item.cta}</div>
+              </Link>
+            ))}
+          </div>
+        </article>
       </section>
 
       <section className="surface-card p-4 md:p-5">
