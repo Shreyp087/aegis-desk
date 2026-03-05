@@ -14,7 +14,7 @@ export default function LedgerPanel({ ledger, expanded }: LedgerPanelProps) {
     <div className="h-full min-h-0 flex flex-col gap-3">
       <div className="panel-note">Timeline of what the agent did and why.</div>
 
-      <div className={`min-h-0 flex-1 overflow-auto space-y-3 ${expanded ? 'max-h-none' : 'max-h-96'}`}>
+      <div className={`min-h-0 flex-1 overflow-auto space-y-3 ${expanded ? 'max-h-none' : 'max-h-none md:max-h-96'}`}>
         {ledger.length === 0 ? (
           <div className="panel-empty text-sm italic">No ledger events yet.</div>
         ) : (

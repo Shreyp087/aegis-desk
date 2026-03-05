@@ -1,5 +1,6 @@
 import { openai } from "@ai-sdk/openai";
 import { generateText } from "ai";
+import { z } from "zod";
 import { getOfflineRuntimeConfig, isOfflineEnforced } from "@/lib/offline";
 
 console.log("OPENAI_API_KEY present:", !!process.env.OPENAI_API_KEY);
@@ -16,6 +17,33 @@ function tomorrowAt3pmNYISO(): string {
 
   return `${y}-${m}-${d}T15:00:00-05:00`;
 }
+
+const PlanStepTypeEnum = z.enum([
+  "extract",
+  "verify_entity_authenticity",
+  "redact_and_search",
+  "analyze_contract_risks",
+  "draft_reply",
+  "create_ics",
+]);
+
+const PlanStepSchema = z
+  .object({
+    id: z.string(),
+    type: PlanStepTypeEnum,
+    desc: z.string(),
+    rawQuery: z.string().optional(),
+    title: z.string().optional(),
+    datetimeISO: z.string().optional(),
+  })
+  .passthrough();
+
+const PlannerPlanSchema = z
+  .object({
+    goal: z.string(),
+    steps: z.array(PlanStepSchema).min(4),
+  })
+  .passthrough();
 
 export async function POST(req: Request) {
   try {
@@ -44,7 +72,7 @@ Your job: convert the user's command into a STRICT JSON plan.
 ABSOLUTE RULES:
 - Return ONLY valid JSON (no markdown, no commentary).
 - Use ONLY the step types listed below (exact spelling).
-- Must include EXACTLY TWO Linkup web research steps.
+- Must include BETWEEN 2 AND 6 Linkup web research steps.
 - Must redact PII before web search (handled later), but your rawQuery MUST avoid personal data.
 - If user asks to "verify company/person background" you MUST plan authenticity verification for each entity.
 - Do NOT verify internal contract statements using web search (e.g., SLA response time). Web search is ONLY for external entity/background verification.
@@ -62,8 +90,10 @@ ALLOWED STEP TYPES (exact):
 - create_ics
 
 LINKUP SEARCH REQUIREMENT:
-- You MUST output exactly TWO steps of type "redact_and_search".
-- Those two searches must be about the TWO most relevant entities to verify (usually companies in the agreement/email).
+- You MUST output 2 to 6 steps of type "redact_and_search" based on how many entities actually require verification.
+- Use more search steps when multiple people/companies are mentioned.
+- Assume Linkup search depth is STANDARD by default for cost control.
+- Only suggest deep investigation language if the user explicitly asks for deep research.
 
 QUERY QUALITY RULES (IMPORTANT):
 - Queries must minimize ambiguity and avoid fictional/franchise results.
@@ -83,9 +113,9 @@ Return ONLY valid JSON in this exact shape:
     { "id":"2", "type":"verify_entity_authenticity", "desc":"..." },
     { "id":"3", "type":"redact_and_search", "desc":"...", "rawQuery":"..." },
     { "id":"4", "type":"redact_and_search", "desc":"...", "rawQuery":"..." },
-    { "id":"5", "type":"analyze_contract_risks", "desc":"..." },
-    { "id":"6", "type":"draft_reply", "desc":"..." },
-    { "id":"7", "type":"create_ics", "desc":"...", "title":"...", "datetimeISO":"..." }
+    { "id":"X", "type":"analyze_contract_risks", "desc":"..." },
+    { "id":"Y", "type":"draft_reply", "desc":"..." },
+    { "id":"Z", "type":"create_ics", "desc":"...", "title":"...", "datetimeISO":"..." }
   ]
 }
 
@@ -113,25 +143,28 @@ ${command}
     }
 
     const jsonText = result.text.slice(start, end + 1);
-    const plan = JSON.parse(jsonText);
+    const plan = PlannerPlanSchema.parse(JSON.parse(jsonText));
 
-    // Optional guardrails: ensure exactly two redact_and_search steps
-    const searchSteps = (plan.steps || []).filter((s: any) => s.type === "redact_and_search");
-    if (searchSteps.length !== 2) {
-      throw new Error(`Plan must include exactly 2 redact_and_search steps. Got ${searchSteps.length}.`);
+    // Guardrails: enforce dynamic but bounded search count.
+    const searchSteps = plan.steps.filter((s) => s.type === "redact_and_search");
+    if (searchSteps.length < 2 || searchSteps.length > 6) {
+      throw new Error(
+        `Plan must include between 2 and 6 redact_and_search steps. Got ${searchSteps.length}.`
+      );
     }
 
     // Ensure meeting datetimeISO is correct (override if model deviated)
-    const icsStep = (plan.steps || []).find((s: any) => s.type === "create_ics");
+    const icsStep = plan.steps.find((s) => s.type === "create_ics");
     if (icsStep) {
       icsStep.datetimeISO = fixedMeetingISO;
     }
 
     return Response.json({ ok: true, plan });
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error("Plan error:", err);
+    const detail = err instanceof Error ? err.message : String(err);
     return Response.json(
-      { error: "Plan failed", detail: err?.message },
+      { error: "Plan failed", detail },
       { status: 500 }
     );
   }

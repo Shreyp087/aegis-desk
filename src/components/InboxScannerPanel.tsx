@@ -1,6 +1,9 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { EscalateToHelpdeskButton } from "@/components/tickets/EscalateToHelpdeskButton";
+import { TicketLinkForEmail } from "@/components/tickets/TicketLinkForEmail";
 
 type Priority = "high" | "medium" | "low";
 type Mode = "manual" | "gmail";
@@ -19,6 +22,15 @@ type Category =
   | "ops_support"
   | "newsletter"
   | "general";
+
+type TicketDecision = "escalate" | "quarantine";
+type FeedbackOutcome =
+  | "spam_true_positive"
+  | "spam_false_positive"
+  | "harmful_true_positive"
+  | "harmful_false_positive"
+  | "actionable_correct"
+  | "informational_correct";
 
 const FILTER_CATEGORIES = [
   "scam_bec",
@@ -53,6 +65,21 @@ type InboxAlert = {
   uncertaintyPercent: number;
   priority: Priority;
   primaryCategory: Category;
+  mailClass?: "spam" | "harmful" | "actionable" | "informational";
+  threatType?:
+    | "phishing"
+    | "impersonation"
+    | "malware"
+    | "payment_fraud"
+    | "legal_risk"
+    | "none"
+    | "unknown";
+  decisionTrace?: {
+    policyVersion: string;
+    modelVersion: string;
+    explanation: string;
+    evidenceRefs: Array<{ type: string; ref: string; weight: number }>;
+  };
   categoryScores: CategoryScore[];
   riskTags: string[];
   signals: string[];
@@ -65,6 +92,31 @@ type InboxAlert = {
     confidencePct: number;
     riskScore: number;
     note: string;
+  };
+  classifier?: {
+    modelVersion: string;
+    predictedClass: "spam" | "harmful" | "actionable" | "informational";
+    probabilities: {
+      spam: number;
+      harmful: number;
+      actionable: number;
+      informational: number;
+    };
+    memorySampleCount: number;
+    rationale: string;
+  };
+  guardrails?: {
+    policyVersion: string;
+    ruleHits: string[];
+    rationale: string;
+    priorityAdjusted: boolean;
+    actionAdjusted: boolean;
+    classificationAdjusted: boolean;
+  };
+  memoryRef?: {
+    sourceHash: string;
+    subjectHash: string;
+    senderEmailHash: string;
   };
   trustScore: number;
   reputationScore: number;
@@ -93,6 +145,14 @@ type InboxMeta = {
   highCount: number;
   mediumCount: number;
   lowCount: number;
+  policyVersion?: string;
+  modelVersion?: string;
+  classifierVersion?: string;
+  guardrailVersion?: string;
+  learningSamplesUsed?: number;
+  consensusMode?: "single" | "multi";
+  consensusMaxModels?: number;
+  consensusSource?: "env_default" | "admin_override";
 };
 
 type InboxResponse = {
@@ -104,6 +164,18 @@ type InboxResponse = {
 type GmailStatus = {
   connected: boolean;
   email: string | null;
+};
+
+type InboxConsensusSettings = {
+  consensusEnabled: boolean;
+  consensusMaxModels: number;
+  source: "env_default" | "admin_override";
+};
+
+type InboxSettingsResponse = {
+  ok: true;
+  canEdit: boolean;
+  settings: InboxConsensusSettings;
 };
 
 function categoryLabel(category: Category): string {
@@ -172,8 +244,35 @@ function suggestedCommand(alert: InboxAlert): string {
   return "Summarize this email, identify key risks and action items, and draft a concise professional reply.";
 }
 
+function toTicketDecision(alert: InboxAlert): TicketDecision {
+  const action = alert.trustedDecision?.action || "escalate";
+  if (action === "block" || action === "quarantine") return "quarantine";
+  return "escalate";
+}
+
+function confidenceFromAlert(alert: InboxAlert): number {
+  const pct = alert.trustedDecision?.confidencePct ?? alert.consensusScore;
+  return Math.max(0, Math.min(1, Math.round(pct) / 100));
+}
+
+function riskSummaryFromAlert(alert: InboxAlert) {
+  return {
+    category: alert.primaryCategory,
+    score: alert.priorityScore,
+    deterministicNotes: alert.signals.slice(0, 6),
+    llmSummary: alert.consensusNote || undefined,
+  };
+}
+
+function safeFeedbackLabel(alert: InboxAlert): FeedbackOutcome {
+  if (alert.mailClass === "spam") return "spam_false_positive";
+  if (alert.mailClass === "harmful") return "harmful_false_positive";
+  if (alert.mailClass === "actionable") return "actionable_correct";
+  return "informational_correct";
+}
+
 function chipClass(active: boolean): string {
-  return `text-xs px-3 py-1.5 rounded-full border transition-all ${
+  return `text-xs px-3 py-1.5 rounded-full border transition-all shrink-0 ${
     active
       ? "bg-[rgba(71,215,255,0.28)] text-slate-100 border-cyan-300/70 shadow-[0_8px_18px_rgba(71,215,255,0.22)]"
       : "bg-[rgba(14,24,39,0.66)] text-slate-300 border-slate-400/30 hover:bg-[rgba(71,215,255,0.16)] hover:text-slate-100"
@@ -209,6 +308,16 @@ export default function InboxScannerPanel({
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [isScanning, setIsScanning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [lastCreatedTicketId, setLastCreatedTicketId] = useState<string | null>(null);
+  const [settingsLoading, setSettingsLoading] = useState(true);
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [canEditConsensus, setCanEditConsensus] = useState(false);
+  const [consensusEnabled, setConsensusEnabled] = useState(false);
+  const [consensusMaxModels, setConsensusMaxModels] = useState(3);
+  const [consensusSource, setConsensusSource] = useState<"env_default" | "admin_override">("env_default");
+  const [feedbackSavingById, setFeedbackSavingById] = useState<Record<string, boolean>>({});
+  const [feedbackStatusById, setFeedbackStatusById] = useState<Record<string, string>>({});
 
   async function refreshGmailStatus() {
     setCheckingStatus(true);
@@ -226,8 +335,68 @@ export default function InboxScannerPanel({
     }
   }
 
+  async function refreshInboxSettings() {
+    setSettingsLoading(true);
+    setSettingsError(null);
+    try {
+      const res = await fetch("/api/inbox/settings", { cache: "no-store" });
+      const data = (await res.json()) as Partial<InboxSettingsResponse> & {
+        error?: string;
+        detail?: string;
+      };
+      if (!res.ok || !data.ok || !data.settings) {
+        throw new Error(data.detail || data.error || "Failed to load inbox settings.");
+      }
+
+      setCanEditConsensus(Boolean(data.canEdit));
+      setConsensusEnabled(Boolean(data.settings.consensusEnabled));
+      setConsensusMaxModels(Math.max(1, Math.min(8, Number(data.settings.consensusMaxModels) || 3)));
+      setConsensusSource(data.settings.source || "env_default");
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : "Failed to load inbox settings.";
+      setSettingsError(detail);
+    } finally {
+      setSettingsLoading(false);
+    }
+  }
+
+  async function saveInboxSettings() {
+    if (!canEditConsensus) return;
+    setSettingsSaving(true);
+    setSettingsError(null);
+    try {
+      const res = await fetch("/api/inbox/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          consensusEnabled,
+          consensusMaxModels: Math.max(1, Math.min(8, consensusMaxModels)),
+        }),
+      });
+
+      const data = (await res.json()) as Partial<InboxSettingsResponse> & {
+        ok?: boolean;
+        error?: string;
+        detail?: string;
+      };
+      if (!res.ok || !data.ok || !data.settings) {
+        throw new Error(data.detail || data.error || "Failed to save inbox settings.");
+      }
+
+      setConsensusEnabled(Boolean(data.settings.consensusEnabled));
+      setConsensusMaxModels(Math.max(1, Math.min(8, Number(data.settings.consensusMaxModels) || 3)));
+      setConsensusSource(data.settings.source || "admin_override");
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : "Failed to save inbox settings.";
+      setSettingsError(detail);
+    } finally {
+      setSettingsSaving(false);
+    }
+  }
+
   useEffect(() => {
     void refreshGmailStatus();
+    void refreshInboxSettings();
   }, []);
 
   async function scanInbox() {
@@ -275,6 +444,8 @@ export default function InboxScannerPanel({
       setMeta(data.meta);
       setExpandedId(data.alerts[0]?.id || null);
       setActiveFilter("all");
+      setFeedbackSavingById({});
+      setFeedbackStatusById({});
     } catch (err) {
       const detail = err instanceof Error ? err.message : "Scan failed.";
       setError(detail);
@@ -286,6 +457,62 @@ export default function InboxScannerPanel({
   async function disconnectGmail() {
     await fetch("/api/inbox/gmail/disconnect", { method: "POST" });
     await refreshGmailStatus();
+  }
+
+  async function submitFeedback(args: {
+    alert: InboxAlert;
+    outcomeLabel: FeedbackOutcome;
+    correctedClass?: "spam" | "harmful" | "actionable" | "informational";
+    correctedPriority?: "low" | "medium" | "high";
+  }) {
+    const sourceHash = args.alert.memoryRef?.sourceHash;
+    if (!sourceHash) {
+      setFeedbackStatusById((prev) => ({
+        ...prev,
+        [args.alert.id]: "Feedback unavailable for this result (missing memory reference).",
+      }));
+      return;
+    }
+
+    setFeedbackSavingById((prev) => ({ ...prev, [args.alert.id]: true }));
+    try {
+      const res = await fetch("/api/inbox/feedback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sourceHash,
+          sourceEmailId: args.alert.id,
+          outcomeLabel: args.outcomeLabel,
+          correctedClass: args.correctedClass,
+          correctedPriority: args.correctedPriority,
+        }),
+      });
+
+      const data = (await res.json()) as {
+        ok?: boolean;
+        matched?: number;
+        modified?: number;
+        error?: string;
+        detail?: string;
+      };
+      if (!res.ok || !data.ok) {
+        throw new Error(data.detail || data.error || "Failed to save feedback.");
+      }
+
+      const matched = Number(data.matched || 0);
+      setFeedbackStatusById((prev) => ({
+        ...prev,
+        [args.alert.id]:
+          matched > 0
+            ? `Feedback saved (matched ${matched} memory record${matched === 1 ? "" : "s"}).`
+            : "Feedback saved, but no matching memory records were found yet.",
+      }));
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : "Feedback save failed.";
+      setFeedbackStatusById((prev) => ({ ...prev, [args.alert.id]: detail }));
+    } finally {
+      setFeedbackSavingById((prev) => ({ ...prev, [args.alert.id]: false }));
+    }
   }
 
   const counts = useMemo(() => {
@@ -318,11 +545,11 @@ export default function InboxScannerPanel({
 
   const selected = alerts.find((a) => a.id === expandedId) || null;
   const summary = meta
-    ? `Mode: ${meta.mode} | Processing: ${meta.processingMode || "hybrid_remote_llm"} | Offline: ${meta.offlineState || "disabled"} | Scanned: ${meta.scanned} | High: ${meta.highCount} | Medium: ${meta.mediumCount} | Low: ${meta.lowCount}`
+    ? `Mode: ${meta.mode} | Processing: ${meta.processingMode || "hybrid_remote_llm"} | Offline: ${meta.offlineState || "disabled"} | Policy: ${meta.policyVersion || "n/a"} | Guardrails: ${meta.guardrailVersion || "n/a"} | Model: ${meta.modelVersion || "n/a"} | Classifier: ${meta.classifierVersion || "n/a"} | Consensus: ${meta.consensusMode || "single"}${meta.consensusMode === "multi" ? ` (${meta.consensusMaxModels || 1})` : ""} [${meta.consensusSource || "env_default"}] | Learning Signals: ${meta.learningSamplesUsed ?? 0} | Scanned: ${meta.scanned} | High: ${meta.highCount} | Medium: ${meta.mediumCount} | Low: ${meta.lowCount}`
     : "No scans yet.";
 
   return (
-    <div className="h-full min-h-0 flex flex-col gap-3">
+    <div className="h-full min-h-0 flex flex-col gap-3 mobile-safe-pad">
       <div className="surface-card p-3">
         <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
           <div className="font-semibold text-slate-100">Inbox Scanner</div>
@@ -330,13 +557,13 @@ export default function InboxScannerPanel({
             type="button"
             onClick={scanInbox}
             disabled={isScanning || checkingStatus}
-            className="primary-cta px-3 py-2 rounded-lg font-semibold disabled:opacity-50"
+            className="primary-cta px-3 py-2 rounded-lg font-semibold min-h-[40px] w-full sm:w-auto disabled:opacity-50"
           >
             {isScanning ? "Scanning..." : "Scan Inbox"}
           </button>
         </div>
 
-        <div className="flex gap-2 mb-3">
+        <div className="flex gap-2 mb-3 flex-wrap">
           <button className={chipClass(mode === "manual")} onClick={() => setMode("manual")}>
             Manual
           </button>
@@ -350,6 +577,71 @@ export default function InboxScannerPanel({
           </button>
         </div>
 
+        <div className="surface-subcard p-3 mb-3 text-sm text-slate-200">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-xs">
+              Consensus mode:{" "}
+              <span className="font-semibold">
+                {consensusEnabled ? `Multi-model (${consensusMaxModels})` : "Single-model (cost saver)"}
+              </span>{" "}
+              <span className="opacity-80">[{consensusSource === "admin_override" ? "admin override" : "env default"}]</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => void refreshInboxSettings()}
+              className="px-3 py-1.5 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[34px] text-xs"
+              disabled={settingsLoading || settingsSaving}
+            >
+              {settingsLoading ? "Loading..." : "Refresh Settings"}
+            </button>
+          </div>
+
+          {settingsLoading ? (
+            <div className="mt-2 text-xs opacity-80">Loading consensus settings...</div>
+          ) : canEditConsensus ? (
+            <div className="mt-3 grid grid-cols-1 md:grid-cols-[1fr_auto_auto] gap-2 items-center">
+              <label className="flex items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={consensusEnabled}
+                  onChange={(e) => setConsensusEnabled(e.target.checked)}
+                  disabled={settingsSaving || settingsLoading || offlinePublicEnforced}
+                />
+                Enable multi-model consensus
+              </label>
+
+              <input
+                className="field-input text-xs w-full md:w-[140px]"
+                type="number"
+                min={1}
+                max={8}
+                value={consensusMaxModels}
+                onChange={(e) => {
+                  const n = Number(e.target.value) || 1;
+                  setConsensusMaxModels(Math.max(1, Math.min(8, n)));
+                }}
+                disabled={!consensusEnabled || settingsSaving || settingsLoading || offlinePublicEnforced}
+                title="Maximum models to run when consensus is enabled"
+              />
+
+              <button
+                type="button"
+                onClick={() => void saveInboxSettings()}
+                disabled={settingsSaving || settingsLoading || offlinePublicEnforced}
+                className="px-3 py-2 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[36px] text-xs disabled:opacity-60"
+              >
+                {settingsSaving ? "Saving..." : "Save"}
+              </button>
+            </div>
+          ) : (
+            <div className="mt-2 text-xs opacity-80">
+              Admin login is required to change consensus settings.
+            </div>
+          )}
+
+          {settingsError ? <div className="text-xs text-rose-300 mt-2">{settingsError}</div> : null}
+        </div>
+
         {offlinePublicEnforced ? (
           <div className="text-xs text-amber-200 mb-3">
             Enforced offline mode is active. Gmail fetch is disabled; use Manual mode.
@@ -358,18 +650,18 @@ export default function InboxScannerPanel({
 
         <div className="surface-subcard p-3 mb-3 text-sm text-slate-200">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <div>
+            <div className="break-all">
               Gmail: {gmailStatus.connected ? "Connected" : "Not connected"}
               {gmailStatus.email ? ` (${gmailStatus.email})` : ""}
             </div>
-            <div className="flex gap-2">
+            <div className="flex gap-2 flex-wrap">
               {!gmailStatus.connected ? (
                 <button
                   type="button"
                   onClick={() => {
                     window.location.href = "/api/inbox/gmail/connect";
                   }}
-                  className="px-3 py-1.5 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition"
+                  className="px-3 py-1.5 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[38px]"
                 >
                   Connect Gmail
                 </button>
@@ -377,7 +669,7 @@ export default function InboxScannerPanel({
                 <button
                   type="button"
                   onClick={() => void disconnectGmail()}
-                  className="px-3 py-1.5 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition"
+                  className="px-3 py-1.5 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[38px]"
                 >
                   Disconnect
                 </button>
@@ -385,7 +677,7 @@ export default function InboxScannerPanel({
               <button
                 type="button"
                 onClick={() => void refreshGmailStatus()}
-                className="px-3 py-1.5 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition"
+                className="px-3 py-1.5 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[38px]"
               >
                 Refresh
               </button>
@@ -395,7 +687,7 @@ export default function InboxScannerPanel({
 
         {mode === "manual" ? (
           <textarea
-            className="field-input h-52 text-sm mb-3 resize-none"
+            className="field-input h-48 sm:h-52 text-sm mb-3 resize-none"
             value={rawInbox}
             onChange={(e) => setRawInbox(e.target.value)}
             placeholder="Paste emails separated by ---"
@@ -433,8 +725,8 @@ export default function InboxScannerPanel({
       </div>
 
       <div className="surface-card p-3">
-        <div className="text-sm text-slate-300 mb-2">{summary}</div>
-        <div className="flex flex-wrap gap-2">
+        <div className="text-xs sm:text-sm text-slate-300 mb-2 break-words">{summary}</div>
+        <div className="flex gap-2 overflow-x-auto pb-1 mobile-chip-scroll">
           <button className={chipClass(activeFilter === "all")} onClick={() => setActiveFilter("all")}>
             All ({counts.all})
           </button>
@@ -460,7 +752,7 @@ export default function InboxScannerPanel({
       </div>
 
       <div className="min-h-0 flex-1 grid grid-cols-1 lg:grid-cols-2 gap-3">
-        <div className="min-h-0 overflow-auto surface-card max-h-96">
+        <div className="min-h-0 overflow-auto surface-card max-h-none lg:max-h-96">
           {filtered.length === 0 ? (
             <div className="p-4 text-sm text-slate-400">No emails in this category.</div>
           ) : (
@@ -468,7 +760,7 @@ export default function InboxScannerPanel({
               <button
                 key={alert.id}
                 onClick={() => setExpandedId(alert.id)}
-                className={`w-full text-left p-4 border-b border-slate-400/20 hover:bg-cyan-400/10 ${
+                className={`w-full text-left p-3 sm:p-4 border-b border-slate-400/20 hover:bg-cyan-400/10 ${
                   expandedId === alert.id ? "bg-cyan-400/15" : ""
                 }`}
               >
@@ -478,6 +770,16 @@ export default function InboxScannerPanel({
                   <span className="px-2 py-1 rounded-full border border-cyan-300/45 text-slate-200 bg-cyan-400/10">
                     {categoryLabel(alert.primaryCategory)}
                   </span>
+                  {alert.mailClass ? (
+                    <span className="px-2 py-1 rounded-full border border-cyan-300/45 text-slate-200 bg-cyan-400/10 uppercase">
+                      {alert.mailClass}
+                    </span>
+                  ) : null}
+                  {alert.threatType ? (
+                    <span className="px-2 py-1 rounded-full border border-cyan-300/45 text-slate-200 bg-cyan-400/10">
+                      Threat {alert.threatType}
+                    </span>
+                  ) : null}
                   <span className="px-2 py-1 rounded-full border border-cyan-300/45 text-slate-200 bg-cyan-400/10">
                     Priority {alert.priorityScore}
                   </span>
@@ -496,7 +798,7 @@ export default function InboxScannerPanel({
           )}
         </div>
 
-        <div className="min-h-0 overflow-auto surface-card p-4 max-h-96">
+        <div className="min-h-0 overflow-auto surface-card p-3 sm:p-4 max-h-none lg:max-h-96">
           {!selected ? (
             <div className="text-sm text-slate-400">Select an email to view details.</div>
           ) : (
@@ -509,6 +811,9 @@ export default function InboxScannerPanel({
                   Trusted decision: {(selected.trustedDecision?.action || "escalate").toUpperCase()} (
                   {selected.trustedDecision?.riskScore ?? "-"}
                   /100 risk, {selected.trustedDecision?.confidencePct ?? "-"}% confidence)
+                </div>
+                <div className="mt-2">
+                  <TicketLinkForEmail sourceEmailId={selected.id} />
                 </div>
               </div>
 
@@ -556,11 +861,37 @@ export default function InboxScannerPanel({
                 <div className="rounded-lg border border-slate-400/25 bg-slate-900/30 p-2">
                   Thread depth: {selected.thread.depth} | Risk density: {selected.thread.riskDensity}
                 </div>
+                {selected.classifier ? (
+                  <div className="rounded-lg border border-slate-400/25 bg-slate-900/30 p-2">
+                    Classifier ({selected.classifier.modelVersion}): {selected.classifier.predictedClass.toUpperCase()} | S/H/A/I{" "}
+                    {Math.round(selected.classifier.probabilities.spam * 100)}/
+                    {Math.round(selected.classifier.probabilities.harmful * 100)}/
+                    {Math.round(selected.classifier.probabilities.actionable * 100)}/
+                    {Math.round(selected.classifier.probabilities.informational * 100)} | Memory samples{" "}
+                    {selected.classifier.memorySampleCount}
+                  </div>
+                ) : null}
               </div>
 
               <div className="rounded-lg border border-slate-400/25 bg-slate-900/30 p-2 text-xs text-slate-300">
                 Decision note: {selected.trustedDecision?.note || "Decision note unavailable."}
               </div>
+              {selected.guardrails ? (
+                <div className="rounded-lg border border-slate-400/25 bg-slate-900/30 p-2 text-xs text-slate-300">
+                  Guardrails ({selected.guardrails.policyVersion}):{" "}
+                  {selected.guardrails.ruleHits.length > 0
+                    ? selected.guardrails.ruleHits.join(", ")
+                    : "none"}{" "}
+                  | priority adjusted: {selected.guardrails.priorityAdjusted ? "yes" : "no"} | action adjusted:{" "}
+                  {selected.guardrails.actionAdjusted ? "yes" : "no"} | class adjusted:{" "}
+                  {selected.guardrails.classificationAdjusted ? "yes" : "no"}
+                </div>
+              ) : null}
+              {selected.decisionTrace?.explanation ? (
+                <div className="rounded-lg border border-slate-400/25 bg-slate-900/30 p-2 text-xs text-slate-300">
+                  Decision trace: {selected.decisionTrace.explanation}
+                </div>
+              ) : null}
 
               {selected.extracted.attachments.length > 0 ? (
                 <div className="rounded-lg border border-slate-400/25 bg-slate-900/30 p-2 text-xs text-slate-300">
@@ -590,29 +921,104 @@ export default function InboxScannerPanel({
                 {selected.draftReply}
               </pre>
 
+              <div className="rounded-lg border border-slate-400/25 bg-slate-900/30 p-2">
+                <div className="text-xs text-slate-200 mb-2">
+                  Learning feedback (updates memory for future scans)
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void submitFeedback({
+                        alert: selected,
+                        outcomeLabel: "spam_true_positive",
+                        correctedClass: "spam",
+                        correctedPriority: "low",
+                      })
+                    }
+                    disabled={Boolean(feedbackSavingById[selected.id])}
+                    className="px-3 py-2 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[36px] text-xs disabled:opacity-60"
+                  >
+                    Confirm Spam
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void submitFeedback({
+                        alert: selected,
+                        outcomeLabel: "harmful_true_positive",
+                        correctedClass: "harmful",
+                        correctedPriority: "high",
+                      })
+                    }
+                    disabled={Boolean(feedbackSavingById[selected.id])}
+                    className="px-3 py-2 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[36px] text-xs disabled:opacity-60"
+                  >
+                    Confirm Harmful
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void submitFeedback({
+                        alert: selected,
+                        outcomeLabel: safeFeedbackLabel(selected),
+                        correctedClass:
+                          selected.mailClass === "actionable"
+                            ? "actionable"
+                            : "informational",
+                        correctedPriority:
+                          selected.mailClass === "actionable" ? "medium" : "low",
+                      })
+                    }
+                    disabled={Boolean(feedbackSavingById[selected.id])}
+                    className="px-3 py-2 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[36px] text-xs disabled:opacity-60"
+                  >
+                    Mark Safe
+                  </button>
+                </div>
+                {feedbackStatusById[selected.id] ? (
+                  <div className="text-xs text-slate-300 mt-2">{feedbackStatusById[selected.id]}</div>
+                ) : null}
+              </div>
+
               <div className="flex flex-wrap gap-2">
                 <button
                   type="button"
                   onClick={() => onEscalate(selected.rawEmail, suggestedCommand(selected))}
-                  className="primary-cta px-3 py-2 rounded-lg font-semibold"
+                  className="primary-cta px-3 py-2 rounded-lg font-semibold min-h-[40px] w-full sm:w-auto"
                 >
                   Escalate to Main Agent
                 </button>
+                <EscalateToHelpdeskButton
+                  sourceEmailId={selected.id}
+                  sender={selected.senderEmail || selected.from}
+                  subject={selected.subject}
+                  date={new Date().toISOString()}
+                  risk={riskSummaryFromAlert(selected)}
+                  decision={toTicketDecision(selected)}
+                  confidence={confidenceFromAlert(selected)}
+                  onCreated={(localTicketId) => setLastCreatedTicketId(localTicketId)}
+                />
                 <button
                   type="button"
                   onClick={() => navigator.clipboard.writeText(selected.rawEmail)}
-                  className="px-3 py-2 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition"
+                  className="px-3 py-2 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[40px] w-full sm:w-auto"
                 >
                   Copy Raw Email
                 </button>
                 <button
                   type="button"
                   onClick={() => navigator.clipboard.writeText(selected.draftReply)}
-                  className="px-3 py-2 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition"
+                  className="px-3 py-2 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[40px] w-full sm:w-auto"
                 >
                   Copy Draft
                 </button>
               </div>
+              {lastCreatedTicketId ? (
+                <Link href={`/tickets/${lastCreatedTicketId}`} className="text-xs text-cyan-200 underline">
+                  Open newly created ticket: {lastCreatedTicketId}
+                </Link>
+              ) : null}
             </div>
           )}
         </div>

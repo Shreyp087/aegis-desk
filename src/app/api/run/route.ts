@@ -2,12 +2,81 @@ import { LinkupClient } from "linkup-sdk";
 import { privacyFirewall } from "@/lib/tools/privacy";
 import { createICS } from "@/lib/tools/ics";
 
+import { createHash } from "crypto";
 import { openai } from "@ai-sdk/openai";
 import { generateObject } from "ai";
 import { z } from "zod";
+import { connectMongo } from "@/lib/db/mongoose";
+import { extractEntityCandidatesFromContext } from "@/lib/inbox/entityProfiler";
+import { EntityProfileCacheModel } from "@/lib/models/EntityProfileCache";
 import { getOfflineRuntimeConfig, isOfflineEnforced } from "@/lib/offline";
 
 const linkup = new LinkupClient({ apiKey: process.env.LINKUP_API_KEY! });
+
+const AnalysisSectionTypeEnum = z.enum([
+  "contract",
+  "security",
+  "finance",
+  "operations",
+  "scheduling",
+  "general",
+]);
+
+type AnalysisSectionType = z.infer<typeof AnalysisSectionTypeEnum>;
+
+type LinkupDepth = "standard" | "deep";
+
+type RunStep = {
+  id: string;
+  type: string;
+  desc?: string;
+  rawQuery?: string;
+  title?: string;
+  datetimeISO?: string;
+  _ics?: string;
+  [key: string]: unknown;
+};
+
+type RunPlan = {
+  goal?: string;
+  steps: RunStep[];
+  [key: string]: unknown;
+};
+
+type NormalizedLinkupResult = {
+  title: string;
+  url: string;
+  snippet: string;
+};
+
+type SearchResearch = {
+  type: "search";
+  message: string;
+  data: {
+    query: string;
+    depth: LinkupDepth;
+    results: NormalizedLinkupResult[];
+  };
+};
+
+type RedactionResearch = {
+  type: "redaction";
+  message: string;
+  data: {
+    rawQuery: string;
+    safeQuery: string;
+    removed: string[];
+  };
+};
+
+type ResearchEvent = SearchResearch | RedactionResearch;
+
+const AnalysisFindingSchema = z.object({
+  risk: z.string(),
+  severity: z.enum(["low", "medium", "high"]),
+  whyItMatters: z.string(),
+  suggestedEdit: z.string(),
+});
 
 /** ---------- Schema for Outputs (Drafts + Evidence) ---------- */
 const FinalSchema = z.object({
@@ -38,14 +107,11 @@ const FinalSchema = z.object({
     })
   ),
 
-  contractRisks: z.array(
-    z.object({
-      risk: z.string(),
-      severity: z.enum(["low", "medium", "high"]),
-      whyItMatters: z.string(),
-      suggestedEdit: z.string(),
-    })
-  ),
+  analysisSection: z.object({
+    title: z.string(),
+    sectionType: AnalysisSectionTypeEnum,
+    findings: z.array(AnalysisFindingSchema),
+  }),
 
   replyDraft: z.object({
     subject: z.string(),
@@ -62,6 +128,34 @@ const FinalSchema = z.object({
     whatIDid: z.array(z.string()),
     uncertainties: z.array(z.string()),
   }),
+});
+
+const RunRequestSchema = z.object({
+  plan: z.object({
+    goal: z.string().optional(),
+    steps: z
+      .array(
+        z
+          .object({
+            id: z.string(),
+            type: z.string(),
+            desc: z.string().optional(),
+            rawQuery: z.string().optional(),
+            title: z.string().optional(),
+            datetimeISO: z.string().optional(),
+          })
+          .passthrough()
+      )
+      .default([]),
+  }),
+  emailText: z.string().optional().default(""),
+  docText: z.string().optional().default(""),
+  command: z.string().optional().default(""),
+  options: z
+    .object({
+      linkupDepth: z.enum(["standard", "deep"]).default("standard"),
+    })
+    .optional(),
 });
 
 /** ---------- Schema for Linkup-derived entity profiles ---------- */
@@ -97,46 +191,18 @@ function tomorrowAt3pmNYISO(): string {
   return `${y}-${m}-${d}T15:00:00-05:00`;
 }
 
-/** ---------- Extract likely entities from plan + text (lightweight) ---------- */
-function extractEntityCandidates(plan: any, emailText: string, docText: string): string[] {
-  const candidates = new Set<string>();
-  const patterns = [
-    /\b([A-Z][A-Za-z0-9&.\- ]{2,}?\s(?:LLC|Inc|Corp|Corporation|Ltd|Limited))\b/g,
-  ];
-
-  const combined = `${emailText}\n${docText}`;
-  for (const pat of patterns) {
-    let m;
-    while ((m = pat.exec(combined)) !== null) {
-      candidates.add(m[1].trim());
-    }
-  }
-
-  // fallback: infer from search queries if regex found nothing
-  const searchSteps = (plan?.steps || []).filter((s: any) => s.type === "redact_and_search");
-  if (candidates.size === 0) {
-    for (const s of searchSteps) {
-      const q = (s.rawQuery || "").trim();
-      const guess = q.split(/\s+/).slice(0, 4).join(" ").trim();
-      if (guess) candidates.add(guess);
-    }
-  }
-
-  return Array.from(candidates).slice(0, 4);
-}
-
 /** ---------- Convert research array into per-entity buckets ---------- */
-function groupResearchByEntity(plan: any, research: any[]) {
-  const searchSteps = (plan?.steps || []).filter((s: any) => s.type === "redact_and_search");
-  const searches = research.filter((r: any) => r.type === "search");
+function groupResearchByEntity(plan: RunPlan, research: ResearchEvent[]) {
+  const searchSteps = plan.steps.filter((s) => s.type === "redact_and_search");
+  const searches = research.filter((r): r is SearchResearch => r.type === "search");
 
-  const perEntity: Array<{ entityHint: string; query: string; results: any[] }> = [];
+  const perEntity: Array<{ entityHint: string; query: string; results: NormalizedLinkupResult[] }> = [];
 
   for (let i = 0; i < searchSteps.length; i++) {
     const step = searchSteps[i];
     const search = searches[i];
-    const query = search?.data?.query || step?.rawQuery || "";
-    const results = search?.data?.results || [];
+    const query = search?.data.query || step.rawQuery || "";
+    const results = search?.data.results || [];
     const entityHint = (query.split(",")[0] || query).split(" company")[0].trim();
     perEntity.push({ entityHint, query, results });
   }
@@ -144,22 +210,140 @@ function groupResearchByEntity(plan: any, research: any[]) {
   return perEntity;
 }
 
-/** ---------- Utility: brief deadline extraction (hackathon-safe) ---------- */
-function extractDeadlines(text: string): string[] {
-  const out = new Set<string>();
-  const patterns = [
-    /\bby\s+(end of day|eod|end of week)\b/gi,
-    /\bwithin\s+\d+\s+(days|weeks)\b/gi,
-    /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s+\d{4}\b/gi,
-    /\b\d{4}-\d{2}-\d{2}\b/g,
-    /\btomorrow\b/gi,
-    /\bnext week\b/gi,
-  ];
-  for (const p of patterns) {
-    const m = text.match(p);
-    if (m) m.forEach((x) => out.add(x.trim()));
+function deriveAnalysisSectionHint(command: string, emailText: string, docText: string): {
+  sectionType: AnalysisSectionType;
+  title: string;
+  reason: string;
+} {
+  const text = `${command}\n${emailText}\n${docText}`.toLowerCase();
+
+  const hasContract = /\b(contract|agreement|msa|nda|terms|indemn|liability|governing law|clause|legal)\b/.test(text);
+  const hasSecurity = /\b(phish|phishing|credential|password|mfa|security|malware|spoof|suspicious link|attachment)\b/.test(
+    text
+  );
+  const hasFinance = /\b(payment|invoice|wire|ach|bank details|beneficiary|refund|billing|remittance)\b/.test(text);
+  const hasScheduling = /\b(deadline|schedule|meeting|timeline|eta|due date|calendar|availability)\b/.test(text);
+  const hasOperations = /\b(outage|incident|ticket|support|bug|deployment|uptime|sla)\b/.test(text);
+
+  if (hasContract) {
+    return {
+      sectionType: "contract",
+      title: "Contract Risks",
+      reason: "Legal/contract terms detected in user command or content.",
+    };
   }
-  return Array.from(out).slice(0, 8);
+  if (hasSecurity) {
+    return {
+      sectionType: "security",
+      title: "Security Findings",
+      reason: "Security/phishing indicators detected in user command or content.",
+    };
+  }
+  if (hasFinance) {
+    return {
+      sectionType: "finance",
+      title: "Payment & Fraud Risks",
+      reason: "Payment/invoice context detected in user command or content.",
+    };
+  }
+  if (hasScheduling) {
+    return {
+      sectionType: "scheduling",
+      title: "Execution & Timeline Risks",
+      reason: "Scheduling/deadline context detected in user command or content.",
+    };
+  }
+  if (hasOperations) {
+    return {
+      sectionType: "operations",
+      title: "Operational Risks",
+      reason: "Support/operations context detected in user command or content.",
+    };
+  }
+
+  return {
+    sectionType: "general",
+    title: "Key Risks & Actions",
+    reason: "No dominant contract/security/finance/ops/scheduling context detected.",
+  };
+}
+
+function entityProfileCacheKey(args: {
+  entity: string;
+  query: string;
+  depth: LinkupDepth;
+}): string {
+  const raw = `${args.entity.toLowerCase()}|${args.query.toLowerCase()}|${args.depth}`;
+  return createHash("sha256").update(raw).digest("hex");
+}
+
+async function hasMongoCache(): Promise<boolean> {
+  if (!process.env.MONGODB_URI) return false;
+  try {
+    await connectMongo();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function getCachedProfile(args: {
+  entity: string;
+  query: string;
+  depth: LinkupDepth;
+}): Promise<z.infer<typeof EntityProfileSchema> | null> {
+  const key = entityProfileCacheKey(args);
+  const cachedRaw = (await EntityProfileCacheModel.findOne({
+    cacheKey: key,
+    expiresAt: { $gt: new Date() },
+  })
+    .lean()
+    .exec()) as unknown;
+  if (!cachedRaw || Array.isArray(cachedRaw)) return null;
+
+  const cached = cachedRaw as { _id: unknown; profile?: unknown };
+  if (!cached.profile) return null;
+
+  const parsed = EntityProfileSchema.safeParse(cached.profile);
+  if (!parsed.success) return null;
+
+  await EntityProfileCacheModel.updateOne(
+    { _id: cached._id },
+    { $set: { lastAccessedAt: new Date() } }
+  ).exec();
+
+  return parsed.data;
+}
+
+async function saveCachedProfile(args: {
+  entity: string;
+  query: string;
+  depth: LinkupDepth;
+  profile: z.infer<typeof EntityProfileSchema>;
+}): Promise<void> {
+  const key = entityProfileCacheKey(args);
+  const now = new Date();
+  const ttlMs = args.depth === "deep" ? 7 * 24 * 60 * 60 * 1000 : 3 * 24 * 60 * 60 * 1000;
+  const expiresAt = new Date(now.getTime() + ttlMs);
+
+  await EntityProfileCacheModel.updateOne(
+    { cacheKey: key },
+    {
+      $set: {
+        cacheKey: key,
+        entity: args.entity,
+        entityType: "unknown",
+        query: args.query,
+        depth: args.depth,
+        profile: args.profile,
+        confidence: Math.max(0, 100 - Math.round(args.profile.redFlags.length * 15)),
+        sourceUrls: args.profile.sourceEvidence.map((s) => s.url).filter(Boolean),
+        expiresAt,
+        lastAccessedAt: now,
+      },
+    },
+    { upsert: true }
+  ).exec();
 }
 
 export async function POST(req: Request) {
@@ -177,17 +361,21 @@ export async function POST(req: Request) {
       );
     }
 
-    const { plan, emailText = "", docText = "", command = "" } = await req.json();
+    const payload = RunRequestSchema.parse(await req.json());
+    const plan: RunPlan = payload.plan as RunPlan;
+    const { emailText, docText, command } = payload;
+    const linkupDepth: LinkupDepth = payload.options?.linkupDepth ?? "standard";
 
-    const ledger: any[] = [];
-    const research: any[] = [];
+    const ledger: Array<Record<string, unknown>> = [];
+    const research: ResearchEvent[] = [];
+    const mongoCacheReady = await hasMongoCache();
 
-    const log = (type: string, message: string, data?: any) => {
+    const log = (type: string, message: string, data?: unknown) => {
       ledger.push({ ts: new Date().toISOString(), type, message, data });
     };
 
     log("plan", "Plan received", plan);
-    log("command", "User command received", { command });
+    log("command", "User command received", { command, linkupDepth });
 
     // Execute steps (only redact_and_search + create_ics)
     for (const step of plan.steps) {
@@ -208,27 +396,30 @@ export async function POST(req: Request) {
           safeQuery: redacted.safeQuery,
         });
 
-        const response: any = await linkup.search({
+        const response = (await linkup.search({
           query: redacted.safeQuery,
-          depth: "standard",
+          depth: linkupDepth,
           outputType: "searchResults",
           includeImages: false,
-        });
+        })) as { results?: Array<{ title?: string; name?: string; url?: string; snippet?: string; content?: string }> };
 
-        const results = (response?.results ?? []).slice(0, 6).map((r: any) => ({
-          title: r?.title ?? "Untitled",
-          url: r?.url ?? "",
-          snippet: r?.snippet ?? "",
-        }));
+        const results: NormalizedLinkupResult[] = (response.results ?? [])
+          .slice(0, 8)
+          .map((r) => ({
+            title: r.title || r.name || "Untitled",
+            url: r.url || "",
+            snippet: (r.snippet || r.content || "").slice(0, 360),
+          }));
 
         research.push({
           type: "search",
           message: step.desc || "Linkup search",
-          data: { query: redacted.safeQuery, results },
+          data: { query: redacted.safeQuery, depth: linkupDepth, results },
         });
 
         log("search", "Linkup search completed", {
           query: redacted.safeQuery,
+          depth: linkupDepth,
           resultsCount: results.length,
         });
       }
@@ -256,11 +447,34 @@ export async function POST(req: Request) {
 
     // --- Prepare evidence for synthesis ---
     const perEntityResearch = groupResearchByEntity(plan, research);
-    const entities = extractEntityCandidates(plan, emailText, docText);
+    const entityCandidates = extractEntityCandidatesFromContext({
+      emailText,
+      docText,
+      searchQueries: perEntityResearch.map((e) => e.query),
+      maxEntities: 6,
+    });
+    const entities = entityCandidates.map((entry) => entry.name);
 
     // --- Build Linkup-derived entity profiles (key upgrade) ---
-    const profiles: any[] = [];
+    const profiles: Array<z.infer<typeof EntityProfileSchema>> = [];
     for (const e of perEntityResearch) {
+      if (mongoCacheReady) {
+        const cached = await getCachedProfile({
+          entity: e.entityHint,
+          query: e.query,
+          depth: linkupDepth,
+        });
+        if (cached) {
+          profiles.push(cached);
+          log("research_profile_cache_hit", "Loaded entity profile from cache", {
+            entity: e.entityHint,
+            query: e.query,
+            depth: linkupDepth,
+          });
+          continue;
+        }
+      }
+
       const profilePrompt = `
 You are a research analyst. Build a compact entity profile ONLY from the provided Linkup search results.
 
@@ -301,23 +515,34 @@ Return STRICT JSON matching this schema exactly:
       });
 
       profiles.push(profileObj.object);
+      if (mongoCacheReady) {
+        await saveCachedProfile({
+          entity: e.entityHint,
+          query: e.query,
+          depth: linkupDepth,
+          profile: profileObj.object,
+        });
+      }
     }
 
     log("research_profile", "Entity profiles extracted from Linkup evidence", {
       count: profiles.length,
-      entities: profiles.map((p: any) => p.entity),
+      entities: profiles.map((p) => p.entity),
+      entityCandidates,
+      cacheEnabled: mongoCacheReady,
     });
 
-    const meetingStep = plan.steps.find((s: any) => s.type === "create_ics");
+    const meetingStep = plan.steps.find((s) => s.type === "create_ics");
     const meetingTitle = meetingStep?.title || "Follow-up Meeting";
     const meetingDatetimeISO = meetingStep?.datetimeISO || tomorrowAt3pmNYISO();
     const meetingICS = meetingStep?._ics || "";
 
-    const deadlines = extractDeadlines(`${emailText}\n${docText}`);
+    const analysisSectionHint = deriveAnalysisSectionHint(command, emailText, docText);
 
     log("synthesis", "Generating user-facing final output using LLM", {
       evidenceQueries: perEntityResearch.map((e) => e.query),
       entities,
+      analysisSectionHint,
     });
 
     // --- Final synthesis: LLM decides genuineness/uncertainty based on extracted profiles ---
@@ -327,14 +552,17 @@ You are an AGI-inspired desktop intelligence agent producing the FINAL user-faci
 User asked: "${command}"
 
 GOAL:
-- Summarize the email + contract.
-- Flag risks (3-6) with severity + suggested edits.
-- Verify company/entity background using Linkup results ONLY.
+- Summarize the email + document context.
+- Build one dynamic analysis section with 3-6 findings (severity + suggested edits), based on the user command and mail type.
+- Verify company/person/entity background using Linkup results ONLY.
 - Output genuineness verdicts with a justified uncertaintyPct that is NOT random.
 
 CRITICAL RULES:
 - You MUST base verdict and uncertaintyPct on the extracted ENTITY_PROFILES_EXTRACTED_FROM_LINKUP only.
 - Do NOT invent sources or facts not present in profiles.
+- analysisSection.title must be context-aware.
+- Use "Contract Risks" only when legal/contract context is actually present.
+- For non-contract mails, use specific titles like "Security Findings", "Payment & Fraud Risks", "Operational Risks", "Execution & Timeline Risks", or "Key Risks & Actions".
 - uncertaintyPct must be driven by:
   (a) profile completeness: official domain + whatItIs + (industry or location)
   (b) consistency: at least 2 sources agree vs sources conflict
@@ -342,9 +570,9 @@ CRITICAL RULES:
 - Guidance for uncertaintyPct:
   - If official domain is present AND whatItIs is clear AND redFlags are empty/low → uncertaintyPct should be 5–25.
   - If missing official domain OR only directories/aggregators OR identity conflicts → uncertaintyPct should be 55–85.
-  - If strong franchise/fiction mismatch or strong spoof signals → verdict suspicious and uncertaintyPct should be 5–25 (high confidence it's suspicious).
+- If strong franchise/fiction mismatch or strong spoof signals → verdict suspicious and uncertaintyPct should be 5–25 (high confidence it's suspicious).
 - Proof must be brief (2-4 items) using profile.sourceEvidence (title/url/snippet). snippet can be "".
-- Ensure replyDraft is a negotiation email aligned to BOTH: contract risks + entity verification outcome.
+- Ensure replyDraft is aligned to BOTH: analysisSection findings + entity verification outcome.
 
 EMAIL_TEXT:
 ${emailText}
@@ -353,13 +581,16 @@ DOCUMENT_TEXT:
 ${docText}
 
 ENTITY_CANDIDATES:
-${JSON.stringify(entities, null, 2)}
+${JSON.stringify(entityCandidates, null, 2)}
 
 LINKUP_EVIDENCE_BY_SEARCH (JSON):
 ${JSON.stringify(perEntityResearch, null, 2)}
 
 ENTITY_PROFILES_EXTRACTED_FROM_LINKUP (JSON):
 ${JSON.stringify(profiles, null, 2)}
+
+ANALYSIS_SECTION_HINT (JSON):
+${JSON.stringify(analysisSectionHint, null, 2)}
 
 MEETING (already generated):
 Title: ${meetingTitle}
@@ -379,15 +610,17 @@ Return STRICT JSON matching the schema exactly.
 
     log("output", "Final output produced", {
       entityVerdicts: final.entityVerdicts?.length ?? 0,
-      contractRisks: final.contractRisks?.length ?? 0,
+      analysisTitle: final.analysisSection?.title ?? "",
+      analysisFindings: final.analysisSection?.findings?.length ?? 0,
       hasICS: !!final.meetingInvite?.ics,
     });
 
-    return Response.json({ ok: true, final, plan, ledger, research, profiles });
-  } catch (err: any) {
+    return Response.json({ ok: true, final, plan, ledger, research, profiles, runConfig: { linkupDepth } });
+  } catch (err: unknown) {
     console.error("Run error:", err);
+    const detail = err instanceof Error ? err.message : String(err);
     return Response.json(
-      { error: "Run failed", detail: err?.message },
+      { error: "Run failed", detail },
       { status: 500 }
     );
   }

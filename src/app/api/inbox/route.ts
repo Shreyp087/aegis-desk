@@ -1,17 +1,51 @@
 import { createHash } from "crypto";
 
+import { anthropic } from "@ai-sdk/anthropic";
+import { google } from "@ai-sdk/google";
 import { openai } from "@ai-sdk/openai";
 import { generateObject } from "ai";
 import { cookies } from "next/headers";
 import { z } from "zod";
 
+import { connectMongo } from "@/lib/db/mongoose";
+import {
+  classifyInboxMail,
+  type IncidentHint,
+  type MailClassifierResult,
+} from "@/lib/inbox/classifier";
 import { fetchLatestGmailRawEmails, getValidGmailToken } from "@/lib/inbox/gmail";
+import {
+  applyActionGuardrails,
+  applyPriorityGuardrails,
+  reconcileMailClass,
+} from "@/lib/inbox/policy";
+import {
+  InboxDecisionTraceSchema,
+  InboxMailClassEnum,
+  InboxThreatTypeEnum,
+  type InboxMailClass,
+  type InboxThreatType,
+} from "@/lib/inbox/schemas";
+import {
+  buildDecisionTrace,
+  deriveMailClass,
+  deriveThreatType,
+} from "@/lib/inbox/signals";
 import {
   OFFLINE_MODE_TEMPLATE_THRESHOLDS,
   OFFLINE_MODE_TEMPLATE_WEIGHTS,
   getOfflineRuntimeConfig,
   isOfflineEnforced,
 } from "@/lib/offline";
+import { IncidentMemoryModel } from "@/lib/models/IncidentMemory";
+import { SenderReputationSnapshotModel } from "@/lib/models/SenderReputationSnapshot";
+import {
+  buildEnvConsensusPolicy,
+  INBOX_ADMIN_SETTINGS_COOKIE,
+  parseInboxAdminSettingsCookie,
+  resolveConsensusPolicy,
+  type InboxConsensusPolicy,
+} from "@/lib/inbox/settings";
 
 type Category =
   | "scam_bec"
@@ -81,7 +115,7 @@ type ParsedEmail = {
   };
 };
 
-type ScoredEmail = ParsedEmail & {
+type ScoringSnapshot = {
   priorityScore: number;
   priority: Priority;
   primaryCategory: Category;
@@ -91,6 +125,16 @@ type ScoredEmail = ParsedEmail & {
   trustScore: number;
   reputation: ReputationProfile;
   thread: ThreadProfile;
+};
+
+type ScoredEmail = ParsedEmail & ScoringSnapshot & {
+  classifier: MailClassifierResult;
+  incidentHints: IncidentHint[];
+  priorityGuardrail: {
+    adjusted: boolean;
+    ruleHits: string[];
+    rationale: string;
+  };
   baseUncertaintyPercent: number;
   evidenceStrength: number;
 };
@@ -137,6 +181,34 @@ const CategoryScoreSchema = z.object({
   reason: z.string(),
 });
 
+const ClassifierSchema = z.object({
+  modelVersion: z.string(),
+  predictedClass: InboxMailClassEnum,
+  probabilities: z.object({
+    spam: z.number().min(0).max(1),
+    harmful: z.number().min(0).max(1),
+    actionable: z.number().min(0).max(1),
+    informational: z.number().min(0).max(1),
+  }),
+  memorySampleCount: z.number().int().min(0),
+  rationale: z.string(),
+});
+
+const GuardrailSchema = z.object({
+  policyVersion: z.string(),
+  ruleHits: z.array(z.string()),
+  rationale: z.string(),
+  priorityAdjusted: z.boolean(),
+  actionAdjusted: z.boolean(),
+  classificationAdjusted: z.boolean(),
+});
+
+const MemoryRefSchema = z.object({
+  sourceHash: z.string(),
+  subjectHash: z.string(),
+  senderEmailHash: z.string(),
+});
+
 const AlertSchema = z.object({
   id: z.string(),
   from: z.string(),
@@ -146,6 +218,9 @@ const AlertSchema = z.object({
   priorityScore: z.number().min(0).max(100),
   priority: PriorityEnum,
   primaryCategory: CategoryEnum,
+  mailClass: InboxMailClassEnum,
+  threatType: InboxThreatTypeEnum,
+  decisionTrace: InboxDecisionTraceSchema,
   categoryScores: z.array(CategoryScoreSchema),
   riskTags: z.array(z.string()),
   signals: z.array(z.string()),
@@ -159,6 +234,9 @@ const AlertSchema = z.object({
     riskScore: z.number().min(0).max(100),
     note: z.string(),
   }),
+  classifier: ClassifierSchema,
+  guardrails: GuardrailSchema,
+  memoryRef: MemoryRefSchema,
   trustScore: z.number().min(0).max(100),
   reputationScore: z.number().min(0).max(100),
   reputationFindings: z.array(z.string()),
@@ -192,6 +270,14 @@ const InboxResponseSchema = z.object({
     highCount: z.number(),
     mediumCount: z.number(),
     lowCount: z.number(),
+    policyVersion: z.string(),
+    modelVersion: z.string(),
+    classifierVersion: z.string(),
+    guardrailVersion: z.string(),
+    learningSamplesUsed: z.number().int().min(0),
+    consensusMode: z.enum(["single", "multi"]),
+    consensusMaxModels: z.number().int().min(1).max(8),
+    consensusSource: z.enum(["env_default", "admin_override"]),
   }),
 });
 
@@ -293,6 +379,17 @@ const CALIBRATION_PROFILES: Record<
   newsletter: { slope: 0.92, offset: -6, reliabilityWeight: 0.4 },
   general: { slope: 0.96, offset: -3, reliabilityWeight: 0.45 },
 };
+
+const INBOX_POLICY_VERSION = process.env.INBOX_POLICY_VERSION || "inbox-policy-v3-phase2";
+
+function inboxModelVersion(args: {
+  offlineEnforced: boolean;
+  consensusPolicy: InboxConsensusPolicy;
+}): string {
+  if (args.offlineEnforced) return "deterministic-offline-v1";
+  if (!args.consensusPolicy.enabled) return "single-model-assist-v2";
+  return `multi-model-consensus-v2-${args.consensusPolicy.maxModels}`;
+}
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -868,7 +965,7 @@ function scoreEmail(args: {
   trustScore: number;
   reputation: ReputationProfile;
   thread: ThreadProfile;
-}): Omit<ScoredEmail, keyof ParsedEmail | "baseUncertaintyPercent" | "evidenceStrength"> {
+}): ScoringSnapshot {
   const text = `${args.parsed.subject}\n${args.parsed.body}`;
   const securityHits = countHits(text, PATTERNS.security);
   const paymentHits = countHits(text, PATTERNS.payment);
@@ -1123,6 +1220,80 @@ type AssistOutput = {
   consensusNote: string;
 };
 
+type AssistModelProvider = "openai" | "anthropic" | "google";
+
+type AssistModelSpec = {
+  provider: AssistModelProvider;
+  model: string;
+  style: string;
+  displayName: string;
+};
+
+type AssistModelRun = {
+  spec: AssistModelSpec;
+  output: z.infer<typeof LLMOutSchema> | null;
+};
+
+type SuccessfulAssistModelRun = {
+  spec: AssistModelSpec;
+  output: z.infer<typeof LLMOutSchema>;
+};
+
+function hasEnv(name: string): boolean {
+  return Boolean(process.env[name]?.trim());
+}
+
+function buildConsensusModelPool(consensusPolicy: InboxConsensusPolicy): AssistModelSpec[] {
+  const candidates: AssistModelSpec[] = [];
+
+  if (hasEnv("OPENAI_API_KEY")) {
+    candidates.push(
+      {
+        provider: "openai",
+        model: "gpt-4o-mini",
+        style: "security-first",
+        displayName: "GPT-4o mini",
+      },
+      {
+        provider: "openai",
+        model: "gpt-4.1-mini",
+        style: "compliance-first",
+        displayName: "GPT-4.1 mini",
+      }
+    );
+  }
+
+  if (hasEnv("GOOGLE_GENERATIVE_AI_API_KEY")) {
+    candidates.push({
+      provider: "google",
+      model: "gemini-2.0-flash",
+      style: "forensics-first",
+      displayName: "Gemini 2.0 Flash",
+    });
+  }
+
+  if (hasEnv("ANTHROPIC_API_KEY")) {
+    candidates.push({
+      provider: "anthropic",
+      model: "claude-3-5-haiku-latest",
+      style: "policy-first",
+      displayName: "Claude 3.5 Haiku",
+    });
+  }
+
+  const maxModels = !consensusPolicy.enabled ? 1 : clamp(consensusPolicy.maxModels, 1, 8);
+
+  return candidates.slice(0, maxModels);
+}
+
+function isSuccessfulAssistModelRun(run: AssistModelRun): run is SuccessfulAssistModelRun {
+  return run.output !== null;
+}
+
+function formatModelNames(models: { displayName: string }[]): string {
+  return models.map((m) => m.displayName).join(", ");
+}
+
 function buildTrustedDecision(args: {
   email: ScoredEmail;
   uncertaintyPercent: number;
@@ -1239,8 +1410,7 @@ Regards`;
 }
 
 async function runAssistModel(args: {
-  model: string;
-  style: string;
+  modelSpec: AssistModelSpec;
   rawEmail: string;
   from: string;
   subject: string;
@@ -1251,9 +1421,9 @@ async function runAssistModel(args: {
   riskTags: string[];
   signals: string[];
   extracted: ParsedEmail["extracted"];
-}): Promise<z.infer<typeof LLMOutSchema> | null> {
+}): Promise<AssistModelRun> {
   const prompt = `
-You are an inbox triage assistant (${args.style}).
+You are an inbox triage assistant (${args.modelSpec.style}).
 Use ONLY the email and provided signals.
 Output strict JSON:
 - suggestedAction: 1 concise sentence with safest next action.
@@ -1276,14 +1446,21 @@ ${args.rawEmail}
 `;
 
   try {
+    const model =
+      args.modelSpec.provider === "openai"
+        ? openai(args.modelSpec.model)
+        : args.modelSpec.provider === "google"
+          ? google(args.modelSpec.model)
+          : anthropic(args.modelSpec.model);
+
     const obj = await generateObject({
-      model: openai(args.model),
+      model,
       schema: LLMOutSchema,
       prompt,
     });
-    return obj.object;
+    return { spec: args.modelSpec, output: obj.object };
   } catch {
-    return null;
+    return { spec: args.modelSpec, output: null };
   }
 }
 
@@ -1298,54 +1475,79 @@ async function llmAssistWithConsensus(args: {
   riskTags: string[];
   signals: string[];
   extracted: ParsedEmail["extracted"];
+  consensusPolicy: InboxConsensusPolicy;
 }) {
-  const primaryPromise = runAssistModel({
-    ...args,
-    model: "gpt-4o-mini",
-    style: "security-first",
-  });
-  const secondaryPromise = runAssistModel({
-    ...args,
-    model: "gpt-4.1-mini",
-    style: "compliance-first",
-  });
-
-  const [primary, secondary] = await Promise.all([primaryPromise, secondaryPromise]);
-
-  if (!primary && !secondary) {
+  const modelPool = buildConsensusModelPool(args.consensusPolicy);
+  if (modelPool.length === 0) {
     return {
       suggestedAction: "Review the request and verify the sender before taking action.",
       draftReply: "Thanks for your email. I will verify details through a trusted channel and then confirm next steps.",
       consensusScore: 30,
-      consensusNote: "Both reasoning models failed; fallback response used.",
+      consensusNote:
+        "No consensus models configured. Set OPENAI_API_KEY and optionally GOOGLE_GENERATIVE_AI_API_KEY / ANTHROPIC_API_KEY.",
     };
   }
 
-  if (primary && !secondary) {
+  const runs = await Promise.all(modelPool.map((modelSpec) => runAssistModel({ ...args, modelSpec })));
+  const successfulRuns = runs.filter(isSuccessfulAssistModelRun);
+
+  if (successfulRuns.length === 0) {
     return {
-      ...primary,
-      consensusScore: 52,
-      consensusNote: "Single-model response (secondary model unavailable).",
+      suggestedAction: "Review the request and verify the sender before taking action.",
+      draftReply: "Thanks for your email. I will verify details through a trusted channel and then confirm next steps.",
+      consensusScore: 30,
+      consensusNote: `All configured reasoning models failed (${formatModelNames(modelPool)}); fallback response used.`,
     };
   }
 
-  if (!primary && secondary) {
+  if (successfulRuns.length === 1) {
     return {
-      ...secondary,
+      ...successfulRuns[0].output,
       consensusScore: 52,
-      consensusNote: "Single-model response (primary model unavailable).",
+      consensusNote: `Single-model response (${successfulRuns[0].spec.displayName}). Enable consensus in Inbox settings to run multiple models.`,
     };
   }
 
-  const actionSim = jaccardScore(primary!.suggestedAction, secondary!.suggestedAction);
-  const draftSim = jaccardScore(primary!.draftReply, secondary!.draftReply);
-  const consensusScore = clamp(Math.round((actionSim * 0.6 + draftSim * 0.4) * 100), 0, 100);
+  const pairScores: number[] = [];
+  for (let i = 0; i < successfulRuns.length; i += 1) {
+    for (let j = i + 1; j < successfulRuns.length; j += 1) {
+      const actionSim = jaccardScore(successfulRuns[i].output.suggestedAction, successfulRuns[j].output.suggestedAction);
+      const draftSim = jaccardScore(successfulRuns[i].output.draftReply, successfulRuns[j].output.draftReply);
+      pairScores.push(actionSim * 0.6 + draftSim * 0.4);
+    }
+  }
+  const consensusScore = clamp(
+    Math.round((pairScores.reduce((sum, score) => sum + score, 0) / pairScores.length) * 100),
+    0,
+    100
+  );
+
+  let anchor = successfulRuns[0];
+  let bestCentrality = -1;
+  for (const run of successfulRuns) {
+    let similaritySum = 0;
+    let comparisons = 0;
+    for (const other of successfulRuns) {
+      if (run === other) continue;
+      const actionSim = jaccardScore(run.output.suggestedAction, other.output.suggestedAction);
+      const draftSim = jaccardScore(run.output.draftReply, other.output.draftReply);
+      similaritySum += actionSim * 0.6 + draftSim * 0.4;
+      comparisons += 1;
+    }
+    const centrality = comparisons === 0 ? 0 : similaritySum / comparisons;
+    if (centrality > bestCentrality) {
+      bestCentrality = centrality;
+      anchor = run;
+    }
+  }
+
+  const successfulModelNames = formatModelNames(successfulRuns.map((r) => r.spec));
 
   if (consensusScore >= 58) {
     return {
-      ...primary!,
+      ...anchor.output,
       consensusScore,
-      consensusNote: "High agreement between two model perspectives.",
+      consensusNote: `High agreement across ${successfulRuns.length} models (${successfulModelNames}).`,
     };
   }
 
@@ -1355,7 +1557,7 @@ async function llmAssistWithConsensus(args: {
     draftReply:
       "Thank you for your message.\nBefore proceeding, I need to verify the request and sender details through a trusted channel.\nI will follow up once verification is complete.",
     consensusScore,
-    consensusNote: "Low model agreement; conservative consensus output applied.",
+    consensusNote: `Low agreement across ${successfulRuns.length} models (${successfulModelNames}); conservative consensus output applied.`,
   };
 }
 
@@ -1412,6 +1614,205 @@ function parseRawEmail(raw: string, id: string): ParsedEmail {
   };
 }
 
+function buildMemoryRef(args: { raw: string; subject: string; senderEmail: string }) {
+  return {
+    sourceHash: createHashKey(`raw:${args.raw.slice(0, 2400)}`),
+    subjectHash: createHashKey(`subject:${args.subject}`),
+    senderEmailHash: args.senderEmail ? createHashKey(`sender:${args.senderEmail}`) : "",
+  };
+}
+
+async function loadIncidentHints(parsedEmails: ParsedEmail[]): Promise<Record<string, IncidentHint[]>> {
+  if (!process.env.MONGODB_URI || parsedEmails.length === 0) return {};
+
+  try {
+    await connectMongo();
+
+    const senderDomains = Array.from(
+      new Set(parsedEmails.map((email) => email.senderDomain).filter(Boolean))
+    );
+    const senderEmailHashes = Array.from(
+      new Set(
+        parsedEmails
+          .map((email) => (email.senderEmail ? createHashKey(`sender:${email.senderEmail}`) : ""))
+          .filter(Boolean)
+      )
+    );
+    const subjectHashes = Array.from(
+      new Set(parsedEmails.map((email) => createHashKey(`subject:${email.subject}`)))
+    );
+
+    const orFilters: Array<Record<string, unknown>> = [];
+    if (senderDomains.length > 0) {
+      orFilters.push({ senderDomain: { $in: senderDomains } });
+    }
+    if (senderEmailHashes.length > 0) {
+      orFilters.push({ senderEmailHash: { $in: senderEmailHashes } });
+    }
+    if (subjectHashes.length > 0) {
+      orFilters.push({ subjectHash: { $in: subjectHashes } });
+    }
+
+    if (orFilters.length === 0) return {};
+
+    const rawDocs = (await IncidentMemoryModel.find({ $or: orFilters })
+      .sort({ createdAt: -1 })
+      .limit(800)
+      .lean()
+      .exec()) as unknown;
+
+    if (!Array.isArray(rawDocs)) return {};
+
+    const docs = rawDocs as Array<{
+      senderDomain?: unknown;
+      senderEmailHash?: unknown;
+      subjectHash?: unknown;
+      mailClass?: unknown;
+      threatType?: unknown;
+      trustedAction?: unknown;
+      priorityScore?: unknown;
+      outcomeLabel?: unknown;
+    }>;
+
+    const out: Record<string, IncidentHint[]> = {};
+
+    for (const email of parsedEmails) {
+      const senderEmailHash = email.senderEmail
+        ? createHashKey(`sender:${email.senderEmail}`)
+        : "";
+      const subjectHash = createHashKey(`subject:${email.subject}`);
+
+      const hints: IncidentHint[] = [];
+      for (const doc of docs) {
+        const docSenderDomain =
+          typeof doc.senderDomain === "string" ? doc.senderDomain.toLowerCase() : "";
+        const docSenderEmailHash =
+          typeof doc.senderEmailHash === "string" ? doc.senderEmailHash : "";
+        const docSubjectHash = typeof doc.subjectHash === "string" ? doc.subjectHash : "";
+
+        const senderEmailMatch = Boolean(
+          senderEmailHash && docSenderEmailHash === senderEmailHash
+        );
+        const senderDomainMatch = Boolean(
+          email.senderDomain &&
+            docSenderDomain &&
+            docSenderDomain === email.senderDomain
+        );
+        const subjectMatch = Boolean(docSubjectHash && docSubjectHash === subjectHash);
+
+        if (!senderEmailMatch && !senderDomainMatch && !subjectMatch) continue;
+
+        const parsedMailClass = InboxMailClassEnum.safeParse(doc.mailClass);
+        if (!parsedMailClass.success) continue;
+
+        const parsedThreatType = InboxThreatTypeEnum.safeParse(doc.threatType);
+        if (!parsedThreatType.success) continue;
+
+        const parsedAction = TrustedDecisionActionEnum.safeParse(doc.trustedAction);
+
+        hints.push({
+          mailClass: parsedMailClass.data,
+          threatType: parsedThreatType.data,
+          trustedAction: parsedAction.success ? parsedAction.data : "allow",
+          priorityScore:
+            typeof doc.priorityScore === "number"
+              ? clamp(Math.round(doc.priorityScore), 0, 100)
+              : 50,
+          outcomeLabel:
+            typeof doc.outcomeLabel === "string" ? doc.outcomeLabel.trim() : "",
+        });
+
+        if (hints.length >= 24) break;
+      }
+
+      out[email.id] = hints;
+    }
+
+    return out;
+  } catch (error) {
+    console.warn("Incident hint loading skipped:", error);
+    return {};
+  }
+}
+
+async function persistInboxMemory(args: {
+  alerts: Alert[];
+  modelVersion: string;
+  policyVersion: string;
+}): Promise<void> {
+  if (!process.env.MONGODB_URI) return;
+
+  try {
+    await connectMongo();
+
+    const incidentDocs = args.alerts.slice(0, 40).map((alert) => ({
+      sourceEmailId: alert.id,
+      sourceHash: alert.memoryRef.sourceHash,
+      senderDomain: alert.senderDomain,
+      senderEmailHash: alert.memoryRef.senderEmailHash,
+      subjectHash: alert.memoryRef.subjectHash,
+      primaryCategory: alert.primaryCategory,
+      mailClass: alert.mailClass,
+      threatType: alert.threatType,
+      trustedAction: alert.trustedDecision.action,
+      priorityScore: alert.priorityScore,
+      consensusScore: alert.consensusScore,
+      riskTags: alert.riskTags.slice(0, 12),
+      signals: alert.signals.slice(0, 12),
+      evidenceRefs: alert.decisionTrace.evidenceRefs,
+      policyVersion: args.policyVersion,
+      modelVersion: args.modelVersion,
+      outcomeLabel: "",
+      feedbackSource: "inbox_scan",
+    }));
+
+    if (incidentDocs.length > 0) {
+      await IncidentMemoryModel.insertMany(incidentDocs, { ordered: false });
+    }
+
+    const snapshotOps = args.alerts
+      .filter((alert) => alert.senderDomain)
+      .slice(0, 60)
+      .map((alert) => ({
+        updateOne: {
+          filter: {
+            senderDomain: alert.senderDomain,
+            senderEmailHash: alert.senderEmail
+              ? createHashKey(`sender:${alert.senderEmail}`)
+              : "",
+          },
+          update: {
+            $set: {
+              trustScore: alert.trustScore,
+              reputationScore: alert.reputationScore,
+              lastSeenAt: new Date(),
+            },
+            $inc: {
+              highCount: alert.priority === "high" ? 1 : 0,
+              mediumCount: alert.priority === "medium" ? 1 : 0,
+              lowCount: alert.priority === "low" ? 1 : 0,
+              sampleSize: 1,
+            },
+            $addToSet: {
+              notes: {
+                $each: alert.riskTags.slice(0, 4),
+              },
+            },
+          },
+          upsert: true,
+        },
+      }));
+
+    if (snapshotOps.length > 0) {
+      await SenderReputationSnapshotModel.bulkWrite(snapshotOps, {
+        ordered: false,
+      });
+    }
+  } catch (error) {
+    console.warn("Inbox memory persistence skipped:", error);
+  }
+}
+
 export async function POST(req: Request) {
   try {
     const offlineConfig = getOfflineRuntimeConfig();
@@ -1420,6 +1821,18 @@ export async function POST(req: Request) {
     const body = await req.json();
     const parsed = InboxRequestSchema.parse(body);
     const cookieStore = await cookies();
+    const envConsensusPolicy = buildEnvConsensusPolicy();
+    const adminSettings = parseInboxAdminSettingsCookie(
+      cookieStore.get(INBOX_ADMIN_SETTINGS_COOKIE)?.value
+    );
+    const consensusPolicy = resolveConsensusPolicy({
+      envPolicy: envConsensusPolicy,
+      adminSettings,
+    });
+    const modelVersion = inboxModelVersion({
+      offlineEnforced,
+      consensusPolicy,
+    });
 
     if (offlineEnforced && parsed.mode === "gmail" && offlineConfig.blockOutboundNetwork) {
       return Response.json(
@@ -1439,6 +1852,7 @@ export async function POST(req: Request) {
     const parsedEmails = emails.map((raw, idx) => parseRawEmail(raw, `email-${idx + 1}`));
     const threadProfiles = buildThreadProfiles(parsedEmails);
     const trustGraph = readTrustGraphCookie(cookieStore.get(TRUST_COOKIE)?.value);
+    const incidentHintsByEmail = await loadIncidentHints(parsedEmails);
 
     const scored: ScoredEmail[] = parsedEmails.map((email) => {
       const trustScore = getTrustScore(trustGraph, email.senderEmail, email.senderDomain);
@@ -1457,17 +1871,69 @@ export async function POST(req: Request) {
         reputation,
         thread,
       });
+      const incidentHints = incidentHintsByEmail[email.id] || [];
+      const classifier = classifyInboxMail({
+        primaryCategory: s.primaryCategory,
+        categoryScores: s.categoryScores.map((entry) => ({
+          category: entry.category,
+          score: entry.score,
+        })),
+        riskTags: s.riskTags,
+        signals: s.signals,
+        trustScore: s.trustScore,
+        reputationScore: s.reputation.score,
+        threadDepth: s.thread.depth,
+        threadRiskDensity: s.thread.riskDensity,
+        attachmentRiskScore: email.extracted.attachmentRiskScore,
+        urlsCount: email.extracted.urls.length,
+        moneyMentionsCount: email.extracted.moneyMentions.length,
+        deadlineCount: email.extracted.deadlines.length,
+        incidentHints,
+      });
+
+      const priorityGuardrail = applyPriorityGuardrails({
+        primaryCategory: s.primaryCategory,
+        categoryScores: s.categoryScores.map((entry) => ({
+          category: entry.category,
+          score: entry.score,
+        })),
+        priorityScore: s.priorityScore,
+        signals: s.signals,
+        trustScore: s.trustScore,
+        reputationScore: s.reputation.score,
+        attachmentRiskScore: email.extracted.attachmentRiskScore,
+        urlsCount: email.extracted.urls.length,
+        classifier,
+      });
+
+      const guardrailTags = priorityGuardrail.ruleHits.map((rule) => `Guardrail:${rule}`);
+      const riskTags = Array.from(new Set([...s.riskTags, ...guardrailTags]));
+      const signals = Array.from(
+        new Set([
+          ...s.signals,
+          `classifier predicted ${classifier.predictedClass}`,
+          `classifier probs spam/harmful/actionable/info ${Math.round(
+            classifier.probabilities.spam * 100
+          )}/${Math.round(classifier.probabilities.harmful * 100)}/${Math.round(
+            classifier.probabilities.actionable * 100
+          )}/${Math.round(classifier.probabilities.informational * 100)}`,
+          ...(priorityGuardrail.adjusted ? [priorityGuardrail.rationale] : []),
+        ])
+      );
 
       const evidenceStrength = clamp(
-        Math.round(s.categoryScores[0].score * 0.65 + (s.signals.length * 4 + s.riskTags.length * 3)),
+        Math.round(
+          s.categoryScores[0].score * 0.65 +
+            (signals.length * 4 + riskTags.length * 3)
+        ),
         0,
         100
       );
       const baseUncertaintyPercent = computeBaseUncertainty({
         rawEmail: email.raw,
-        priorityScore: s.priorityScore,
-        riskTags: s.riskTags,
-        signals: s.signals,
+        priorityScore: priorityGuardrail.priorityScore,
+        riskTags,
+        signals,
         extracted: email.extracted,
         categoryScores: s.categoryScores,
         trustScore: s.trustScore,
@@ -1478,6 +1944,17 @@ export async function POST(req: Request) {
       return {
         ...email,
         ...s,
+        priorityScore: priorityGuardrail.priorityScore,
+        priority: priorityGuardrail.priority,
+        riskTags,
+        signals,
+        classifier,
+        incidentHints,
+        priorityGuardrail: {
+          adjusted: priorityGuardrail.adjusted,
+          ruleHits: priorityGuardrail.ruleHits,
+          rationale: priorityGuardrail.rationale,
+        },
         baseUncertaintyPercent,
         evidenceStrength,
       };
@@ -1492,12 +1969,30 @@ export async function POST(req: Request) {
           email,
           uncertaintyPercent: email.baseUncertaintyPercent,
         });
+        const seedActionGuardrail = applyActionGuardrails({
+          currentAction: seedDecision.action,
+          primaryCategory: email.primaryCategory,
+          categoryScores: email.categoryScores.map((entry) => ({
+            category: entry.category,
+            score: entry.score,
+          })),
+          attachmentRiskScore: email.extracted.attachmentRiskScore,
+          urlsCount: email.extracted.urls.length,
+          classifier: email.classifier,
+        });
+        const seedDecisionGuarded: TrustedDecision = {
+          ...seedDecision,
+          action: seedActionGuardrail.action,
+          note: seedActionGuardrail.adjusted
+            ? `${seedDecision.note} ${seedActionGuardrail.note}`
+            : seedDecision.note,
+        };
 
         const llm = offlineEnforced
           ? offlineAssistFromPolicy({
               from: email.from,
               subject: email.subject,
-              trustedDecision: seedDecision,
+              trustedDecision: seedDecisionGuarded,
               primaryCategory: email.primaryCategory,
               riskTags: email.riskTags,
             })
@@ -1512,6 +2007,7 @@ export async function POST(req: Request) {
               riskTags: email.riskTags,
               signals: email.signals,
               extracted: email.extracted,
+              consensusPolicy,
             });
 
         const uncertaintyPercent = calibrateUncertainty({
@@ -1523,7 +2019,25 @@ export async function POST(req: Request) {
           consensusScore: llm.consensusScore,
           threadDepth: email.thread.depth,
         });
-        const trustedDecision = buildTrustedDecision({ email, uncertaintyPercent });
+        const trustedDecisionRaw = buildTrustedDecision({ email, uncertaintyPercent });
+        const actionGuardrail = applyActionGuardrails({
+          currentAction: trustedDecisionRaw.action,
+          primaryCategory: email.primaryCategory,
+          categoryScores: email.categoryScores.map((entry) => ({
+            category: entry.category,
+            score: entry.score,
+          })),
+          attachmentRiskScore: email.extracted.attachmentRiskScore,
+          urlsCount: email.extracted.urls.length,
+          classifier: email.classifier,
+        });
+        const trustedDecision: TrustedDecision = {
+          ...trustedDecisionRaw,
+          action: actionGuardrail.action,
+          note: actionGuardrail.adjusted
+            ? `${trustedDecisionRaw.note} ${actionGuardrail.note}`
+            : trustedDecisionRaw.note,
+        };
         const finalAssist = offlineEnforced
           ? offlineAssistFromPolicy({
               from: email.from,
@@ -1534,6 +2048,68 @@ export async function POST(req: Request) {
             })
           : llm;
 
+        const derivedThreatType: InboxThreatType = deriveThreatType({
+          primaryCategory: email.primaryCategory,
+          riskTags: email.riskTags,
+        });
+        const derivedMailClass: InboxMailClass = deriveMailClass({
+          primaryCategory: email.primaryCategory,
+          threatType: derivedThreatType,
+          priorityScore: email.priorityScore,
+          trustedAction: trustedDecision.action,
+          riskTags: email.riskTags,
+        });
+        const classReconcile = reconcileMailClass({
+          primaryCategory: email.primaryCategory,
+          derivedMailClass,
+          derivedThreatType,
+          classifier: email.classifier,
+        });
+
+        const policyRuleHits = Array.from(
+          new Set([
+            ...email.priorityGuardrail.ruleHits,
+            ...actionGuardrail.ruleHits,
+            ...classReconcile.ruleHits,
+          ])
+        );
+        const policyRationale = [
+          email.priorityGuardrail.rationale,
+          actionGuardrail.note,
+          classReconcile.rationale,
+        ]
+          .filter(Boolean)
+          .join(" ");
+        const decisionRiskTags = Array.from(
+          new Set([...email.riskTags, ...policyRuleHits.map((rule) => `Policy:${rule}`)])
+        );
+        const decisionSignals = Array.from(
+          new Set([...email.signals, ...(classReconcile.adjusted ? [classReconcile.rationale] : [])])
+        );
+        const decisionTrace = buildDecisionTrace({
+          primaryCategory: email.primaryCategory,
+          priorityScore: email.priorityScore,
+          trustedAction: trustedDecision.action,
+          riskTags: decisionRiskTags,
+          topCategoryScores: email.categoryScores.slice(0, 4).map((entry) => ({
+            category: entry.category,
+            score: entry.score,
+          })),
+          trustScore: email.trustScore,
+          reputationScore: email.reputation.score,
+          threadDepth: email.thread.depth,
+          threadRiskDensity: email.thread.riskDensity,
+          consensusScore: finalAssist.consensusScore,
+          policyVersion: INBOX_POLICY_VERSION,
+          modelVersion,
+        });
+
+        const memoryRef = buildMemoryRef({
+          raw: email.raw,
+          subject: email.subject,
+          senderEmail: email.senderEmail,
+        });
+
         return {
           id: email.id,
           from: email.from,
@@ -1543,14 +2119,27 @@ export async function POST(req: Request) {
           priorityScore: email.priorityScore,
           priority: email.priority,
           primaryCategory: email.primaryCategory,
+          mailClass: classReconcile.mailClass,
+          threatType: classReconcile.threatType,
+          decisionTrace,
           categoryScores: email.categoryScores,
-          riskTags: email.riskTags,
-          signals: email.signals,
+          riskTags: decisionRiskTags,
+          signals: decisionSignals,
           suggestedAction: finalAssist.suggestedAction,
           draftReply: finalAssist.draftReply,
           consensusScore: finalAssist.consensusScore,
           consensusNote: finalAssist.consensusNote,
           trustedDecision,
+          classifier: email.classifier,
+          guardrails: {
+            policyVersion: INBOX_POLICY_VERSION,
+            ruleHits: policyRuleHits,
+            rationale: policyRationale,
+            priorityAdjusted: email.priorityGuardrail.adjusted,
+            actionAdjusted: actionGuardrail.adjusted,
+            classificationAdjusted: classReconcile.adjusted,
+          },
+          memoryRef,
           trustScore: email.trustScore,
           reputationScore: email.reputation.score,
           reputationFindings: email.reputation.findings,
@@ -1580,7 +2169,77 @@ export async function POST(req: Request) {
         consensusScore: 50,
         threadDepth: email.thread.depth,
       });
-      const trustedDecision = buildTrustedDecision({ email, uncertaintyPercent });
+      const trustedDecisionRaw = buildTrustedDecision({ email, uncertaintyPercent });
+      const actionGuardrail = applyActionGuardrails({
+        currentAction: trustedDecisionRaw.action,
+        primaryCategory: email.primaryCategory,
+        categoryScores: email.categoryScores.map((entry) => ({
+          category: entry.category,
+          score: entry.score,
+        })),
+        attachmentRiskScore: email.extracted.attachmentRiskScore,
+        urlsCount: email.extracted.urls.length,
+        classifier: email.classifier,
+      });
+      const trustedDecision: TrustedDecision = {
+        ...trustedDecisionRaw,
+        action: actionGuardrail.action,
+        note: actionGuardrail.adjusted
+          ? `${trustedDecisionRaw.note} ${actionGuardrail.note}`
+          : trustedDecisionRaw.note,
+      };
+      const derivedThreatType: InboxThreatType = deriveThreatType({
+        primaryCategory: email.primaryCategory,
+        riskTags: email.riskTags,
+      });
+      const derivedMailClass: InboxMailClass = deriveMailClass({
+        primaryCategory: email.primaryCategory,
+        threatType: derivedThreatType,
+        priorityScore: email.priorityScore,
+        trustedAction: trustedDecision.action,
+        riskTags: email.riskTags,
+      });
+      const classReconcile = reconcileMailClass({
+        primaryCategory: email.primaryCategory,
+        derivedMailClass,
+        derivedThreatType,
+        classifier: email.classifier,
+      });
+      const policyRuleHits = Array.from(
+        new Set([
+          ...email.priorityGuardrail.ruleHits,
+          ...actionGuardrail.ruleHits,
+          ...classReconcile.ruleHits,
+        ])
+      );
+      const decisionRiskTags = Array.from(
+        new Set([...email.riskTags, ...policyRuleHits.map((rule) => `Policy:${rule}`)])
+      );
+      const decisionSignals = Array.from(
+        new Set([...email.signals, ...(classReconcile.adjusted ? [classReconcile.rationale] : [])])
+      );
+      const decisionTrace = buildDecisionTrace({
+        primaryCategory: email.primaryCategory,
+        priorityScore: email.priorityScore,
+        trustedAction: trustedDecision.action,
+        riskTags: decisionRiskTags,
+        topCategoryScores: email.categoryScores.slice(0, 4).map((entry) => ({
+          category: entry.category,
+          score: entry.score,
+        })),
+        trustScore: email.trustScore,
+        reputationScore: email.reputation.score,
+        threadDepth: email.thread.depth,
+        threadRiskDensity: email.thread.riskDensity,
+        consensusScore: 50,
+        policyVersion: INBOX_POLICY_VERSION,
+        modelVersion,
+      });
+      const memoryRef = buildMemoryRef({
+        raw: email.raw,
+        subject: email.subject,
+        senderEmail: email.senderEmail,
+      });
 
       alerts.push({
         id: email.id,
@@ -1591,14 +2250,33 @@ export async function POST(req: Request) {
         priorityScore: email.priorityScore,
         priority: email.priority,
         primaryCategory: email.primaryCategory,
+        mailClass: classReconcile.mailClass,
+        threatType: classReconcile.threatType,
+        decisionTrace,
         categoryScores: email.categoryScores,
-        riskTags: email.riskTags,
-        signals: email.signals,
+        riskTags: decisionRiskTags,
+        signals: decisionSignals,
         suggestedAction: "No action suggested (not analyzed).",
         draftReply: "No reply needed.",
         consensusScore: 50,
         consensusNote: "Not passed through multi-model draft analysis due to TOP_N budget.",
         trustedDecision,
+        classifier: email.classifier,
+        guardrails: {
+          policyVersion: INBOX_POLICY_VERSION,
+          ruleHits: policyRuleHits,
+          rationale: [
+            email.priorityGuardrail.rationale,
+            actionGuardrail.note,
+            classReconcile.rationale,
+          ]
+            .filter(Boolean)
+            .join(" "),
+          priorityAdjusted: email.priorityGuardrail.adjusted,
+          actionAdjusted: actionGuardrail.adjusted,
+          classificationAdjusted: classReconcile.adjusted,
+        },
+        memoryRef,
         trustScore: email.trustScore,
         reputationScore: email.reputation.score,
         reputationFindings: email.reputation.findings,
@@ -1621,6 +2299,10 @@ export async function POST(req: Request) {
     }
     writeTrustGraphCookie(cookieStore, trustGraph);
 
+    const learningSamplesUsed = alerts.reduce(
+      (sum, alert) => sum + (alert.classifier.memorySampleCount > 0 ? 1 : 0),
+      0
+    );
     const meta = {
       mode: parsed.mode,
       processingMode: offlineEnforced ? "offline_enforced" : "hybrid_remote_llm",
@@ -1629,7 +2311,21 @@ export async function POST(req: Request) {
       highCount: alerts.filter((a) => a.priority === "high").length,
       mediumCount: alerts.filter((a) => a.priority === "medium").length,
       lowCount: alerts.filter((a) => a.priority === "low").length,
+      policyVersion: INBOX_POLICY_VERSION,
+      modelVersion,
+      classifierVersion: alerts[0]?.classifier.modelVersion || "inbox-hybrid-classifier-v1",
+      guardrailVersion: INBOX_POLICY_VERSION,
+      learningSamplesUsed,
+      consensusMode: consensusPolicy.enabled ? "multi" : "single",
+      consensusMaxModels: consensusPolicy.enabled ? consensusPolicy.maxModels : 1,
+      consensusSource: consensusPolicy.source,
     };
+
+    await persistInboxMemory({
+      alerts,
+      modelVersion,
+      policyVersion: INBOX_POLICY_VERSION,
+    });
 
     return Response.json(InboxResponseSchema.parse({ ok: true, alerts, meta }));
   } catch (err: unknown) {

@@ -31,6 +31,11 @@
   transition-duration: 160ms;
 }
 
+:where(a, button, input, textarea, select, summary):focus-visible {
+  outline: 2px solid rgba(103, 217, 255, 0.88);
+  outline-offset: 2px;
+}
+
 html,
 body {
   min-height: 100%;
@@ -203,6 +208,109 @@ body::after {
   border-radius: 999px;
 }
 
+.nav-chip {
+  border-color: rgba(118, 157, 199, 0.34);
+  background: rgba(11, 20, 34, 0.6);
+  color: #c4d7eb;
+}
+
+.nav-chip:hover {
+  border-color: rgba(138, 189, 238, 0.58);
+  background: rgba(103, 217, 255, 0.12);
+  color: #f4faff;
+}
+
+.nav-chip-active {
+  border-color: rgba(138, 189, 238, 0.72);
+  background: linear-gradient(120deg, rgba(103, 217, 255, 0.22), rgba(76, 157, 255, 0.24));
+  color: #f5fbff;
+  box-shadow: 0 8px 18px rgba(76, 157, 255, 0.18);
+}
+
+.nav-menu {
+  z-index: 10;
+}
+
+.nav-group-label {
+  font-size: 11px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: #8ea8c4;
+  padding-right: 2px;
+}
+
+.nav-menu-summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+}
+
+.nav-menu-summary::-webkit-details-marker {
+  display: none;
+}
+
+.nav-menu-panel {
+  display: none;
+}
+
+.nav-menu[open] .nav-menu-panel {
+  display: block;
+}
+
+.nav-menu-link {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  color: #cadcef;
+  padding: 9px 10px;
+}
+
+.nav-menu-link:hover {
+  border-color: rgba(138, 189, 238, 0.4);
+  background: rgba(103, 217, 255, 0.12);
+  color: #f1f8ff;
+}
+
+.nav-menu-link-active {
+  border-color: rgba(138, 189, 238, 0.5);
+  background: rgba(76, 157, 255, 0.16);
+  color: #f7fbff;
+}
+
+.nav-menu-link-label {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.nav-menu-link-meta {
+  font-size: 11px;
+  line-height: 1.35;
+  color: #9fb4cb;
+}
+
+.skip-link {
+  position: absolute;
+  left: 14px;
+  top: -50px;
+  z-index: 60;
+  border-radius: 999px;
+  border: 1px solid rgba(138, 189, 238, 0.7);
+  background: rgba(9, 18, 31, 0.96);
+  color: #f2f8ff;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 8px 12px;
+  text-decoration: none;
+}
+
+.skip-link:focus {
+  top: 14px;
+}
+
 .ambient-orb {
   position: absolute;
   border-radius: 999px;
@@ -358,6 +466,7 @@ body::after {
 
 .quick-template-chip,
 .command-chip {
+  flex: 0 0 auto;
   font-size: 12px;
   border-radius: 999px;
   border: 1px solid rgba(118, 157, 199, 0.4);
@@ -419,6 +528,17 @@ body::after {
   box-shadow: 0 6px 16px rgba(4, 10, 18, 0.22);
 }
 
+/* QueueGuard: force readable native select popup text on dark-themed pages */
+.qg-policy-select {
+  color: #0f172a !important;
+  background: #ffffff !important;
+}
+
+.qg-policy-select option {
+  color: #0f172a;
+  background-color: #ffffff;
+}
+
 .event-card:hover {
   border-color: rgba(138, 189, 238, 0.46);
   background: rgba(14, 26, 42, 0.68);
@@ -452,15 +572,97 @@ body::after {
   color: #d2e1f0;
 }
 
+.mobile-chip-scroll {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.mobile-chip-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.workspace-tablist {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.workspace-tab {
+  border-radius: 999px;
+  border: 1px solid rgba(118, 157, 199, 0.34);
+  background: rgba(10, 20, 33, 0.5);
+  color: #c5d8eb;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.workspace-tab:hover {
+  border-color: rgba(138, 189, 238, 0.56);
+  background: rgba(103, 217, 255, 0.12);
+  color: #eef7ff;
+}
+
+.workspace-tab-active {
+  border-color: rgba(138, 189, 238, 0.72);
+  background: linear-gradient(120deg, rgba(103, 217, 255, 0.2), rgba(76, 157, 255, 0.24));
+  color: #f5fbff;
+  box-shadow: 0 8px 18px rgba(76, 157, 255, 0.18);
+}
+
+.mobile-safe-pad {
+  padding-bottom: calc(8px + env(safe-area-inset-bottom));
+}
+
 @media (max-width: 768px) {
   body::after {
     background-size: 28px 28px;
     opacity: 0.13;
   }
 
-  .quick-template-label {
+  .futuristic-shell {
+    border-radius: 16px;
+  }
+
+  .glass-panel {
+    border-radius: 14px;
+  }
+
+  .panel-head-actions {
     width: 100%;
-    margin-bottom: 4px;
+  }
+
+  .field-head {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .field-input {
+    font-size: 16px;
+  }
+
+  .metric-hint {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: initial;
+  }
+
+  .quick-template-row {
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    padding-bottom: 2px;
+  }
+
+  .quick-template-label {
+    flex: 0 0 auto;
+    margin-right: 6px;
+  }
+
+  .nav-menu-panel {
+    left: auto;
+    right: 0;
+    min-width: 200px;
   }
 }
 

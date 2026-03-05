@@ -16,11 +16,17 @@ type EntityVerdict = {
   followUpChecks: string[];
 };
 
-type ContractRisk = {
+type AnalysisFinding = {
   risk: string;
   severity: "low" | "medium" | "high";
   whyItMatters: string;
   suggestedEdit: string;
+};
+
+type AnalysisSection = {
+  title: string;
+  sectionType: "contract" | "security" | "finance" | "operations" | "scheduling" | "general";
+  findings: AnalysisFinding[];
 };
 
 type FinalOutput = {
@@ -31,7 +37,8 @@ type FinalOutput = {
     entities: string[];
   };
   entityVerdicts: EntityVerdict[];
-  contractRisks: ContractRisk[];
+  analysisSection?: AnalysisSection;
+  contractRisks?: AnalysisFinding[]; // legacy compatibility
   replyDraft: {
     subject: string;
     body: string;
@@ -47,7 +54,7 @@ type FinalOutput = {
   };
 };
 
-function severityClass(severity: ContractRisk["severity"]): string {
+function severityClass(severity: AnalysisFinding["severity"]): string {
   if (severity === "high") return "text-red-300 border-red-500/40 bg-red-500/10";
   if (severity === "medium") return "text-yellow-300 border-yellow-500/40 bg-yellow-500/10";
   return "text-emerald-300 border-emerald-500/40 bg-emerald-500/10";
@@ -66,12 +73,14 @@ function asFinalOutput(value: unknown): FinalOutput | null {
 
 export default function OutputPanel({ stream, outputs }: { stream: string; outputs: unknown }) {
   const final = asFinalOutput(outputs);
+  const analysisTitle = final?.analysisSection?.title || (final?.contractRisks ? "Contract Risks" : "Key Risks & Actions");
+  const analysisFindings = final?.analysisSection?.findings || final?.contractRisks || [];
 
   return (
     <div className="h-full min-h-0 flex flex-col gap-3">
       <div className="panel-note">Readable final output with verification evidence and actions.</div>
 
-      <div className="scroll-surface min-h-0 flex-1 overflow-auto p-4 max-h-96 space-y-4">
+      <div className="scroll-surface min-h-0 flex-1 overflow-auto p-4 max-h-none md:max-h-96 space-y-4">
         {!final ? (
           <div className="text-sm text-[var(--muted)] whitespace-pre-wrap">
             {stream || "Outputs will appear here after execution."}
@@ -122,10 +131,44 @@ export default function OutputPanel({ stream, outputs }: { stream: string; outpu
                   </tbody>
                 </table>
               </div>
+              <div className="mt-3 space-y-3">
+                {(final.entityVerdicts || []).map((verdict, idx) => (
+                  <div key={`${verdict.entity}-proof-${idx}`} className="rounded-lg border border-[var(--stroke)] bg-[rgba(255,255,255,0.02)] p-3">
+                    <div className="text-xs font-semibold text-[var(--text)] mb-1">
+                      Proof for {verdict.entity}
+                    </div>
+                    <div className="text-xs text-[var(--muted)] mb-2">{verdict.rationale}</div>
+                    {verdict.proof && verdict.proof.length > 0 ? (
+                      <div className="space-y-2">
+                        {verdict.proof.map((item, proofIdx) => (
+                          <div key={`${verdict.entity}-proof-item-${proofIdx}`} className="text-xs text-[var(--muted)]">
+                            {item.url ? (
+                              <a
+                                href={item.url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="text-[var(--text)] underline break-all"
+                              >
+                                {item.title || item.url}
+                              </a>
+                            ) : (
+                              <div className="text-[var(--text)]">{item.title || "Source"}</div>
+                            )}
+                            {item.snippet ? <div className="mt-1">Snippet: {item.snippet}</div> : null}
+                            <div className="mt-1">Why it helps: {item.reasonThisHelps}</div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-xs text-[var(--muted)]">No proof items provided.</div>
+                    )}
+                  </div>
+                ))}
+              </div>
             </section>
 
             <section className="output-section p-4">
-              <div className="output-heading text-sm font-semibold mb-2">Contract Risks</div>
+              <div className="output-heading text-sm font-semibold mb-2">{analysisTitle}</div>
               <div className="overflow-x-auto">
                 <table className="w-full text-sm border-collapse">
                   <thead>
@@ -137,7 +180,7 @@ export default function OutputPanel({ stream, outputs }: { stream: string; outpu
                     </tr>
                   </thead>
                   <tbody>
-                    {(final.contractRisks || []).map((risk, idx) => (
+                    {analysisFindings.map((risk, idx) => (
                       <tr key={`${risk.risk}-${idx}`} className="border-b border-[rgba(255,255,255,0.05)] align-top">
                         <td className="py-2 pr-3 text-[var(--text)]">{risk.risk}</td>
                         <td className="py-2 pr-3">

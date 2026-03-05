@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Prompt Firewall — Options</title>
+  <link rel="stylesheet" href="styles.css"/>
+  <style>
+    .tab-bar { display:flex; gap:4px; border-bottom:2px solid #e2e8f0; margin-bottom:20px; }
+    .tab-btn { padding:8px 16px; border:0; background:transparent; cursor:pointer; font-weight:600; font-size:13px; color:#64748b; border-bottom:2px solid transparent; margin-bottom:-2px; transition:color .15s, border-color .15s; }
+    .tab-btn.active { color:#111827; border-bottom-color:#111827; }
+    .tab-panel { display:none; }
+    .tab-panel.active { display:block; }
+    .proxy-hop { background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:12px; margin-bottom:10px; position:relative; }
+    .proxy-hop-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; font-weight:600; font-size:13px; }
+    .hop-remove { border:0; background:#fee2e2; color:#991b1b; border-radius:6px; padding:3px 8px; cursor:pointer; font-size:11px; }
+    .hop-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .hop-grid-full { grid-column: 1 / -1; }
+    .hop-status { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:600; }
+    .hop-ok   { background:#dcfce7; color:#166534; }
+    .hop-fail { background:#fee2e2; color:#991b1b; }
+    .hop-pend { background:#e0f2fe; color:#075985; }
+    .vault-item { display:flex; align-items:center; justify-content:space-between; padding:6px 10px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; margin-bottom:6px; font-size:12px; }
+    .risk-bar-wrap { background:#e2e8f0; border-radius:999px; height:6px; margin-top:4px; }
+    .risk-bar { height:6px; border-radius:999px; background:#111827; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <div>
+        <div class="logo">🔥 Prompt Firewall</div>
+        <div class="version">v0.3.0 — Options</div>
+      </div>
+    </div>
+
+    <div class="tab-bar">
+      <button class="tab-btn active" data-tab="policy">Policy</button>
+      <button class="tab-btn" data-tab="proxy">Proxy Chain</button>
+      <button class="tab-btn" data-tab="vault">Data Vault</button>
+      <button class="tab-btn" data-tab="audit">Audit &amp; Export</button>
+    </div>
+
+    <!-- ── Policy Tab ───────────────────────────────────── -->
+    <div class="tab-panel active" id="tab-policy">
+      <div class="section">
+        <div class="section-title">Protection</div>
+        <div class="field-row"><label>Enabled</label><input type="checkbox" id="enabled"/></div>
+        <div class="field-row"><label>Policy pack</label>
+          <select id="policy-pack">
+            <option value="corporate">Corporate</option>
+            <option value="healthcare">Healthcare</option>
+            <option value="legal">Legal</option>
+            <option value="student">Student</option>
+            <option value="custom">Custom</option>
+          </select>
+        </div>
+        <div class="field-row"><label>Auto-redact threshold</label><input type="number" id="auto-threshold" min="1" max="99"/></div>
+        <div class="field-row"><label>Block threshold</label><input type="number" id="block-threshold" min="1" max="100"/></div>
+        <div class="field-row"><label>Hold-to-confirm (ms)</label><input type="number" id="hold-ms" min="800" max="7000"/></div>
+      </div>
+      <div class="section">
+        <div class="section-title">Domains</div>
+        <div class="field-col"><label>Allowlist domains (comma or newline)</label><textarea id="allowlist" rows="3"></textarea></div>
+        <div class="field-col"><label>Strict-mode domains</label><textarea id="strict-domains" rows="3"></textarea></div>
+      </div>
+      <div class="section">
+        <div class="section-title">Behavior</div>
+        <div class="field-row"><label>Deny secret overrides</label><input type="checkbox" id="deny-overrides"/></div>
+        <div class="field-row"><label>Clipboard protection</label><input type="checkbox" id="clipboard-protection"/></div>
+        <div class="field-row"><label>Local-only mode</label><input type="checkbox" id="local-only-mode"/></div>
+      </div>
+      <div class="btn-row">
+        <button class="btn" id="save-btn">Save Policy</button>
+        <button class="btn btn-secondary" id="reset-pack-btn">Reset Pack Defaults</button>
+        <button class="btn btn-danger" id="clear-ledger-btn">Clear Ledger</button>
+      </div>
+      <div id="status" class="status-text"></div>
+    </div>
+
+    <!-- ── Proxy Chain Tab ──────────────────────────────── -->
+    <div class="tab-panel" id="tab-proxy">
+      <div class="section">
+        <div class="section-title" style="display:flex;align-items:center;justify-content:space-between;">
+          Proxy Chain
+          <label style="font-weight:400;font-size:12px;display:flex;align-items:center;gap:6px;">
+            <input type="checkbox" id="proxy-enabled"/> Enable chain
+          </label>
+        </div>
+        <p style="font-size:12px;color:#64748b;margin-bottom:12px;">
+          Configure a series of proxy hops. Each hop receives the (redacted) prompt via POST and must return <code>{"text":"..."}</code>. Hops are executed in order before the message is sent to the AI.
+        </p>
+        <div id="proxy-hops-list"></div>
+        <button class="btn btn-secondary" id="add-hop-btn" style="margin-bottom:12px;">+ Add Hop</button>
+        <div class="btn-row">
+          <button class="btn" id="save-proxy-btn">Save Proxy Chain</button>
+          <button class="btn btn-secondary" id="test-proxy-btn">Test Chain</button>
+        </div>
+        <div id="proxy-test-results" style="display:none;margin-top:12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:12px;font-size:12px;"></div>
+        <div id="proxy-status" class="status-text"></div>
+      </div>
+    </div>
+
+    <!-- ── Data Vault Tab ───────────────────────────────── -->
+    <div class="tab-panel" id="tab-vault">
+      <div class="section">
+        <div class="section-title" style="display:flex;align-items:center;justify-content:space-between;">
+          Data Vault
+          <button class="btn btn-danger btn-sm" id="clear-vault-btn">Clear Vault</button>
+        </div>
+        <p style="font-size:12px;color:#64748b;margin-bottom:12px;">
+          Placeholders from redacted sends are stored here so you can reference what was redacted. No raw sensitive values are stored.
+        </p>
+        <div id="vault-list"><div class="muted" style="font-size:12px;">Loading…</div></div>
+      </div>
+    </div>
+
+    <!-- ── Audit & Export Tab ───────────────────────────── -->
+    <div class="tab-panel" id="tab-audit">
+      <div class="section">
+        <div class="section-title">Audit Report</div>
+        <div id="audit-summary" style="font-size:12px;color:#334155;margin-bottom:12px;"></div>
+        <div class="btn-row">
+          <button class="btn" id="export-json-btn">Export JSON</button>
+          <button class="btn btn-secondary" id="export-csv-btn">Export CSV</button>
+          <button class="btn btn-secondary" id="refresh-audit-btn">Refresh</button>
+        </div>
+        <div id="audit-status" class="status-text"></div>
+      </div>
+    </div>
+
+  </div>
+  <script src="options.js"></script>
+</body>
+</html>

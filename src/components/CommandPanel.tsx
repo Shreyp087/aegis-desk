@@ -43,7 +43,7 @@ export default function CommandPanel({
               <span className="field-meta">{emailWords} words</span>
             </div>
             <textarea
-              className="field-input flex-1 min-h-[300px] resize-none"
+              className="field-input flex-1 min-h-[180px] sm:min-h-[220px] md:min-h-[300px] resize-none"
               value={emailText}
               onChange={(e) => setEmailText(e.target.value)}
               placeholder="Paste email thread here..."
@@ -56,7 +56,7 @@ export default function CommandPanel({
               <span className="field-meta">{docWords} words</span>
             </div>
             <textarea
-              className="field-input flex-1 min-h-[300px] resize-none"
+              className="field-input flex-1 min-h-[180px] sm:min-h-[220px] md:min-h-[300px] resize-none"
               value={docText}
               onChange={(e) => setDocText(e.target.value)}
               placeholder="Paste report / attachment text here..."
@@ -73,7 +73,7 @@ export default function CommandPanel({
             className="field-input"
             value={command}
             onChange={(e) => setCommand(e.target.value)}
-            rows={3}
+            rows={4}
             placeholder="What should the agent do?"
           />
           <div className="command-chip-row">

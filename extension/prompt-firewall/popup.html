@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Prompt Firewall</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body class="popup-body">
+    <main class="panel">
+      <header class="panel-head">
+        <div>
+          <div class="title">Prompt Firewall</div>
+          <div class="subtitle">Privacy-first prompt guard</div>
+        </div>
+        <label class="switch">
+          <input id="enabled-toggle" type="checkbox" />
+          <span>ON</span>
+        </label>
+      </header>
+
+      <section class="card">
+        <div class="row">
+          <span>Policy pack</span>
+          <strong id="policy-pack">-</strong>
+        </div>
+        <div class="row">
+          <span>Auto redact</span>
+          <strong id="auto-threshold">-</strong>
+        </div>
+        <div class="row">
+          <span>Block</span>
+          <strong id="block-threshold">-</strong>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="row">
+          <span>Ledger integrity</span>
+          <strong id="ledger-integrity">Checking...</strong>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="row row-tight">
+          <strong>Latest events</strong>
+          <button id="refresh-btn" class="btn btn-ghost">Refresh</button>
+        </div>
+        <ul id="events" class="events-list"></ul>
+      </section>
+
+      <footer class="actions">
+        <button id="open-options" class="btn">Options</button>
+        <button id="clear-ledger" class="btn btn-danger">Clear Ledger</button>
+      </footer>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+  </html>

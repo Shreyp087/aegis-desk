@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Prompt Firewall Options</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body class="options-body">
+    <main class="options-shell">
+      <header class="panel-head">
+        <div>
+          <h1 class="title">Prompt Firewall Options</h1>
+          <p class="subtitle">Policy controls, thresholds, and trust-ledger settings.</p>
+        </div>
+      </header>
+
+      <section class="card">
+        <h2>Policy Profile</h2>
+        <div class="grid two">
+          <label>
+            <span>Policy pack</span>
+            <select id="policy-pack">
+              <option value="student">Student</option>
+              <option value="healthcare">Healthcare</option>
+              <option value="legal">Legal</option>
+              <option value="corporate">Corporate</option>
+              <option value="custom">Custom</option>
+            </select>
+          </label>
+          <label class="inline">
+            <input id="enabled" type="checkbox" />
+            <span>Protection enabled</span>
+          </label>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Risk Thresholds</h2>
+        <div class="grid two">
+          <label>
+            <span>Auto-redact threshold (1-100)</span>
+            <input id="auto-threshold" type="number" min="1" max="100" />
+          </label>
+          <label>
+            <span>Block threshold (1-100)</span>
+            <input id="block-threshold" type="number" min="1" max="100" />
+          </label>
+          <label>
+            <span>Hold-to-confirm milliseconds</span>
+            <input id="hold-ms" type="number" min="800" max="7000" />
+          </label>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Domain Behavior</h2>
+        <div class="grid two">
+          <label>
+            <span>Allowlist domains (comma or newline)</span>
+            <textarea id="allowlist" rows="4" placeholder="internal.ai.company.com"></textarea>
+          </label>
+          <label>
+            <span>Strict mode domains (comma or newline)</span>
+            <textarea id="strict-domains" rows="4" placeholder="chat.openai.com, gemini.google.com"></textarea>
+          </label>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Safety Controls</h2>
+        <div class="grid two">
+          <label class="inline">
+            <input id="deny-overrides" type="checkbox" />
+            <span>Never allow overrides for secrets/private keys</span>
+          </label>
+          <label class="inline">
+            <input id="clipboard-protection" type="checkbox" />
+            <span>Sanitize pasted text in chat inputs</span>
+          </label>
+          <label class="inline">
+            <input id="local-only-mode" type="checkbox" />
+            <span>Local-only mode (no remote rewrite providers)</span>
+          </label>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Actions</h2>
+        <div class="actions">
+          <button id="save-btn" class="btn">Save Policy</button>
+          <button id="reset-pack-btn" class="btn btn-ghost">Apply Pack Defaults</button>
+          <button id="clear-ledger-btn" class="btn btn-danger">Clear Ledger</button>
+        </div>
+        <p id="status" class="status-text"></p>
+      </section>
+    </main>
+    <script src="options.js"></script>
+  </body>
+  </html>
