@@ -1,6 +1,7 @@
 import { cookies } from "next/headers";
 
 import {
+  buildPublicRequestUrl,
   clearGmailTokenCookie,
   getGmailProfile,
   getValidGmailToken,
@@ -10,7 +11,7 @@ import {
 export async function GET(req: Request) {
   try {
     const cookieStore = await cookies();
-    const token = await getValidGmailToken(cookieStore, new URL(req.url));
+    const token = await getValidGmailToken(cookieStore, buildPublicRequestUrl(req));
     if (!token) {
       return Response.json({ connected: false });
     }

@@ -28,7 +28,11 @@ import {
   disagreementSeverity,
   evaluateConsensusRuns,
 } from "@/lib/inbox/consensus";
-import { fetchLatestGmailRawEmails, getValidGmailToken } from "@/lib/inbox/gmail";
+import {
+  buildPublicRequestUrl,
+  fetchLatestGmailRawEmails,
+  getValidGmailToken,
+} from "@/lib/inbox/gmail";
 import {
   appendInboxEvaluationLogEntries,
   buildGroundTruthPlaceholder,
@@ -1962,7 +1966,7 @@ export async function POST(req: Request) {
     }
 
     const orgDomains = (parsed.userContext?.orgDomains || []).map((d) => d.toLowerCase());
-    const emails = await getEmails(parsed, new URL(req.url), cookieStore);
+    const emails = await getEmails(parsed, buildPublicRequestUrl(req), cookieStore);
 
     const parsedEmails = emails.map((raw, idx) => parseRawEmail(raw, `email-${idx + 1}`));
     const threadProfiles = buildThreadProfiles(parsedEmails);
