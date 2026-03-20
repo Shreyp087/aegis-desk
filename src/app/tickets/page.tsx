@@ -4,19 +4,13 @@ import { redirect } from "next/navigation";
 
 export default async function TicketsPage() {
   const session = await getServerSession();
-  if (!session) {
-    redirect("/login/user");
-  }
-  if (session.role === "admin") {
-    redirect("/tickets/admin");
-  }
-  if (session.role === "user") {
-    redirect("/tickets/user");
-  }
+  if (!session) redirect("/sign-in");
+  if (session.role === "admin") redirect("/tickets/admin");
+  if (session.role === "user") redirect("/tickets/user");
 
   return (
     <DesktopShell>
-      <div className="surface-card p-4 text-sm text-slate-200">Redirecting to dashboard...</div>
+      <div className="rounded-xl border border-aegis-border bg-aegis-surface p-4 text-sm text-aegis-muted">Redirecting to dashboard...</div>
     </DesktopShell>
   );
 }

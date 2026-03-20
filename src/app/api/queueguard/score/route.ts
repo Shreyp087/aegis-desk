@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { evaluateQueueAction } from "@/lib/queueguard/engine";
-import { appendLedgerEvent, ensureSession } from "@/lib/queueguard/store";
+import { appendLedgerEvent, ensureSession, saveSession } from "@/lib/queueguard/store";
 import type { QueueEventType, QueueScoreResponse, QueueSignalSnapshot } from "@/lib/queueguard/types";
 
 export const runtime = "nodejs";
@@ -38,7 +38,7 @@ export async function POST(req: Request) {
       eventType: QueueEventType;
       signalsSnapshot: QueueSignalSnapshot;
     };
-    const session = ensureSession(sessionId);
+    const session = await ensureSession(sessionId);
     const { decision, challenge } = evaluateQueueAction({
       session,
       eventType,
@@ -46,7 +46,8 @@ export async function POST(req: Request) {
     });
     const latencyMs = Date.now() - startedAt;
 
-    appendLedgerEvent({
+    await saveSession(session);
+    await appendLedgerEvent({
       sessionId,
       eventKind: "score",
       eventType,

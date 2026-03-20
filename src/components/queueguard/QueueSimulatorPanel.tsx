@@ -1,6 +1,8 @@
 "use client";
 
 import { useState } from "react";
+
+import { AegisButton } from "@/components/ui/AegisPrimitives";
 import type { PolicyMode, QueueAction, RiskDecision, SessionState } from "@/lib/queueguard/types";
 import { runScenario, ScenarioName } from "@/lib/queueguard/scenarios";
 
@@ -15,7 +17,7 @@ export default function QueueSimulatorPanel({
   state: SessionState;
   decision: RiskDecision | null;
   busy: boolean;
-  onAttempt: (action: QueueAction, meta?: any) => Promise<void>;
+  onAttempt: (action: QueueAction, meta?: unknown) => Promise<void>;
   onReset: () => void;
   onModeChange: (mode: PolicyMode) => void;
 }) {
@@ -35,97 +37,72 @@ export default function QueueSimulatorPanel({
   const disabled = busy || running !== null;
 
   return (
-    <section className="rounded-2xl border p-4 shadow-sm">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <h2 className="text-lg font-semibold">Queue Simulator</h2>
-          <p className="text-xs opacity-80">Sandbox actions to show risk-based step-up, throttle, and blocking.</p>
+    <section className="flex min-h-0 flex-col rounded-2xl border border-foreground/8 bg-surface p-5 shadow-sm">
+      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-foreground/6 pb-4">
+        <div className="min-w-0">
+          <h2 className="text-sm font-medium tracking-tight text-foreground">Queue Simulator</h2>
+          <p className="mt-1 text-sm font-light leading-relaxed text-foreground/60">
+            Sandbox actions to show risk-based step-up, throttle, and blocking.
+          </p>
         </div>
-        <button
-          onClick={onReset}
-          className="rounded-xl border px-3 py-1 text-xs hover:bg-black/5"
-          disabled={disabled}
-        >
+        <AegisButton variant="ghost" onClick={onReset} disabled={disabled}>
           Reset Session
-        </button>
+        </AegisButton>
       </div>
 
-      <div className="mt-4 space-y-3">
-        <div className="space-y-1">
-          <div className="text-xs font-medium opacity-80">Policy preset</div>
-          <select
-            className="qg-policy-select w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-500"
-            value={state.mode}
-            onChange={(e) => onModeChange(e.target.value as PolicyMode)}
-            disabled={disabled}
-          >
-            <option value="FAN_FIRST" className="bg-white text-slate-900">Fan-first (min friction)</option>
-            <option value="STRICT" className="bg-white text-slate-900">Strict (aggressive security)</option>
-            <option value="ACCESSIBILITY_FIRST" className="bg-white text-slate-900">Accessibility-first</option>
+      <div className="mt-4 grid min-h-0 gap-4">
+        <div className="grid gap-2">
+          <div className="text-xs font-mono uppercase tracking-widest opacity-40">Policy preset</div>
+          <select className="aegis-select" value={state.mode} onChange={(e) => onModeChange(e.target.value as PolicyMode)} disabled={disabled}>
+            <option value="FAN_FIRST">Fan-first (min friction)</option>
+            <option value="STRICT">Strict (aggressive security)</option>
+            <option value="ACCESSIBILITY_FIRST">Accessibility-first</option>
           </select>
         </div>
 
-        <div className="grid grid-cols-3 gap-2">
-          <button
-            className="rounded-xl border px-3 py-2 text-sm hover:bg-black/5"
-            onClick={() => onAttempt("JOIN")}
-            disabled={disabled}
-          >
+        <div className="grid gap-2 sm:grid-cols-3">
+          <AegisButton variant="secondary" onClick={() => onAttempt("JOIN")} disabled={disabled}>
             Join Queue
-          </button>
-          <button
-            className="rounded-xl border px-3 py-2 text-sm hover:bg-black/5"
-            onClick={() => onAttempt("REFRESH")}
-            disabled={disabled}
-          >
+          </AegisButton>
+          <AegisButton variant="secondary" onClick={() => onAttempt("REFRESH")} disabled={disabled}>
             Refresh
-          </button>
-          <button
-            className="rounded-xl border px-3 py-2 text-sm hover:bg-black/5"
-            onClick={() => onAttempt("CHECKOUT")}
-            disabled={disabled}
-          >
+          </AegisButton>
+          <AegisButton variant="secondary" onClick={() => onAttempt("CHECKOUT")} disabled={disabled}>
             Checkout
-          </button>
+          </AegisButton>
         </div>
 
-        <div className="pt-2">
-          <div className="text-xs font-medium opacity-80">One-click demo scenarios</div>
-          <div className="mt-2 space-y-2">
-            <button
-              className="w-full rounded-xl border px-3 py-2 text-sm hover:bg-black/5"
-              onClick={() => run("NORMAL_FAN")}
-              disabled={disabled}
-            >
-              &gt; Normal Fan Flow
-            </button>
-            <button
-              className="w-full rounded-xl border px-3 py-2 text-sm hover:bg-black/5"
-              onClick={() => run("SUSPICIOUS_USER")}
-              disabled={disabled}
-            >
-              &gt; Suspicious User Flow
-            </button>
-            <button
-              className="w-full rounded-xl border px-3 py-2 text-sm hover:bg-black/5"
-              onClick={() => run("BOT_BURST")}
-              disabled={disabled}
-            >
-              &gt; Bot Burst Attack
-            </button>
+        <div className="grid gap-2">
+          <div className="text-xs font-mono uppercase tracking-widest opacity-40">One-click demo scenarios</div>
+          <div className="grid gap-2">
+            <AegisButton variant="secondary" className="justify-start" onClick={() => run("NORMAL_FAN")} disabled={disabled}>
+              Normal Fan Flow
+            </AegisButton>
+            <AegisButton variant="secondary" className="justify-start" onClick={() => run("SUSPICIOUS_USER")} disabled={disabled}>
+              Suspicious User Flow
+            </AegisButton>
+            <AegisButton variant="secondary" className="justify-start" onClick={() => run("BOT_BURST")} disabled={disabled}>
+              Bot Burst Attack
+            </AegisButton>
           </div>
         </div>
 
-        <div className="pt-2 text-xs opacity-80">
-          <div><span className="font-medium">Session:</span> {state.sessionId}</div>
-          <div><span className="font-medium">Joined?</span> {state.joined ? "Yes" : "No"}</div>
-          <div><span className="font-medium">Events:</span> {state.events.length}</div>
+        <div className="rounded-2xl border border-foreground/8 bg-background/70 p-4 text-sm font-light text-foreground/60">
+          <div>
+            <span className="font-medium text-foreground">Session:</span> <span className="font-mono">{state.sessionId}</span>
+          </div>
+          <div className="mt-2">
+            <span className="font-medium text-foreground">Joined?</span> {state.joined ? "Yes" : "No"}
+          </div>
+          <div className="mt-2">
+            <span className="font-medium text-foreground">Events:</span> {state.events.length}
+          </div>
           {decision ? (
-            <div className="mt-2 rounded-xl bg-black/5 p-3">
-              <div className="text-xs font-medium opacity-80">Last decision</div>
-              <div className="mt-1 text-sm">
-                Risk <span className="font-semibold">{decision.risk}/100</span> -&gt;{" "}
-                <span className="font-semibold">{decision.action}</span>
+            <div className="mt-4 rounded-2xl border border-foreground/8 bg-surface p-4">
+              <div className="text-xs font-mono uppercase tracking-widest opacity-40">Last decision</div>
+              <div className="mt-2 text-sm text-foreground/80">
+                Risk <span className="font-medium text-foreground">{decision.risk}/100</span> {"->"}{" "}
+                <span className="font-medium text-foreground">{decision.action}</span>
                 {decision.action === "STEP_UP" ? ` (L${decision.stepUpLevel})` : ""}
               </div>
             </div>

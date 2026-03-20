@@ -21,6 +21,10 @@ type CommandPanelProps = {
   setCommand: (value: string) => void;
 };
 
+function SectionLabel({ children }: { children: string }) {
+  return <div className="text-xs font-mono font-medium uppercase tracking-widest text-aegis-dim">{children}</div>;
+}
+
 export default function CommandPanel({
   emailText,
   setEmailText,
@@ -34,64 +38,54 @@ export default function CommandPanel({
   const commandLength = command.trim().length;
 
   return (
-    <div className="h-full min-h-0 flex flex-col">
-      <div className="flex-1 min-h-0 space-y-3">
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <div className="field-shell field-shell-email flex flex-col">
-            <div className="field-head">
-              <label className="field-label">Email</label>
-              <span className="field-meta">{emailWords} words</span>
-            </div>
-            <textarea
-              className="field-input flex-1 min-h-[180px] sm:min-h-[220px] md:min-h-[300px] resize-none"
-              value={emailText}
-              onChange={(e) => setEmailText(e.target.value)}
-              placeholder="Paste email thread here..."
-            />
-          </div>
-
-          <div className="field-shell field-shell-doc flex flex-col">
-            <div className="field-head">
-              <label className="field-label">Document Text</label>
-              <span className="field-meta">{docWords} words</span>
-            </div>
-            <textarea
-              className="field-input flex-1 min-h-[180px] sm:min-h-[220px] md:min-h-[300px] resize-none"
-              value={docText}
-              onChange={(e) => setDocText(e.target.value)}
-              placeholder="Paste report / attachment text here..."
-            />
-          </div>
-        </div>
-
-        <div className="field-shell field-shell-command flex flex-col">
-          <div className="field-head">
-            <label className="field-label">Command</label>
-            <span className="field-meta">{commandLength} chars</span>
+    <div className="flex h-full min-h-0 flex-col gap-4">
+      <div className="grid min-h-0 flex-1 gap-4 xl:grid-cols-2">
+        <div className="flex min-h-0 flex-col gap-2 rounded-lg border border-aegis-border bg-aegis-elevated p-4">
+          <div className="flex items-center justify-between gap-3">
+            <SectionLabel>Email Thread</SectionLabel>
+            <span className="aegis-time">{emailWords} words</span>
           </div>
           <textarea
-            className="field-input"
-            value={command}
-            onChange={(e) => setCommand(e.target.value)}
-            rows={4}
-            placeholder="What should the agent do?"
+            className="aegis-textarea min-h-64 flex-1"
+            value={emailText}
+            onChange={(event) => setEmailText(event.target.value)}
+            placeholder="Paste the incoming thread here. Keep raw headers or quoted sections if you want the agent to reason over them."
           />
-          <div className="command-chip-row">
-            {COMMAND_SUGGESTIONS.map((suggestion) => (
-              <button
-                key={suggestion}
-                type="button"
-                onClick={() => setCommand(suggestion)}
-                className="command-chip"
-              >
-                {suggestion}
-              </button>
-            ))}
-          </div>
-          <div className="mt-2 text-[11px] text-[var(--muted)]">
-            Tip: press Ctrl/Cmd + Enter anywhere on Agent tab to run quickly.
-          </div>
         </div>
+
+        <div className="flex min-h-0 flex-col gap-2 rounded-lg border border-aegis-border bg-aegis-elevated p-4">
+          <div className="flex items-center justify-between gap-3">
+            <SectionLabel>Supporting Context</SectionLabel>
+            <span className="aegis-time">{docWords} words</span>
+          </div>
+          <textarea
+            className="aegis-textarea min-h-64 flex-1"
+            value={docText}
+            onChange={(event) => setDocText(event.target.value)}
+            placeholder="Paste attachment text, policy snippets, or any external supporting notes."
+          />
+        </div>
+      </div>
+
+      <div className="grid gap-3 rounded-lg border border-aegis-border bg-aegis-elevated p-4">
+        <div className="flex items-center justify-between gap-3">
+          <SectionLabel>Command</SectionLabel>
+          <span className="aegis-time">{commandLength} chars</span>
+        </div>
+        <textarea
+          className="aegis-textarea min-h-28"
+          value={command}
+          onChange={(event) => setCommand(event.target.value)}
+          placeholder="Define the outcome clearly: assess risk, verify claims, draft a response, summarize evidence."
+        />
+        <div className="aegis-chip-row">
+          {COMMAND_SUGGESTIONS.map((suggestion) => (
+            <button key={suggestion} type="button" onClick={() => setCommand(suggestion)} className="aegis-chip">
+              {suggestion}
+            </button>
+          ))}
+        </div>
+        <div className="text-xs text-aegis-muted">Tip: press `Ctrl/Cmd + Enter` anywhere in Agent Desk to run the current analysis command.</div>
       </div>
     </div>
   );

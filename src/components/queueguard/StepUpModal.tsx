@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+
+import { AegisButton } from "@/components/ui/AegisPrimitives";
 import type { RiskDecision } from "@/lib/queueguard/types";
 
 function formatOtp(n: number) {
@@ -20,7 +22,6 @@ export default function StepUpModal({
 }) {
   const [holdMs, setHoldMs] = useState(0);
   const [holding, setHolding] = useState(false);
-
   const [otp] = useState(() => formatOtp(Math.floor(Math.random() * 1000000)));
   const [otpInput, setOtpInput] = useState("");
 
@@ -29,19 +30,36 @@ export default function StepUpModal({
 
   const isL1 = decision?.stepUpLevel === 1;
   const isL2 = decision?.stepUpLevel === 2;
-
   const requiredHold = 2000;
-
   const canSubmitHold = holdMs >= requiredHold;
   const canSubmitOtp = otpInput.trim() === otp;
 
   useEffect(() => {
-    if (!open) {
-      setHoldMs(0);
-      setHolding(false);
-      setOtpInput("");
+    if (!holding) {
+      if (rafRef.current) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      return;
     }
-  }, [open]);
+
+    const tick = (timestamp: number) => {
+      if (startRef.current === null) {
+        startRef.current = timestamp;
+      }
+      setHoldMs(timestamp - startRef.current);
+      rafRef.current = requestAnimationFrame(tick);
+    };
+
+    rafRef.current = requestAnimationFrame(tick);
+
+    return () => {
+      if (rafRef.current) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    };
+  }, [holding]);
 
   function stopRaf() {
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
@@ -49,19 +67,11 @@ export default function StepUpModal({
     startRef.current = null;
   }
 
-  function tick() {
-    if (!startRef.current) startRef.current = performance.now();
-    const elapsed = performance.now() - startRef.current;
-    setHoldMs(elapsed);
-    rafRef.current = requestAnimationFrame(tick);
-  }
-
   function startHold() {
     setHolding(true);
     setHoldMs(0);
     stopRaf();
-    startRef.current = performance.now();
-    rafRef.current = requestAnimationFrame(tick);
+    startRef.current = null;
   }
 
   function endHold() {
@@ -76,6 +86,7 @@ export default function StepUpModal({
       startHold();
     }
   }
+
   function onKeyUp(e: React.KeyboardEvent) {
     if (!isL1) return;
     if (e.key === " " || e.key === "Enter") {
@@ -93,122 +104,94 @@ export default function StepUpModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4 backdrop-blur-sm"
       role="dialog"
       aria-modal="true"
       aria-label="Step-up verification"
     >
-      <div className="w-full max-w-lg rounded-2xl bg-white p-5 text-slate-900 shadow-xl ring-1 ring-slate-200">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <div className="text-lg font-semibold text-slate-900">{title}</div>
-            <div className="mt-1 text-sm text-slate-700">
-              We only step-up when risk is elevated. No image CAPTCHAs.
-            </div>
+      <div className="w-full max-w-lg rounded-3xl border border-foreground/8 bg-surface p-6 shadow-2xl md:p-7">
+        <div className="flex items-start justify-between gap-3 border-b border-foreground/6 pb-4">
+          <div className="min-w-0">
+            <div className="text-xs font-mono uppercase tracking-widest opacity-40">Verification</div>
+            <h2 className="mt-2 text-xl font-medium tracking-tight">{title}</h2>
+            <p className="mt-2 text-sm font-light leading-relaxed text-foreground/60">
+              We only step up when risk is elevated. No image CAPTCHAs.
+            </p>
           </div>
-          <button
-            onClick={onClose}
-            className="rounded-xl border border-slate-300 px-3 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100"
-          >
+          <AegisButton variant="ghost" onClick={onClose}>
             Close
-          </button>
+          </AegisButton>
         </div>
 
         {isL1 ? (
-          <div className="mt-4 space-y-3">
-            <div className="rounded-2xl border border-slate-200 p-4">
-              <div className="text-sm font-semibold text-slate-900">Level 1: Hold-to-confirm</div>
-              <div className="mt-1 text-xs text-slate-700">
+          <div className="mt-5 space-y-3">
+            <div className="rounded-2xl border border-foreground/8 bg-background/70 p-4">
+              <div className="text-sm font-medium text-foreground">Level 1: Hold-to-confirm</div>
+              <div className="mt-1 text-sm font-light leading-relaxed text-foreground/60">
                 Press and hold for 2 seconds to continue. Keyboard: hold Space or Enter.
               </div>
-
               <button
-                className={`mt-3 w-full rounded-2xl border px-4 py-3 text-sm font-semibold transition ${
-                  holding
-                    ? "border-slate-900 bg-slate-900 text-white"
-                    : "border-slate-300 bg-white text-slate-900 hover:bg-slate-100"
-                }`}
+                className={[
+                  "mt-4 w-full rounded-full border px-4 py-3 text-sm font-medium transition-all duration-200 ease-out",
+                  holding ? "border-accent bg-accent text-background" : "border-foreground/8 bg-surface text-foreground hover:-translate-y-0.5 hover:border-foreground/15",
+                ].join(" ")}
                 onPointerDown={startHold}
                 onPointerUp={endHold}
                 onPointerLeave={endHold}
                 onKeyDown={onKeyDown}
                 onKeyUp={onKeyUp}
               >
-                {holding ? "Holding..." : "Press & Hold"}
+                {holding ? "Holding..." : "Press and Hold"}
               </button>
-
-              <div className="mt-3 h-2 w-full rounded-full bg-slate-200">
-                <div
-                  className="h-2 rounded-full bg-slate-900"
-                  style={{ width: `${Math.min(100, (holdMs / requiredHold) * 100)}%` }}
-                />
+              <div className="mt-3 h-1.5 w-full rounded-full bg-foreground/10">
+                <div className="h-1.5 rounded-full bg-accent transition-[width] duration-75 ease-linear" style={{ width: `${Math.min(100, (holdMs / requiredHold) * 100)}%` }} />
               </div>
-
-              <div className="mt-2 text-xs text-slate-700">
+              <div className="mt-2 text-sm font-light text-foreground/60">
                 {canSubmitHold ? "Verified. You can continue." : `Holding: ${Math.floor(holdMs)}ms / ${requiredHold}ms`}
               </div>
             </div>
-
             <div className="flex justify-end gap-2">
-              <button
-                onClick={() => onResult(false)}
-                className="rounded-xl border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100"
-              >
+              <AegisButton variant="secondary" onClick={() => onResult(false)}>
                 Cancel
-              </button>
-              <button
-                onClick={() => onResult(true)}
-                className="rounded-xl bg-slate-900 px-3 py-2 text-sm text-white disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={!canSubmitHold}
-              >
+              </AegisButton>
+              <AegisButton onClick={() => onResult(true)} disabled={!canSubmitHold}>
                 Continue
-              </button>
+              </AegisButton>
             </div>
           </div>
         ) : null}
 
         {isL2 ? (
-          <div className="mt-4 space-y-3">
-            <div className="rounded-2xl border border-slate-200 p-4">
-              <div className="text-sm font-semibold text-slate-900">Level 2: OTP (demo MFA)</div>
-              <div className="mt-1 text-xs text-slate-700">
-                For hackathon demo, the OTP is displayed (mock delivery). In production, it would be delivered out-of-band.
+          <div className="mt-5 space-y-3">
+            <div className="rounded-2xl border border-foreground/8 bg-background/70 p-4">
+              <div className="text-sm font-medium text-foreground">Level 2: OTP (demo MFA)</div>
+              <div className="mt-1 text-sm font-light leading-relaxed text-foreground/60">
+                For demo mode, the OTP is displayed. In production, it would be delivered out-of-band.
               </div>
-
-              <div className="mt-3 rounded-xl bg-slate-100 p-3 text-center">
-                <div className="text-xs font-medium text-slate-600">OTP</div>
-                <div className="text-2xl font-semibold tracking-widest text-slate-900">{otp}</div>
+              <div className="mt-4 rounded-2xl border border-foreground/8 bg-surface p-4 text-center">
+                <div className="text-xs font-mono uppercase tracking-widest opacity-40">OTP</div>
+                <div className="mt-2 text-2xl font-mono tracking-[0.3em] text-foreground">{otp}</div>
               </div>
-
-              <label className="mt-3 block text-xs font-medium text-slate-700">Enter OTP</label>
+              <label className="mt-4 block text-xs font-mono uppercase tracking-widest opacity-40">Enter OTP</label>
               <input
-                className="mt-1 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400"
+                className="aegis-input mt-1"
                 value={otpInput}
                 onChange={(e) => setOtpInput(e.target.value)}
                 inputMode="numeric"
                 placeholder="6 digits"
                 aria-label="OTP input"
               />
-
-              <div className="mt-2 text-xs text-slate-700">
+              <div className="mt-2 text-sm font-light text-foreground/60">
                 {canSubmitOtp ? "OTP verified." : "Type the OTP to continue."}
               </div>
             </div>
-
             <div className="flex justify-end gap-2">
-              <button
-                onClick={() => onResult(false)}
-                className="rounded-xl border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100"
-              >
+              <AegisButton variant="secondary" onClick={() => onResult(false)}>
                 Cancel
-              </button>
-              <button
-                onClick={() => onResult(true)}
-                className="rounded-xl bg-slate-900 px-3 py-2 text-sm text-white disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={!canSubmitOtp}
-              >
+              </AegisButton>
+              <AegisButton onClick={() => onResult(true)} disabled={!canSubmitOtp}>
                 Continue
-              </button>
+              </AegisButton>
             </div>
           </div>
         ) : null}

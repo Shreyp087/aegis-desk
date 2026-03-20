@@ -51,7 +51,7 @@ export function EscalateToHelpdeskButton(props: Props) {
         ticket?: { _id?: string };
       };
       if (res.status === 401 || res.status === 403) {
-        router.replace("/login/user");
+        router.replace("/sign-in");
         return;
       }
       if (!res.ok || !json?.ok) {
@@ -74,11 +74,12 @@ export function EscalateToHelpdeskButton(props: Props) {
         type="button"
         onClick={onClick}
         disabled={loading}
-        className="secondary-ghost px-3 py-2 rounded-lg text-sm font-semibold min-h-[40px] w-full sm:w-auto disabled:opacity-60"
+        className="inline-flex min-h-10 w-full items-center justify-center gap-2 rounded-lg border border-aegis-border bg-transparent px-3 py-2 text-sm font-medium text-aegis-muted transition-colors duration-150 hover:bg-aegis-elevated hover:text-aegis-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-aegis-accent/50 disabled:pointer-events-none disabled:opacity-60 sm:w-auto"
       >
         {loading ? "Escalating..." : "Create Helpdesk Ticket"}
       </button>
-      {error ? <div className="text-xs text-rose-300">{error}</div> : null}
+      {error ? <div className="flex items-center gap-1.5 text-xs text-red-400">{error}</div> : null}
     </div>
   );
 }
+

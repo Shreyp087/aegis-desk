@@ -1,6 +1,10 @@
 import { openai } from "@ai-sdk/openai";
 import { generateText } from "ai";
 import { z } from "zod";
+import {
+  extractEntityCandidatesFromContext,
+  type EntityCandidate,
+} from "@/lib/inbox/entityProfiler";
 import { getOfflineRuntimeConfig, isOfflineEnforced } from "@/lib/offline";
 
 console.log("OPENAI_API_KEY present:", !!process.env.OPENAI_API_KEY);
@@ -44,6 +48,185 @@ const PlannerPlanSchema = z
     steps: z.array(PlanStepSchema).min(4),
   })
   .passthrough();
+
+type PlannerPlan = z.infer<typeof PlannerPlanSchema>;
+type PlannerPlanStep = z.infer<typeof PlanStepSchema>;
+
+const SEARCH_STEP_MIN = 2;
+const SEARCH_STEP_MAX = 6;
+
+function buildSearchQueriesForEntity(entity: EntityCandidate): string[] {
+  const name = entity.name.trim();
+  if (!name) return [];
+
+  if (entity.entityType === "company" || entity.entityType === "organization") {
+    return [
+      `${name} official website company registration LinkedIn`,
+      `${name} business entity search incorporation official website`,
+    ];
+  }
+
+  if (entity.entityType === "person") {
+    return [
+      `${name} LinkedIn official profile biography`,
+      `${name} company profile official biography`,
+    ];
+  }
+
+  return [
+    `${name} official website LinkedIn`,
+    `${name} company registration official website`,
+  ];
+}
+
+function inferFallbackSearchQueries(args: {
+  emailText: string;
+  docText: string;
+  command: string;
+}): string[] {
+  const entities = extractEntityCandidatesFromContext({
+    emailText: args.emailText,
+    docText: args.docText,
+    searchQueries: [args.command],
+    maxEntities: SEARCH_STEP_MAX,
+  });
+
+  const queries: string[] = [];
+  const seen = new Set<string>();
+
+  for (const entity of entities) {
+    for (const query of buildSearchQueriesForEntity(entity)) {
+      const normalized = query.trim().toLowerCase();
+      if (!normalized || seen.has(normalized)) continue;
+      seen.add(normalized);
+      queries.push(query);
+      if (queries.length >= SEARCH_STEP_MAX) return queries;
+    }
+  }
+
+  const genericFallbacks = [
+    "official website company registration LinkedIn",
+    "business entity search official website leadership",
+  ];
+
+  for (const query of genericFallbacks) {
+    const normalized = query.toLowerCase();
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    queries.push(query);
+    if (queries.length >= SEARCH_STEP_MAX) break;
+  }
+
+  return queries;
+}
+
+function normalizeSearchSteps(args: {
+  plan: PlannerPlan;
+  emailText: string;
+  docText: string;
+  command: string;
+}): PlannerPlanStep[] {
+  const existing = args.plan.steps
+    .filter((step) => step.type === "redact_and_search")
+    .filter((step) => step.rawQuery && step.rawQuery.trim().length > 0);
+
+  const queries: string[] = [];
+  const seen = new Set<string>();
+
+  for (const step of existing) {
+    const query = step.rawQuery?.trim() || "";
+    const normalized = query.toLowerCase();
+    if (!query || seen.has(normalized)) continue;
+    seen.add(normalized);
+    queries.push(query);
+    if (queries.length >= SEARCH_STEP_MAX) break;
+  }
+
+  if (queries.length < SEARCH_STEP_MIN) {
+    for (const query of inferFallbackSearchQueries(args)) {
+      const normalized = query.toLowerCase();
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+      queries.push(query);
+      if (queries.length >= SEARCH_STEP_MIN) break;
+    }
+  }
+
+  const bounded = queries.slice(0, SEARCH_STEP_MAX);
+
+  return bounded.map((query, index) => ({
+    id: `search_${index + 1}`,
+    type: "redact_and_search",
+    desc: `Search external sources for authenticity and background signals (${index + 1}/${bounded.length}).`,
+    rawQuery: query,
+  }));
+}
+
+function normalizePlan(args: {
+  plan: PlannerPlan;
+  emailText: string;
+  docText: string;
+  command: string;
+  fixedMeetingISO: string;
+}): PlannerPlan {
+  const extractStep =
+    args.plan.steps.find((step) => step.type === "extract") ||
+    ({
+      id: "extract_1",
+      type: "extract",
+      desc: "Extract the main entities, deadlines, requests, and factual claims from the provided context.",
+    } satisfies PlannerPlanStep);
+
+  const searchSteps = normalizeSearchSteps(args);
+
+  const verifyStep =
+    args.plan.steps.find((step) => step.type === "verify_entity_authenticity") ||
+    ({
+      id: "verify_1",
+      type: "verify_entity_authenticity",
+      desc: "Verify the authenticity of the key external people, companies, or organizations referenced in the message.",
+    } satisfies PlannerPlanStep);
+
+  const analyzeSteps = args.plan.steps.filter(
+    (step) => step.type === "analyze_contract_risks"
+  );
+
+  const draftStep =
+    args.plan.steps.find((step) => step.type === "draft_reply") ||
+    ({
+      id: "draft_1",
+      type: "draft_reply",
+      desc: "Draft a concise, safe reply aligned to the verified evidence and identified risks.",
+    } satisfies PlannerPlanStep);
+
+  const icsStep = {
+    ...(args.plan.steps.find((step) => step.type === "create_ics") || {
+      id: "ics_1",
+      type: "create_ics" as const,
+      desc: "Create a follow-up calendar invite for the next review checkpoint.",
+      title: "Aegis Desk Follow-up",
+    }),
+    datetimeISO: args.fixedMeetingISO,
+  } satisfies PlannerPlanStep;
+
+  const steps = [
+    extractStep,
+    verifyStep,
+    ...searchSteps,
+    ...analyzeSteps,
+    draftStep,
+    icsStep,
+  ].map((step, index) => ({
+    ...step,
+    id: String(index + 1),
+  }));
+
+  return {
+    ...args.plan,
+    goal: args.plan.goal?.trim() || args.command.trim() || "Analyze the provided email and produce a structured response plan.",
+    steps,
+  };
+}
 
 export async function POST(req: Request) {
   try {
@@ -143,11 +326,18 @@ ${command}
     }
 
     const jsonText = result.text.slice(start, end + 1);
-    const plan = PlannerPlanSchema.parse(JSON.parse(jsonText));
+    const parsedPlan = PlannerPlanSchema.parse(JSON.parse(jsonText));
+    const plan = normalizePlan({
+      plan: parsedPlan,
+      emailText,
+      docText,
+      command,
+      fixedMeetingISO,
+    });
 
     // Guardrails: enforce dynamic but bounded search count.
     const searchSteps = plan.steps.filter((s) => s.type === "redact_and_search");
-    if (searchSteps.length < 2 || searchSteps.length > 6) {
+    if (searchSteps.length < SEARCH_STEP_MIN || searchSteps.length > SEARCH_STEP_MAX) {
       throw new Error(
         `Plan must include between 2 and 6 redact_and_search steps. Got ${searchSteps.length}.`
       );

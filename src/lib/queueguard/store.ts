@@ -1,4 +1,9 @@
 import crypto from "crypto";
+
+import { connectMongo, isMongoConfigured } from "@/lib/db/mongoose";
+import { QueueGuardLedgerModel } from "@/lib/models/QueueGuardLedger";
+import { QueueGuardSessionModel } from "@/lib/models/QueueGuardSession";
+
 import { QUEUEGUARD_POLICY } from "./policy";
 import { sha256Hex } from "./hash";
 import type { QueueDecision, QueueEventType, QueueLedgerEntry, QueueSessionState, StepUpChallenge } from "./types";
@@ -6,6 +11,23 @@ import type { QueueDecision, QueueEventType, QueueLedgerEntry, QueueSessionState
 type QueueGuardStore = {
   sessions: Record<string, QueueSessionState>;
   ledger: QueueLedgerEntry[];
+};
+
+type QueueGuardSessionRecord = {
+  sessionId: string;
+  createdAtMs: number;
+  lastSeenAtMs: number;
+  trustedUntilMs?: number;
+  frictionUsed: number;
+  challengeAttempts: number;
+  challengePasses: number;
+  challengeFailures: number;
+  pendingChallenge?: QueueSessionState["pendingChallenge"];
+  lastDecision?: QueueDecision;
+  lastEventType?: QueueEventType;
+  history: QueueSessionState["history"];
+  payloadCounts?: Map<string, number> | Record<string, number>;
+  sequenceCounts?: Map<string, number> | Record<string, number>;
 };
 
 const MAX_LEDGER_ENTRIES = 600;
@@ -23,16 +45,9 @@ function getGlobalStore(): QueueGuardStore {
   return root[globalKey] as QueueGuardStore;
 }
 
-export function ensureSession(sessionId: string): QueueSessionState {
-  const store = getGlobalStore();
+function createSession(sessionId: string): QueueSessionState {
   const now = Date.now();
-  const existing = store.sessions[sessionId];
-  if (existing) {
-    existing.lastSeenAt = now;
-    return existing;
-  }
-
-  const session: QueueSessionState = {
+  return {
     sessionId,
     createdAt: now,
     lastSeenAt: now,
@@ -44,19 +59,126 @@ export function ensureSession(sessionId: string): QueueSessionState {
     payloadCounts: {},
     sequenceCounts: {},
   };
-  store.sessions[sessionId] = session;
+}
+
+function normalizeNumberRecord(
+  value: Map<string, number> | Record<string, number> | undefined
+): Record<string, number> {
+  if (!value) return {};
+  if (value instanceof Map) {
+    return Object.fromEntries(value.entries());
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([key, count]) => [key, Number(count) || 0])
+  );
+}
+
+function hydrateSession(record: QueueGuardSessionRecord): QueueSessionState {
+  return {
+    sessionId: record.sessionId,
+    createdAt: record.createdAtMs,
+    lastSeenAt: record.lastSeenAtMs,
+    trustedUntil: record.trustedUntilMs,
+    frictionUsed: record.frictionUsed,
+    challengeAttempts: record.challengeAttempts,
+    challengePasses: record.challengePasses,
+    challengeFailures: record.challengeFailures,
+    pendingChallenge: record.pendingChallenge,
+    lastDecision: record.lastDecision,
+    lastEventType: record.lastEventType,
+    history: record.history || [],
+    payloadCounts: normalizeNumberRecord(record.payloadCounts),
+    sequenceCounts: normalizeNumberRecord(record.sequenceCounts),
+  };
+}
+
+function serializeSession(session: QueueSessionState) {
+  return {
+    sessionId: session.sessionId,
+    createdAtMs: session.createdAt,
+    lastSeenAtMs: session.lastSeenAt,
+    trustedUntilMs: session.trustedUntil,
+    frictionUsed: session.frictionUsed,
+    challengeAttempts: session.challengeAttempts,
+    challengePasses: session.challengePasses,
+    challengeFailures: session.challengeFailures,
+    pendingChallenge: session.pendingChallenge,
+    lastDecision: session.lastDecision,
+    lastEventType: session.lastEventType,
+    history: session.history,
+    payloadCounts: session.payloadCounts,
+    sequenceCounts: session.sequenceCounts,
+  };
+}
+
+export async function ensureSession(sessionId: string): Promise<QueueSessionState> {
+  if (!isMongoConfigured()) {
+    const store = getGlobalStore();
+    const existing = store.sessions[sessionId];
+    if (existing) {
+      existing.lastSeenAt = Date.now();
+      return existing;
+    }
+    const session = createSession(sessionId);
+    store.sessions[sessionId] = session;
+    return session;
+  }
+
+  await connectMongo();
+  const record = await QueueGuardSessionModel.findOne({ sessionId }).lean<QueueGuardSessionRecord | null>();
+  if (record) {
+    const session = hydrateSession(record);
+    session.lastSeenAt = Date.now();
+    return session;
+  }
+
+  const session = createSession(sessionId);
+  await QueueGuardSessionModel.create(serializeSession(session));
   return session;
 }
 
-export function getSession(sessionId: string): QueueSessionState | null {
-  const store = getGlobalStore();
-  return store.sessions[sessionId] || null;
+export async function getSession(sessionId: string): Promise<QueueSessionState | null> {
+  if (!isMongoConfigured()) {
+    const store = getGlobalStore();
+    return store.sessions[sessionId] || null;
+  }
+
+  await connectMongo();
+  const record = await QueueGuardSessionModel.findOne({ sessionId }).lean<QueueGuardSessionRecord | null>();
+  return record ? hydrateSession(record) : null;
 }
 
-export function resetSession(sessionId: string): QueueSessionState {
-  const store = getGlobalStore();
-  delete store.sessions[sessionId];
-  return ensureSession(sessionId);
+export async function resetSession(sessionId: string): Promise<QueueSessionState> {
+  if (!isMongoConfigured()) {
+    const store = getGlobalStore();
+    delete store.sessions[sessionId];
+    const session = createSession(sessionId);
+    store.sessions[sessionId] = session;
+    return session;
+  }
+
+  await connectMongo();
+  await QueueGuardSessionModel.deleteOne({ sessionId });
+  const session = createSession(sessionId);
+  await QueueGuardSessionModel.create(serializeSession(session));
+  return session;
+}
+
+export async function saveSession(session: QueueSessionState): Promise<void> {
+  session.lastSeenAt = Date.now();
+
+  if (!isMongoConfigured()) {
+    const store = getGlobalStore();
+    store.sessions[session.sessionId] = session;
+    return;
+  }
+
+  await connectMongo();
+  await QueueGuardSessionModel.updateOne(
+    { sessionId: session.sessionId },
+    { $set: serializeSession(session) },
+    { upsert: true }
+  );
 }
 
 export function applyChallengeSuccess(session: QueueSessionState) {
@@ -144,7 +266,7 @@ export function consumeFriction(session: QueueSessionState, level: 1 | 2) {
   );
 }
 
-export function appendLedgerEvent(args: {
+export async function appendLedgerEvent(args: {
   sessionId: string;
   eventKind: "score" | "verify";
   eventType: QueueEventType;
@@ -152,9 +274,44 @@ export function appendLedgerEvent(args: {
   decision: QueueDecision;
   stepUpOutcome: "none" | "issued" | "pass" | "fail";
   latencyMs: number;
-}): QueueLedgerEntry {
-  const store = getGlobalStore();
-  const prevHash = store.ledger.length > 0 ? store.ledger[store.ledger.length - 1].entryHash : "GENESIS";
+}): Promise<QueueLedgerEntry> {
+  if (!isMongoConfigured()) {
+    const store = getGlobalStore();
+    const prevHash = store.ledger.length > 0 ? store.ledger[store.ledger.length - 1].entryHash : "GENESIS";
+    const entryBase = {
+      id: crypto.randomUUID(),
+      ts: new Date().toISOString(),
+      sessionId: args.sessionId,
+      eventKind: args.eventKind,
+      eventType: args.eventType,
+      attemptedAction: args.attemptedAction,
+      decisionAction: args.decision.action,
+      risk: args.decision.risk,
+      topFactorKeys: args.decision.topFactors.map((f) => f.key),
+      stepUpLevel: args.decision.stepUpLevel,
+      stepUpOutcome: args.stepUpOutcome,
+      policyVersion: args.decision.policyVersion,
+      frictionBudget: args.decision.frictionBudget,
+      latencyMs: args.latencyMs,
+      prevHash,
+    };
+    const entryHash = sha256Hex(`${prevHash}|${JSON.stringify(entryBase)}`);
+
+    const entry: QueueLedgerEntry = {
+      ...entryBase,
+      entryHash,
+    };
+
+    store.ledger.push(entry);
+    if (store.ledger.length > MAX_LEDGER_ENTRIES) {
+      store.ledger.splice(0, store.ledger.length - MAX_LEDGER_ENTRIES);
+    }
+    return entry;
+  }
+
+  await connectMongo();
+  const previous = await QueueGuardLedgerModel.findOne({}).sort({ ts: -1 }).select("entryHash").lean<{ entryHash: string } | null>();
+  const prevHash = previous?.entryHash || "GENESIS";
   const entryBase = {
     id: crypto.randomUUID(),
     ts: new Date().toISOString(),
@@ -173,27 +330,88 @@ export function appendLedgerEvent(args: {
     prevHash,
   };
   const entryHash = sha256Hex(`${prevHash}|${JSON.stringify(entryBase)}`);
-
   const entry: QueueLedgerEntry = {
     ...entryBase,
     entryHash,
   };
 
-  store.ledger.push(entry);
-  if (store.ledger.length > MAX_LEDGER_ENTRIES) {
-    store.ledger.splice(0, store.ledger.length - MAX_LEDGER_ENTRIES);
-  }
+  await QueueGuardLedgerModel.create({
+    ledgerId: entry.id,
+    ts: entry.ts,
+    sessionId: entry.sessionId,
+    eventKind: entry.eventKind,
+    eventType: entry.eventType,
+    attemptedAction: entry.attemptedAction,
+    decisionAction: entry.decisionAction,
+    risk: entry.risk,
+    topFactorKeys: entry.topFactorKeys,
+    stepUpLevel: entry.stepUpLevel,
+    stepUpOutcome: entry.stepUpOutcome,
+    policyVersion: entry.policyVersion,
+    frictionBudget: entry.frictionBudget,
+    latencyMs: entry.latencyMs,
+    prevHash: entry.prevHash,
+    entryHash: entry.entryHash,
+  });
+
   return entry;
 }
 
-export function getLedger(args?: { action?: string; limit?: number }): QueueLedgerEntry[] {
-  const store = getGlobalStore();
+export async function getLedger(args?: { action?: string; limit?: number }): Promise<QueueLedgerEntry[]> {
   const actionFilter = args?.action?.trim().toUpperCase();
   const limit = Math.max(1, Math.min(args?.limit ?? 150, 500));
-  const reversed = [...store.ledger].reverse();
 
-  const filtered = actionFilter
-    ? reversed.filter((entry) => entry.decisionAction === actionFilter)
-    : reversed;
-  return filtered.slice(0, limit);
+  if (!isMongoConfigured()) {
+    const store = getGlobalStore();
+    const reversed = [...store.ledger].reverse();
+    const filtered = actionFilter
+      ? reversed.filter((entry) => entry.decisionAction === actionFilter)
+      : reversed;
+    return filtered.slice(0, limit);
+  }
+
+  await connectMongo();
+  const query = actionFilter ? { decisionAction: actionFilter } : {};
+  const records = await QueueGuardLedgerModel.find(query)
+    .sort({ ts: -1 })
+    .limit(limit)
+    .lean<
+      Array<{
+        ledgerId: string;
+        ts: string;
+        sessionId: string;
+        eventKind: "score" | "verify";
+        eventType: QueueEventType;
+        attemptedAction: QueueEventType;
+        decisionAction: QueueDecision["action"];
+        risk: number;
+        topFactorKeys: string[];
+        stepUpLevel: 0 | 1 | 2;
+        stepUpOutcome: "none" | "issued" | "pass" | "fail";
+        policyVersion: string;
+        frictionBudget: QueueDecision["frictionBudget"];
+        latencyMs: number;
+        prevHash: string;
+        entryHash: string;
+      }>
+    >();
+
+  return records.map((record) => ({
+    id: record.ledgerId,
+    ts: record.ts,
+    sessionId: record.sessionId,
+    eventKind: record.eventKind,
+    eventType: record.eventType,
+    attemptedAction: record.attemptedAction,
+    decisionAction: record.decisionAction,
+    risk: record.risk,
+    topFactorKeys: record.topFactorKeys,
+    stepUpLevel: record.stepUpLevel,
+    stepUpOutcome: record.stepUpOutcome,
+    policyVersion: record.policyVersion,
+    frictionBudget: record.frictionBudget,
+    latencyMs: record.latencyMs,
+    prevHash: record.prevHash,
+    entryHash: record.entryHash,
+  }));
 }

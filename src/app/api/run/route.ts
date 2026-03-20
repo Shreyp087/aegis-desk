@@ -7,6 +7,20 @@ import { openai } from "@ai-sdk/openai";
 import { generateObject } from "ai";
 import { z } from "zod";
 import { connectMongo } from "@/lib/db/mongoose";
+import {
+  attachClaimVerification,
+  ExtractedClaimSchema,
+  VerifiedClaimSchema,
+} from "@/lib/agent/claimVerification";
+import {
+  EvidenceConflictSchema,
+  EvidenceItemSchema,
+  scoreResultsForQuery,
+  summarizeResearchEvidence,
+  type RawResearchResult,
+  type ScoredResearchResult,
+} from "@/lib/agent/evidence";
+import { formatFinalOutput } from "@/lib/agent/finalFormatter";
 import { extractEntityCandidatesFromContext } from "@/lib/inbox/entityProfiler";
 import { EntityProfileCacheModel } from "@/lib/models/EntityProfileCache";
 import { getOfflineRuntimeConfig, isOfflineEnforced } from "@/lib/offline";
@@ -43,11 +57,7 @@ type RunPlan = {
   [key: string]: unknown;
 };
 
-type NormalizedLinkupResult = {
-  title: string;
-  url: string;
-  snippet: string;
-};
+type NormalizedLinkupResult = ScoredResearchResult;
 
 type SearchResearch = {
   type: "search";
@@ -79,7 +89,7 @@ const AnalysisFindingSchema = z.object({
 });
 
 /** ---------- Schema for Outputs (Drafts + Evidence) ---------- */
-const FinalSchema = z.object({
+const GeneratedFinalSchema = z.object({
   summary: z.object({
     email: z.string(),
     document: z.string(),
@@ -124,10 +134,19 @@ const FinalSchema = z.object({
     ics: z.string(),
   }),
 
+  claims: z.array(ExtractedClaimSchema).catch([]).default([]),
+
   notes: z.object({
     whatIDid: z.array(z.string()),
     uncertainties: z.array(z.string()),
   }),
+});
+
+const FinalSchema = GeneratedFinalSchema.extend({
+  claims: z.array(VerifiedClaimSchema).default([]),
+  evidence: z.array(EvidenceItemSchema).default([]),
+  conflicts: z.array(EvidenceConflictSchema).default([]),
+  evidence_quality_score: z.number().min(0).max(1).default(0),
 });
 
 const RunRequestSchema = z.object({
@@ -368,6 +387,7 @@ export async function POST(req: Request) {
 
     const ledger: Array<Record<string, unknown>> = [];
     const research: ResearchEvent[] = [];
+    const rawSearchBatches: Array<{ query: string; results: RawResearchResult[] }> = [];
     const mongoCacheReady = await hasMongoCache();
 
     const log = (type: string, message: string, data?: unknown) => {
@@ -403,13 +423,15 @@ export async function POST(req: Request) {
           includeImages: false,
         })) as { results?: Array<{ title?: string; name?: string; url?: string; snippet?: string; content?: string }> };
 
-        const results: NormalizedLinkupResult[] = (response.results ?? [])
+        const rawResults: RawResearchResult[] = (response.results ?? [])
           .slice(0, 8)
           .map((r) => ({
             title: r.title || r.name || "Untitled",
             url: r.url || "",
             snippet: (r.snippet || r.content || "").slice(0, 360),
           }));
+        const results: NormalizedLinkupResult[] = scoreResultsForQuery(redacted.safeQuery, rawResults);
+        rawSearchBatches.push({ query: redacted.safeQuery, results: rawResults });
 
         research.push({
           type: "search",
@@ -444,6 +466,13 @@ export async function POST(req: Request) {
 
       log("step_done", `Completed step ${step.id}`);
     }
+
+    const evidenceSummary = summarizeResearchEvidence(rawSearchBatches);
+    log("evidence", "Scored retrieval evidence and checked for conflicts", {
+      evidenceCount: evidenceSummary.evidence.length,
+      conflicts: evidenceSummary.conflicts.length,
+      evidenceQualityScore: evidenceSummary.evidence_quality_score,
+    });
 
     // --- Prepare evidence for synthesis ---
     const perEntityResearch = groupResearchByEntity(plan, research);
@@ -556,6 +585,7 @@ GOAL:
 - Build one dynamic analysis section with 3-6 findings (severity + suggested edits), based on the user command and mail type.
 - Verify company/person/entity background using Linkup results ONLY.
 - Output genuineness verdicts with a justified uncertaintyPct that is NOT random.
+- Extract top-level raw claims from EMAIL_TEXT and DOCUMENT_TEXT only.
 
 CRITICAL RULES:
 - You MUST base verdict and uncertaintyPct on the extracted ENTITY_PROFILES_EXTRACTED_FROM_LINKUP only.
@@ -569,10 +599,19 @@ CRITICAL RULES:
   (c) redFlags count/severity (name collision, fiction/franchise, mismatched entity)
 - Guidance for uncertaintyPct:
   - If official domain is present AND whatItIs is clear AND redFlags are empty/low → uncertaintyPct should be 5–25.
-  - If missing official domain OR only directories/aggregators OR identity conflicts → uncertaintyPct should be 55–85.
+- If missing official domain OR only directories/aggregators OR identity conflicts → uncertaintyPct should be 55–85.
 - If strong franchise/fiction mismatch or strong spoof signals → verdict suspicious and uncertaintyPct should be 5–25 (high confidence it's suspicious).
 - Proof must be brief (2-4 items) using profile.sourceEvidence (title/url/snippet). snippet can be "".
 - Ensure replyDraft is aligned to BOTH: analysisSection findings + entity verification outcome.
+- Claims are raw asserted statements, NOT verified facts.
+- Do NOT use Linkup evidence to invent or validate claims.
+- Extract claims only with these types: "sender_identity", "organization", "financial_request", "urgency".
+- sender_identity: who the sender claims to be or represent.
+- organization: what company or organization is claimed or referenced as the acting party.
+- financial_request: requests for payment, invoice handling, bank detail change, refund, ACH, wire, beneficiary, or remittance action.
+- urgency: explicit deadline, emergency framing, pressure, or immediate-action claim.
+- Use [] if no claims are present. Prefer 0 to 6 total claims.
+- claim confidence is extraction confidence in [0,1], not truth confidence.
 
 EMAIL_TEXT:
 ${emailText}
@@ -602,20 +641,53 @@ Return STRICT JSON matching the schema exactly.
 
     const finalObj = await generateObject({
       model: openai("gpt-4o-mini"),
-      schema: FinalSchema,
+      schema: GeneratedFinalSchema,
       prompt,
     });
 
-    const final = finalObj.object;
+    const parsedFinal = FinalSchema.parse({
+      ...finalObj.object,
+      claims: attachClaimVerification(finalObj.object.claims ?? [], {
+        emailText,
+        docText,
+      }),
+      evidence: evidenceSummary.evidence,
+      conflicts: evidenceSummary.conflicts,
+      evidence_quality_score: evidenceSummary.evidence_quality_score,
+    });
+    const final = formatFinalOutput({
+      final: parsedFinal,
+      plan,
+      ledger,
+      modelsUsed: ["openai:gpt-4o-mini:entity_profile", "openai:gpt-4o-mini:final_synthesis"],
+    });
 
     log("output", "Final output produced", {
       entityVerdicts: final.entityVerdicts?.length ?? 0,
+      claimCount: final.claims?.length ?? 0,
+      evidenceCount: final.evidence?.length ?? 0,
+      conflictCount: final.conflicts?.length ?? 0,
+      evidenceQualityScore: final.evidence_quality_score ?? 0,
+      decisionAction: final.decision?.final_action ?? "",
+      uncertaintyLevel: final.uncertainty?.level ?? "",
+      auditFlags: final.audit_trace?.flags?.length ?? 0,
       analysisTitle: final.analysisSection?.title ?? "",
       analysisFindings: final.analysisSection?.findings?.length ?? 0,
       hasICS: !!final.meetingInvite?.ics,
     });
 
-    return Response.json({ ok: true, final, plan, ledger, research, profiles, runConfig: { linkupDepth } });
+    return Response.json({
+      ok: true,
+      final,
+      plan,
+      ledger,
+      research,
+      profiles,
+      evidence: final.evidence,
+      conflicts: final.conflicts,
+      evidence_quality_score: final.evidence_quality_score,
+      runConfig: { linkupDepth },
+    });
   } catch (err: unknown) {
     console.error("Run error:", err);
     const detail = err instanceof Error ? err.message : String(err);

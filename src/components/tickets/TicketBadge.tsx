@@ -14,14 +14,15 @@ export function TicketBadge({ ticket }: { ticket: LocalTicket }) {
 
   const classes =
     ticket.syncState === "synced"
-      ? "border-cyan-300/60 bg-cyan-400/15 text-cyan-100"
+      ? "border-emerald-800/60 bg-emerald-950/50 text-emerald-400"
       : ticket.syncState === "failed"
-        ? "border-rose-300/60 bg-rose-400/15 text-rose-100"
-        : "border-slate-300/40 bg-slate-800/40 text-slate-100";
+        ? "border-red-800/60 bg-red-950/50 text-red-400"
+        : "border-zinc-700/50 bg-zinc-800/50 text-zinc-300";
 
   return (
-    <span className={`inline-flex items-center gap-1 px-2 py-1 rounded-full text-xs border ${classes}`}>
+    <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-1 text-xs font-mono font-medium tracking-wide ${classes}`}>
       {label}
     </span>
   );
 }
+

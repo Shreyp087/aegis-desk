@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { verifyStepUpChallenge } from "@/lib/queueguard/engine";
-import { appendLedgerEvent, ensureSession, getSession } from "@/lib/queueguard/store";
+import { appendLedgerEvent, ensureSession, saveSession } from "@/lib/queueguard/store";
 import type { QueueEventType, QueueVerifyInput, QueueVerifyResponse } from "@/lib/queueguard/types";
 
 export const runtime = "nodejs";
@@ -26,14 +26,14 @@ export async function POST(req: Request) {
     }
 
     const input = parsed.data as QueueVerifyInput;
-    const session = ensureSession(input.sessionId);
+    const session = await ensureSession(input.sessionId);
     const result = verifyStepUpChallenge({ session, input });
     const latencyMs = Date.now() - startedAt;
 
-    const eventType: QueueEventType =
-      session.lastEventType || getSession(input.sessionId)?.lastEventType || "refresh";
+    const eventType: QueueEventType = session.lastEventType || "refresh";
 
-    appendLedgerEvent({
+    await saveSession(session);
+    await appendLedgerEvent({
       sessionId: input.sessionId,
       eventKind: "verify",
       eventType,

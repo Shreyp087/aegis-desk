@@ -1,5 +1,6 @@
 "use client";
 
+import { MetricCard, StatusBadge } from "@/components/ui/AegisPrimitives";
 import type { RiskDecision, SessionState } from "@/lib/queueguard/types";
 
 export default function RiskPanel({
@@ -12,48 +13,41 @@ export default function RiskPanel({
   policyVersion: string;
 }) {
   return (
-    <section className="rounded-2xl border p-4 shadow-sm">
-      <h2 className="text-lg font-semibold">Risk & Transparency</h2>
-      <p className="text-xs opacity-80">
-        Derived behavioral signals only (no raw PII). Decisions are explainable and logged.
-      </p>
-
-      <div className="mt-4 rounded-2xl bg-black/5 p-4">
-        <div className="flex items-center justify-between">
-          <div className="text-xs font-medium opacity-80">Friction Budget</div>
-          <div className="text-xs opacity-80">Policy: {policyVersion}</div>
-        </div>
-        <div className="mt-2 text-sm">
-          Used <span className="font-semibold">{state.frictionUsed}</span> /{" "}
-          <span className="font-semibold">{state.frictionCap}</span>{" "}
-          <span className="opacity-70">(lower is better for legit fans)</span>
-        </div>
+    <section className="flex min-h-0 flex-col rounded-2xl border border-foreground/8 bg-surface p-5 shadow-sm">
+      <div className="border-b border-foreground/6 pb-4">
+        <h2 className="text-sm font-medium tracking-tight text-foreground">Risk and Transparency</h2>
+        <p className="mt-1 text-sm font-light leading-relaxed text-foreground/60">
+          Derived behavioral signals only. Decisions stay explainable and logged.
+        </p>
       </div>
 
-      <div className="mt-4">
+      <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-1">
+        <MetricCard label="Friction Budget" value={`${state.frictionUsed}/${state.frictionCap}`} sub={`Policy ${policyVersion}`} tone="caution" />
+        <MetricCard
+          label="Current Risk"
+          value={decision ? `${decision.risk}/100` : "--"}
+          sub={decision ? `${decision.action}${decision.action === "STEP_UP" ? ` · L${decision.stepUpLevel}` : ""}` : "Trigger an action"}
+          tone={decision && decision.risk >= 75 ? "risk" : decision && decision.risk >= 40 ? "caution" : "clear"}
+        />
+      </div>
+
+      <div className="mt-4 flex-1 min-h-0 space-y-3 overflow-y-auto">
         {!decision ? (
-          <div className="rounded-2xl border p-4 text-sm opacity-80">
-            Trigger an action (Join/Refresh/Checkout) to see risk scoring and step-up decisions.
+          <div className="rounded-2xl border border-foreground/8 bg-background/70 p-4 text-sm font-light text-foreground/60">
+            Trigger an action to see risk scoring, top factors, and step-up decisions.
           </div>
         ) : (
-          <div className="space-y-3">
-            <div className="rounded-2xl border p-4">
-              <div className="flex items-center justify-between">
-                <div className="text-xs font-medium opacity-80">Risk Score</div>
-                <div className="text-xs opacity-80">Latency: {decision.latencyMs}ms</div>
+          <>
+            <div className="rounded-2xl border border-foreground/8 bg-background/70 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-xs font-mono uppercase tracking-widest opacity-40">Decision</div>
+                <StatusBadge tone={decision.action === "BLOCK" ? "risk" : decision.action === "STEP_UP" ? "caution" : "clear"}>
+                  {decision.action}
+                </StatusBadge>
               </div>
-              <div className="mt-1 text-2xl font-semibold">{decision.risk}/100</div>
-              <div className="mt-1 text-sm">
-                Decision: <span className="font-semibold">{decision.action}</span>{" "}
-                {decision.action === "STEP_UP" ? (
-                  <span className="opacity-80">
-                    (Step-up L{decision.stepUpLevel}: {decision.stepUpMethod})
-                  </span>
-                ) : null}
-              </div>
-
+              <div className="mt-2 text-sm font-light text-foreground/60">Latency {decision.latencyMs}ms</div>
               {decision.notes.length ? (
-                <ul className="mt-2 list-disc space-y-1 pl-5 text-xs opacity-80">
+                <ul className="mt-3 list-disc space-y-1 pl-5 text-sm font-light text-foreground/60">
                   {decision.notes.map((n, i) => (
                     <li key={i}>{n}</li>
                   ))}
@@ -61,37 +55,33 @@ export default function RiskPanel({
               ) : null}
             </div>
 
-            <div className="rounded-2xl border p-4">
-              <div className="text-xs font-medium opacity-80">Top Factors (Why)</div>
-              <div className="mt-2 space-y-2">
+            <div className="rounded-2xl border border-foreground/8 bg-background/70 p-4">
+              <div className="text-xs font-mono uppercase tracking-widest opacity-40">Top Factors</div>
+              <div className="mt-3 space-y-3">
                 {decision.factors.slice(0, 6).map((f) => (
-                  <div key={f.key} className="rounded-xl bg-black/5 p-3">
-                    <div className="flex items-center justify-between">
-                      <div className="text-sm font-semibold">{f.label}</div>
-                      <div className="text-xs opacity-80">{Math.round(f.points)} pts</div>
+                  <div key={f.key} className="rounded-2xl border border-foreground/8 bg-surface p-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="text-sm font-medium text-foreground">{f.label}</div>
+                      <div className="text-xs font-mono tabular-nums opacity-50">{Math.round(f.points)} pts</div>
                     </div>
-                    <div className="mt-1 text-xs opacity-80">{f.evidence}</div>
-                    <div className="mt-2 h-2 w-full rounded-full bg-black/10">
-                      <div
-                        className="h-2 rounded-full bg-black/60"
-                        style={{ width: `${Math.round(f.score01 * 100)}%` }}
-                        aria-label={`${f.label} contribution`}
-                      />
+                    <div className="mt-1 text-sm font-light text-foreground/60">{f.evidence}</div>
+                    <div className="mt-3 h-1.5 w-full rounded-full bg-foreground/10">
+                      <div className="h-1.5 rounded-full bg-accent" style={{ width: `${Math.round(f.score01 * 100)}%` }} />
                     </div>
                   </div>
                 ))}
               </div>
             </div>
 
-            <div className="rounded-2xl border p-4">
-              <div className="text-xs font-medium opacity-80">Privacy & Minimization (what we do NOT store)</div>
-              <ul className="mt-2 list-disc space-y-1 pl-5 text-xs opacity-80">
+            <div className="rounded-2xl border border-foreground/8 bg-background/70 p-4">
+              <div className="text-xs font-mono uppercase tracking-widest opacity-40">Privacy and Minimization</div>
+              <ul className="mt-3 list-disc space-y-1 pl-5 text-sm font-light text-foreground/60">
                 <li>No demographics, no location, no biometrics.</li>
                 <li>No raw page content or typed text stored.</li>
-                <li>Only derived behavioral signals + decision metadata are logged.</li>
+                <li>Only derived behavioral signals and decision metadata are logged.</li>
               </ul>
             </div>
-          </div>
+          </>
         )}
       </div>
     </section>

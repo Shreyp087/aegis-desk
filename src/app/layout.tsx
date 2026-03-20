@@ -1,33 +1,47 @@
 import type { Metadata } from "next";
 import { JetBrains_Mono, Sora } from "next/font/google";
+
+import { AppShell } from "@/components/AppShell";
+import { ThemeProvider } from "@/components/ThemeProvider";
+import { AuthProvider } from "@/context/AuthContext";
+import { getServerSession } from "@/lib/auth/session";
 import "./globals.css";
 
 const sora = Sora({
-  variable: "--font-sora",
   subsets: ["latin"],
+  weight: ["300", "400", "500", "600"],
+  variable: "--font-sans",
 });
 
-const jetbrainsMono = JetBrains_Mono({
-  variable: "--font-jetbrains-mono",
+const mono = JetBrains_Mono({
   subsets: ["latin"],
+  weight: ["400", "500"],
+  variable: "--font-mono",
 });
 
 export const metadata: Metadata = {
   title: "Aegis Desk",
-  description: "Minimal-futuristic intelligence desktop for inbox triage and autonomous workflows.",
+  description: "Email triage, AI-assisted analysis, and operational follow-through.",
 };
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const initialUser = await getServerSession();
+
   return (
-    <html lang="en">
+    <html lang="en" className={`${sora.variable} ${mono.variable}`} suppressHydrationWarning>
       <body
-        className={`${sora.variable} ${jetbrainsMono.variable} antialiased`}
+        className="min-h-screen bg-background text-foreground font-sans antialiased"
+        suppressHydrationWarning
       >
-        {children}
+        <ThemeProvider>
+          <AuthProvider initialUser={initialUser}>
+            <AppShell>{children}</AppShell>
+          </AuthProvider>
+        </ThemeProvider>
       </body>
     </html>
   );

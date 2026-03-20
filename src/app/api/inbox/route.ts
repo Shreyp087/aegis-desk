@@ -13,7 +13,32 @@ import {
   type IncidentHint,
   type MailClassifierResult,
 } from "@/lib/inbox/classifier";
+import {
+  buildExplanation,
+  buildSignalGroups,
+  buildStructuredUncertainty,
+  InboxExplanationSchema,
+  InboxSignalGroupsSchema,
+  InboxUncertaintySchema,
+} from "@/lib/inbox/compatibility";
+import {
+  ConsensusAgreementScoresSchema,
+  ConsensusModelOutputSchema,
+  defaultAgreementScores,
+  disagreementSeverity,
+  evaluateConsensusRuns,
+} from "@/lib/inbox/consensus";
 import { fetchLatestGmailRawEmails, getValidGmailToken } from "@/lib/inbox/gmail";
+import {
+  appendInboxEvaluationLogEntries,
+  buildGroundTruthPlaceholder,
+  buildInboxEvaluationLogEntry,
+} from "@/lib/inbox/evaluation";
+import {
+  buildEnvDecisionPolicyConfig,
+  InboxDecisionSchema,
+  routeInboxDecision,
+} from "@/lib/inbox/decision";
 import {
   applyActionGuardrails,
   applyPriorityGuardrails,
@@ -224,10 +249,17 @@ const AlertSchema = z.object({
   categoryScores: z.array(CategoryScoreSchema),
   riskTags: z.array(z.string()),
   signals: z.array(z.string()),
+  signalGroups: InboxSignalGroupsSchema,
+  uncertainty: InboxUncertaintySchema,
+  explanation: InboxExplanationSchema,
+  decision: InboxDecisionSchema,
   suggestedAction: z.string(),
   draftReply: z.string(),
   consensusScore: z.number().min(0).max(100),
   consensusNote: z.string(),
+  agreement_scores: ConsensusAgreementScoresSchema,
+  disagreement_flags: z.array(z.string()),
+  consensus_strength: z.number().min(0).max(1),
   trustedDecision: z.object({
     action: TrustedDecisionActionEnum,
     confidencePct: z.number().min(0).max(100),
@@ -1181,31 +1213,6 @@ function calibrateUncertainty(args: {
   return clamp(Math.round(100 - calibratedConfidence), 2, 98);
 }
 
-const LLMOutSchema = z.object({
-  suggestedAction: z.string(),
-  draftReply: z.string(),
-});
-
-function tokenize(text: string): string[] {
-  return text
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .split(/\s+/)
-    .filter((t) => t.length > 2);
-}
-
-function jaccardScore(a: string, b: string): number {
-  const sa = new Set(tokenize(a));
-  const sb = new Set(tokenize(b));
-  if (sa.size === 0 || sb.size === 0) return 0;
-  let inter = 0;
-  for (const token of sa) {
-    if (sb.has(token)) inter += 1;
-  }
-  const union = sa.size + sb.size - inter;
-  return union === 0 ? 0 : inter / union;
-}
-
 type TrustedDecision = {
   action: TrustedDecisionAction;
   confidencePct: number;
@@ -1218,6 +1225,9 @@ type AssistOutput = {
   draftReply: string;
   consensusScore: number;
   consensusNote: string;
+  agreement_scores: z.infer<typeof ConsensusAgreementScoresSchema>;
+  disagreement_flags: string[];
+  consensus_strength: number;
 };
 
 type AssistModelProvider = "openai" | "anthropic" | "google";
@@ -1231,12 +1241,12 @@ type AssistModelSpec = {
 
 type AssistModelRun = {
   spec: AssistModelSpec;
-  output: z.infer<typeof LLMOutSchema> | null;
+  output: z.infer<typeof ConsensusModelOutputSchema> | null;
 };
 
 type SuccessfulAssistModelRun = {
   spec: AssistModelSpec;
-  output: z.infer<typeof LLMOutSchema>;
+  output: z.infer<typeof ConsensusModelOutputSchema>;
 };
 
 function hasEnv(name: string): boolean {
@@ -1292,6 +1302,13 @@ function isSuccessfulAssistModelRun(run: AssistModelRun): run is SuccessfulAssis
 
 function formatModelNames(models: { displayName: string }[]): string {
   return models.map((m) => m.displayName).join(", ");
+}
+
+function applyDisagreementPenalty(baseUncertaintyPercent: number, flags: string[]): number {
+  const severity = disagreementSeverity(flags);
+  if (severity === "hard") return clamp(baseUncertaintyPercent + 12, 2, 98);
+  if (severity === "moderate") return clamp(baseUncertaintyPercent + 6, 2, 98);
+  return baseUncertaintyPercent;
 }
 
 function buildTrustedDecision(args: {
@@ -1406,6 +1423,9 @@ Regards`;
     draftReply,
     consensusScore: args.trustedDecision.confidencePct,
     consensusNote: `Offline deterministic policy applied (${riskSummary}).`,
+    agreement_scores: defaultAgreementScores(),
+    disagreement_flags: ["offline_policy_applied"],
+    consensus_strength: clamp(args.trustedDecision.confidencePct / 100, 0, 1),
   };
 }
 
@@ -1428,6 +1448,10 @@ Use ONLY the email and provided signals.
 Output strict JSON:
 - suggestedAction: 1 concise sentence with safest next action.
 - draftReply: 3-7 professional lines. If no response needed: "No reply needed."
+- label: one of "spam", "harmful", "actionable", "informational".
+- action: one of "allow", "escalate", "quarantine", "block".
+- confidence: float between 0 and 1 for the model's own confidence.
+- entities: list of important people, organizations, brands, domains, or products referenced in the email. Use [] if none.
 
 FROM: ${args.from}
 SUBJECT: ${args.subject}
@@ -1455,7 +1479,7 @@ ${args.rawEmail}
 
     const obj = await generateObject({
       model,
-      schema: LLMOutSchema,
+      schema: ConsensusModelOutputSchema,
       prompt,
     });
     return { spec: args.modelSpec, output: obj.object };
@@ -1485,6 +1509,9 @@ async function llmAssistWithConsensus(args: {
       consensusScore: 30,
       consensusNote:
         "No consensus models configured. Set OPENAI_API_KEY and optionally GOOGLE_GENERATIVE_AI_API_KEY / ANTHROPIC_API_KEY.",
+      agreement_scores: defaultAgreementScores(),
+      disagreement_flags: ["no_models_configured"],
+      consensus_strength: 0.3,
     };
   }
 
@@ -1497,67 +1524,68 @@ async function llmAssistWithConsensus(args: {
       draftReply: "Thanks for your email. I will verify details through a trusted channel and then confirm next steps.",
       consensusScore: 30,
       consensusNote: `All configured reasoning models failed (${formatModelNames(modelPool)}); fallback response used.`,
+      agreement_scores: defaultAgreementScores(),
+      disagreement_flags: ["all_models_failed"],
+      consensus_strength: 0.3,
     };
   }
+
+  const evaluation = evaluateConsensusRuns({
+    successfulRuns,
+    totalModelCount: modelPool.length,
+  });
+  const successfulModelNames = formatModelNames(successfulRuns.map((r) => r.spec));
+  const severity = disagreementSeverity(evaluation.disagreement_flags);
 
   if (successfulRuns.length === 1) {
+    const partialFailureNote = evaluation.disagreement_flags.includes("partial_model_failure")
+      ? " Some configured models failed, so disagreement handling increased uncertainty."
+      : "";
     return {
-      ...successfulRuns[0].output,
-      consensusScore: 52,
-      consensusNote: `Single-model response (${successfulRuns[0].spec.displayName}). Enable consensus in Inbox settings to run multiple models.`,
+      suggestedAction: evaluation.anchor.output.suggestedAction,
+      draftReply: evaluation.anchor.output.draftReply,
+      consensusScore: evaluation.consensusScore,
+      consensusNote: `Single-model response (${successfulRuns[0].spec.displayName}). Enable consensus in Inbox settings to run multiple models.${partialFailureNote}`,
+      agreement_scores: evaluation.agreement_scores,
+      disagreement_flags: evaluation.disagreement_flags,
+      consensus_strength: evaluation.consensus_strength,
     };
   }
 
-  const pairScores: number[] = [];
-  for (let i = 0; i < successfulRuns.length; i += 1) {
-    for (let j = i + 1; j < successfulRuns.length; j += 1) {
-      const actionSim = jaccardScore(successfulRuns[i].output.suggestedAction, successfulRuns[j].output.suggestedAction);
-      const draftSim = jaccardScore(successfulRuns[i].output.draftReply, successfulRuns[j].output.draftReply);
-      pairScores.push(actionSim * 0.6 + draftSim * 0.4);
-    }
-  }
-  const consensusScore = clamp(
-    Math.round((pairScores.reduce((sum, score) => sum + score, 0) / pairScores.length) * 100),
-    0,
-    100
-  );
-
-  let anchor = successfulRuns[0];
-  let bestCentrality = -1;
-  for (const run of successfulRuns) {
-    let similaritySum = 0;
-    let comparisons = 0;
-    for (const other of successfulRuns) {
-      if (run === other) continue;
-      const actionSim = jaccardScore(run.output.suggestedAction, other.output.suggestedAction);
-      const draftSim = jaccardScore(run.output.draftReply, other.output.draftReply);
-      similaritySum += actionSim * 0.6 + draftSim * 0.4;
-      comparisons += 1;
-    }
-    const centrality = comparisons === 0 ? 0 : similaritySum / comparisons;
-    if (centrality > bestCentrality) {
-      bestCentrality = centrality;
-      anchor = run;
-    }
-  }
-
-  const successfulModelNames = formatModelNames(successfulRuns.map((r) => r.spec));
-
-  if (consensusScore >= 58) {
+  if (severity === "hard") {
     return {
-      ...anchor.output,
-      consensusScore,
+      suggestedAction:
+        "Model outputs disagree; verify sender identity and request details via a known trusted channel before responding.",
+      draftReply:
+        "Thank you for your message.\nBefore proceeding, I need to verify the request and sender details through a trusted channel.\nI will follow up once verification is complete.",
+      consensusScore: evaluation.consensusScore,
+      consensusNote: `Low agreement across ${successfulRuns.length} models (${successfulModelNames}); disagreement detected in labels or actions, so the conservative fallback response was used.`,
+      agreement_scores: evaluation.agreement_scores,
+      disagreement_flags: evaluation.disagreement_flags,
+      consensus_strength: evaluation.consensus_strength,
+    };
+  }
+
+  if (evaluation.highAgreement) {
+    return {
+      suggestedAction: evaluation.anchor.output.suggestedAction,
+      draftReply: evaluation.anchor.output.draftReply,
+      consensusScore: evaluation.consensusScore,
       consensusNote: `High agreement across ${successfulRuns.length} models (${successfulModelNames}).`,
+      agreement_scores: evaluation.agreement_scores,
+      disagreement_flags: evaluation.disagreement_flags,
+      consensus_strength: evaluation.consensus_strength,
     };
   }
 
   return {
-    suggestedAction:
-      "Model outputs disagree; verify sender identity and request details via a known trusted channel before responding.",
-    draftReply:
-      "Thank you for your message.\nBefore proceeding, I need to verify the request and sender details through a trusted channel.\nI will follow up once verification is complete.",
-    consensusScore,
-    consensusNote: `Low agreement across ${successfulRuns.length} models (${successfulModelNames}); conservative consensus output applied.`,
+    suggestedAction: evaluation.anchor.output.suggestedAction,
+    draftReply: evaluation.anchor.output.draftReply,
+    consensusScore: evaluation.consensusScore,
+    consensusNote: `Low agreement across ${successfulRuns.length} models (${successfulModelNames}); anchor response kept with disagreement warning.`,
+    agreement_scores: evaluation.agreement_scores,
+    disagreement_flags: evaluation.disagreement_flags,
+    consensus_strength: evaluation.consensus_strength,
   };
 }
 
@@ -1759,6 +1787,39 @@ async function persistInboxMemory(args: {
       consensusScore: alert.consensusScore,
       riskTags: alert.riskTags.slice(0, 12),
       signals: alert.signals.slice(0, 12),
+      uncertaintyScore: alert.uncertainty.score,
+      uncertaintyTypes: alert.uncertainty.type.slice(0, 3),
+      uncertaintySources: {
+        modelConfidence: alert.uncertainty.sources.model_confidence,
+        signalConflict: alert.uncertainty.sources.signal_conflict,
+        missingFields: alert.uncertainty.sources.missing_fields,
+      },
+      deterministicSignals: {
+        topCategoryScores: alert.signalGroups.deterministic.topCategoryScores.slice(0, 4),
+        riskTags: alert.signalGroups.deterministic.riskTags.slice(0, 8),
+        signals: alert.signalGroups.deterministic.signals.slice(0, 8),
+        trustScore: alert.signalGroups.deterministic.trustScore,
+        reputationScore: alert.signalGroups.deterministic.reputationScore,
+        reputationFindings: alert.signalGroups.deterministic.reputationFindings.slice(0, 6),
+        thread: alert.signalGroups.deterministic.thread,
+        extractedCounts: alert.signalGroups.deterministic.extractedCounts,
+        guardrails: {
+          ruleHits: alert.signalGroups.deterministic.guardrails.ruleHits.slice(0, 6),
+          rationale: alert.signalGroups.deterministic.guardrails.rationale,
+        },
+      },
+      learnedSignals: {
+        classifier: alert.signalGroups.learned.classifier,
+        consensus: {
+          score: alert.signalGroups.learned.consensus.score,
+          note: alert.signalGroups.learned.consensus.note,
+          strength: alert.signalGroups.learned.consensus.strength,
+          agreementScores: alert.signalGroups.learned.consensus.agreementScores,
+          disagreementFlags: alert.signalGroups.learned.consensus.disagreementFlags.slice(0, 6),
+        },
+      },
+      explanationSummary: alert.explanation.summary,
+      explanationKeyFactors: alert.explanation.keyFactors.slice(0, 5),
       evidenceRefs: alert.decisionTrace.evidenceRefs,
       policyVersion: args.policyVersion,
       modelVersion: args.modelVersion,
@@ -1813,6 +1874,56 @@ async function persistInboxMemory(args: {
   }
 }
 
+async function persistInboxEvaluationLog(args: {
+  alerts: Alert[];
+  sourceMode: "manual" | "gmail";
+  processingMode: "offline_enforced" | "hybrid_remote_llm";
+  modelVersion: string;
+  classifierVersion: string;
+  policyVersion: string;
+  consensusMode: "single" | "multi";
+  consensusSource: "env_default" | "admin_override";
+  consensusMaxModels: number;
+  consensusModels: string[];
+}): Promise<void> {
+  try {
+    const entries = args.alerts.map((alert) =>
+      buildInboxEvaluationLogEntry({
+        messageId: alert.id,
+        prediction: alert.mailClass,
+        rawPrediction: alert.classifier.predictedClass,
+        confidence: alert.trustedDecision.confidencePct,
+        rawModelConfidence: Math.max(
+          alert.classifier.probabilities.spam,
+          alert.classifier.probabilities.harmful,
+          alert.classifier.probabilities.actionable,
+          alert.classifier.probabilities.informational
+        ),
+        uncertainty: alert.uncertainty.score,
+        uncertaintyPercent: alert.uncertaintyPercent,
+        action: alert.trustedDecision.action,
+        routingAction: alert.decision.final_action,
+        consensusMode: args.consensusMode,
+        consensusSource: args.consensusSource,
+        consensusMaxModels: args.consensusMaxModels,
+        consensusModels: args.consensusModels,
+        consensusStrength: alert.consensus_strength,
+        disagreementFlags: alert.disagreement_flags,
+        sourceMode: args.sourceMode,
+        processingMode: args.processingMode,
+        modelVersion: args.modelVersion,
+        classifierVersion: args.classifierVersion,
+        policyVersion: args.policyVersion,
+        groundTruth: buildGroundTruthPlaceholder(),
+      })
+    );
+
+    await appendInboxEvaluationLogEntries(entries);
+  } catch (error) {
+    console.warn("Inbox evaluation logging skipped:", error);
+  }
+}
+
 export async function POST(req: Request) {
   try {
     const offlineConfig = getOfflineRuntimeConfig();
@@ -1829,6 +1940,10 @@ export async function POST(req: Request) {
       envPolicy: envConsensusPolicy,
       adminSettings,
     });
+    const decisionPolicyConfig = buildEnvDecisionPolicyConfig();
+    const selectedConsensusModels = buildConsensusModelPool(consensusPolicy).map(
+      (spec) => `${spec.provider}:${spec.model}`
+    );
     const modelVersion = inboxModelVersion({
       offlineEnforced,
       consensusPolicy,
@@ -2010,7 +2125,7 @@ export async function POST(req: Request) {
               consensusPolicy,
             });
 
-        const uncertaintyPercent = calibrateUncertainty({
+        const uncertaintyPercentBase = calibrateUncertainty({
           category: email.primaryCategory,
           baseUncertaintyPercent: email.baseUncertaintyPercent,
           evidenceStrength: email.evidenceStrength,
@@ -2019,6 +2134,10 @@ export async function POST(req: Request) {
           consensusScore: llm.consensusScore,
           threadDepth: email.thread.depth,
         });
+        const uncertaintyPercent = applyDisagreementPenalty(
+          uncertaintyPercentBase,
+          llm.disagreement_flags
+        );
         const trustedDecisionRaw = buildTrustedDecision({ email, uncertaintyPercent });
         const actionGuardrail = applyActionGuardrails({
           currentAction: trustedDecisionRaw.action,
@@ -2086,23 +2205,74 @@ export async function POST(req: Request) {
         const decisionSignals = Array.from(
           new Set([...email.signals, ...(classReconcile.adjusted ? [classReconcile.rationale] : [])])
         );
-        const decisionTrace = buildDecisionTrace({
-          primaryCategory: email.primaryCategory,
-          priorityScore: email.priorityScore,
-          trustedAction: trustedDecision.action,
+        const signalGroups = buildSignalGroups({
+          categoryScores: email.categoryScores,
           riskTags: decisionRiskTags,
-          topCategoryScores: email.categoryScores.slice(0, 4).map((entry) => ({
-            category: entry.category,
-            score: entry.score,
-          })),
+          signals: decisionSignals,
           trustScore: email.trustScore,
           reputationScore: email.reputation.score,
-          threadDepth: email.thread.depth,
-          threadRiskDensity: email.thread.riskDensity,
-          consensusScore: finalAssist.consensusScore,
-          policyVersion: INBOX_POLICY_VERSION,
-          modelVersion,
+          reputationFindings: email.reputation.findings,
+          thread: email.thread,
+          extracted: email.extracted,
+          guardrails: {
+            ruleHits: policyRuleHits,
+            rationale: policyRationale,
+          },
+          classifier: email.classifier,
+          consensus: {
+            score: finalAssist.consensusScore,
+            note: finalAssist.consensusNote,
+            strength: finalAssist.consensus_strength,
+            agreementScores: finalAssist.agreement_scores,
+            disagreementFlags: finalAssist.disagreement_flags,
+          },
         });
+        const uncertainty = buildStructuredUncertainty({
+          uncertaintyPercent,
+          categoryScores: email.categoryScores,
+          classifier: email.classifier,
+          finalMailClass: classReconcile.mailClass,
+          senderEmail: email.senderEmail,
+          senderDomain: email.senderDomain,
+          rawEmail: email.raw,
+          extracted: email.extracted,
+          consensusStrength: finalAssist.consensus_strength,
+          disagreementFlags: finalAssist.disagreement_flags,
+        });
+        const explanation = buildExplanation({
+          primaryCategory: email.primaryCategory,
+          priorityScore: email.priorityScore,
+          trustedDecision,
+          signalGroups,
+          uncertainty,
+        });
+        const decision = routeInboxDecision({
+          confidencePct: trustedDecision.confidencePct,
+          uncertaintyPercent,
+          riskScore: trustedDecision.riskScore,
+          disagreementFlags: finalAssist.disagreement_flags,
+          config: decisionPolicyConfig,
+        });
+        const decisionTrace = {
+          ...buildDecisionTrace({
+            primaryCategory: email.primaryCategory,
+            priorityScore: email.priorityScore,
+            trustedAction: trustedDecision.action,
+            riskTags: decisionRiskTags,
+            topCategoryScores: email.categoryScores.slice(0, 4).map((entry) => ({
+              category: entry.category,
+              score: entry.score,
+            })),
+            trustScore: email.trustScore,
+            reputationScore: email.reputation.score,
+            threadDepth: email.thread.depth,
+            threadRiskDensity: email.thread.riskDensity,
+            consensusScore: finalAssist.consensusScore,
+            policyVersion: INBOX_POLICY_VERSION,
+            modelVersion,
+          }),
+          explanation: explanation.summary,
+        };
 
         const memoryRef = buildMemoryRef({
           raw: email.raw,
@@ -2125,10 +2295,17 @@ export async function POST(req: Request) {
           categoryScores: email.categoryScores,
           riskTags: decisionRiskTags,
           signals: decisionSignals,
+          signalGroups,
+          uncertainty,
+          explanation,
+          decision,
           suggestedAction: finalAssist.suggestedAction,
           draftReply: finalAssist.draftReply,
           consensusScore: finalAssist.consensusScore,
           consensusNote: finalAssist.consensusNote,
+          agreement_scores: finalAssist.agreement_scores,
+          disagreement_flags: finalAssist.disagreement_flags,
+          consensus_strength: finalAssist.consensus_strength,
           trustedDecision,
           classifier: email.classifier,
           guardrails: {
@@ -2218,23 +2395,80 @@ export async function POST(req: Request) {
       const decisionSignals = Array.from(
         new Set([...email.signals, ...(classReconcile.adjusted ? [classReconcile.rationale] : [])])
       );
-      const decisionTrace = buildDecisionTrace({
-        primaryCategory: email.primaryCategory,
-        priorityScore: email.priorityScore,
-        trustedAction: trustedDecision.action,
+      const signalGroups = buildSignalGroups({
+        categoryScores: email.categoryScores,
         riskTags: decisionRiskTags,
-        topCategoryScores: email.categoryScores.slice(0, 4).map((entry) => ({
-          category: entry.category,
-          score: entry.score,
-        })),
+        signals: decisionSignals,
         trustScore: email.trustScore,
         reputationScore: email.reputation.score,
-        threadDepth: email.thread.depth,
-        threadRiskDensity: email.thread.riskDensity,
-        consensusScore: 50,
-        policyVersion: INBOX_POLICY_VERSION,
-        modelVersion,
+        reputationFindings: email.reputation.findings,
+        thread: email.thread,
+        extracted: email.extracted,
+        guardrails: {
+          ruleHits: policyRuleHits,
+          rationale: [
+            email.priorityGuardrail.rationale,
+            actionGuardrail.note,
+            classReconcile.rationale,
+          ]
+            .filter(Boolean)
+            .join(" "),
+        },
+        classifier: email.classifier,
+        consensus: {
+          score: 50,
+          note: "Not passed through multi-model draft analysis due to TOP_N budget.",
+          strength: 0.5,
+          agreementScores: defaultAgreementScores(),
+          disagreementFlags: ["not_analyzed_budget_capped"],
+        },
       });
+      const uncertainty = buildStructuredUncertainty({
+        uncertaintyPercent,
+        categoryScores: email.categoryScores,
+        classifier: email.classifier,
+        finalMailClass: classReconcile.mailClass,
+        senderEmail: email.senderEmail,
+        senderDomain: email.senderDomain,
+        rawEmail: email.raw,
+        extracted: email.extracted,
+        consensusStrength: 0.5,
+        disagreementFlags: ["not_analyzed_budget_capped"],
+      });
+      const explanation = buildExplanation({
+        primaryCategory: email.primaryCategory,
+        priorityScore: email.priorityScore,
+        trustedDecision,
+        signalGroups,
+        uncertainty,
+      });
+      const decision = routeInboxDecision({
+        confidencePct: trustedDecision.confidencePct,
+        uncertaintyPercent,
+        riskScore: trustedDecision.riskScore,
+        disagreementFlags: ["not_analyzed_budget_capped"],
+        config: decisionPolicyConfig,
+      });
+      const decisionTrace = {
+        ...buildDecisionTrace({
+          primaryCategory: email.primaryCategory,
+          priorityScore: email.priorityScore,
+          trustedAction: trustedDecision.action,
+          riskTags: decisionRiskTags,
+          topCategoryScores: email.categoryScores.slice(0, 4).map((entry) => ({
+            category: entry.category,
+            score: entry.score,
+          })),
+          trustScore: email.trustScore,
+          reputationScore: email.reputation.score,
+          threadDepth: email.thread.depth,
+          threadRiskDensity: email.thread.riskDensity,
+          consensusScore: 50,
+          policyVersion: INBOX_POLICY_VERSION,
+          modelVersion,
+        }),
+        explanation: explanation.summary,
+      };
       const memoryRef = buildMemoryRef({
         raw: email.raw,
         subject: email.subject,
@@ -2256,10 +2490,17 @@ export async function POST(req: Request) {
         categoryScores: email.categoryScores,
         riskTags: decisionRiskTags,
         signals: decisionSignals,
+        signalGroups,
+        uncertainty,
+        explanation,
+        decision,
         suggestedAction: "No action suggested (not analyzed).",
         draftReply: "No reply needed.",
         consensusScore: 50,
         consensusNote: "Not passed through multi-model draft analysis due to TOP_N budget.",
+        agreement_scores: defaultAgreementScores(),
+        disagreement_flags: ["not_analyzed_budget_capped"],
+        consensus_strength: 0.5,
         trustedDecision,
         classifier: email.classifier,
         guardrails: {
@@ -2303,9 +2544,13 @@ export async function POST(req: Request) {
       (sum, alert) => sum + (alert.classifier.memorySampleCount > 0 ? 1 : 0),
       0
     );
+    const processingMode: "offline_enforced" | "hybrid_remote_llm" = offlineEnforced
+      ? "offline_enforced"
+      : "hybrid_remote_llm";
+    const consensusMode: "single" | "multi" = consensusPolicy.enabled ? "multi" : "single";
     const meta = {
       mode: parsed.mode,
-      processingMode: offlineEnforced ? "offline_enforced" : "hybrid_remote_llm",
+      processingMode,
       offlineState: offlineConfig.state,
       scanned: scored.length,
       highCount: alerts.filter((a) => a.priority === "high").length,
@@ -2316,7 +2561,7 @@ export async function POST(req: Request) {
       classifierVersion: alerts[0]?.classifier.modelVersion || "inbox-hybrid-classifier-v1",
       guardrailVersion: INBOX_POLICY_VERSION,
       learningSamplesUsed,
-      consensusMode: consensusPolicy.enabled ? "multi" : "single",
+      consensusMode,
       consensusMaxModels: consensusPolicy.enabled ? consensusPolicy.maxModels : 1,
       consensusSource: consensusPolicy.source,
     };
@@ -2325,6 +2570,19 @@ export async function POST(req: Request) {
       alerts,
       modelVersion,
       policyVersion: INBOX_POLICY_VERSION,
+    });
+
+    await persistInboxEvaluationLog({
+      alerts,
+      sourceMode: parsed.mode,
+      processingMode,
+      modelVersion,
+      classifierVersion: meta.classifierVersion,
+      policyVersion: INBOX_POLICY_VERSION,
+      consensusMode: meta.consensusMode,
+      consensusSource: meta.consensusSource,
+      consensusMaxModels: meta.consensusMaxModels,
+      consensusModels: selectedConsensusModels,
     });
 
     return Response.json(InboxResponseSchema.parse({ ok: true, alerts, meta }));

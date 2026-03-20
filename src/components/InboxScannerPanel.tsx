@@ -1,7 +1,25 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { useEffect, useMemo, useState } from "react";
+
+import type {
+  InboxExplanation,
+  InboxSignalGroups,
+  InboxUncertainty,
+} from "@/lib/inbox/compatibility";
+import type { InboxDecision } from "@/lib/inbox/decision";
+
+import PanelFrame from "@/components/PanelFrame";
+import {
+  AegisButton,
+  EmptyState,
+  InlineError,
+  MetricCard,
+  ProcessingBadge,
+  StatusBadge,
+  buttonClassName,
+} from "@/components/ui/AegisPrimitives";
 import { EscalateToHelpdeskButton } from "@/components/tickets/EscalateToHelpdeskButton";
 import { TicketLinkForEmail } from "@/components/tickets/TicketLinkForEmail";
 
@@ -31,6 +49,7 @@ type FeedbackOutcome =
   | "harmful_false_positive"
   | "actionable_correct"
   | "informational_correct";
+type PrimaryFilter = "all" | "high" | "pending" | "reviewed";
 
 const FILTER_CATEGORIES = [
   "scam_bec",
@@ -47,7 +66,6 @@ const FILTER_CATEGORIES = [
 ] as const;
 
 type VisibleCategory = (typeof FILTER_CATEGORIES)[number];
-type Filter = "all" | "high" | "medium" | "low" | VisibleCategory;
 
 type CategoryScore = {
   category: Category;
@@ -83,10 +101,22 @@ type InboxAlert = {
   categoryScores: CategoryScore[];
   riskTags: string[];
   signals: string[];
+  signalGroups?: InboxSignalGroups;
+  uncertainty?: InboxUncertainty;
+  explanation?: InboxExplanation;
+  decision?: InboxDecision;
   suggestedAction: string;
   draftReply: string;
   consensusScore: number;
   consensusNote: string;
+  agreement_scores?: {
+    label_agreement: number;
+    action_agreement: number;
+    confidence_variance: number;
+    entity_overlap: number;
+  };
+  disagreement_flags?: string[];
+  consensus_strength?: number;
   trustedDecision?: {
     action: "allow" | "escalate" | "quarantine" | "block";
     confidencePct: number;
@@ -178,6 +208,15 @@ type InboxSettingsResponse = {
   settings: InboxConsensusSettings;
 };
 
+type QuotedBlock = {
+  kind: "quoted" | "body";
+  text: string;
+};
+
+function cn(...values: Array<string | false | null | undefined>) {
+  return values.filter(Boolean).join(" ");
+}
+
 function categoryLabel(category: Category): string {
   const labels: Record<Category, string> = {
     scam_bec: "Scam BEC",
@@ -198,10 +237,18 @@ function categoryLabel(category: Category): string {
   return labels[category];
 }
 
+function formatPercent(value: number): string {
+  return `${Math.round(value * 100)}%`;
+}
+
+function humanizeFlag(value: string): string {
+  return value.replace(/_/g, " ");
+}
+
 function splitManualEmails(input: string): string[] {
   return input
     .split(/\n-{3,}\n/g)
-    .map((v) => v.trim())
+    .map((value) => value.trim())
     .filter(Boolean);
 }
 
@@ -210,7 +257,7 @@ function parseDomains(input: string): string[] {
     new Set(
       input
         .split(",")
-        .map((v) => v.trim().toLowerCase())
+        .map((value) => value.trim().toLowerCase())
         .filter(Boolean)
     )
   );
@@ -271,17 +318,108 @@ function safeFeedbackLabel(alert: InboxAlert): FeedbackOutcome {
   return "informational_correct";
 }
 
-function chipClass(active: boolean): string {
-  return `text-xs px-3 py-1.5 rounded-full border transition-all shrink-0 ${
-    active
-      ? "bg-[rgba(71,215,255,0.28)] text-slate-100 border-cyan-300/70 shadow-[0_8px_18px_rgba(71,215,255,0.22)]"
-      : "bg-[rgba(14,24,39,0.66)] text-slate-300 border-slate-400/30 hover:bg-[rgba(71,215,255,0.16)] hover:text-slate-100"
-  }`;
-}
-
 function hasCategory(alert: InboxAlert, category: Category): boolean {
   if (alert.primaryCategory === category) return true;
   return alert.categoryScores.some((entry) => entry.category === category && entry.score >= 35);
+}
+
+function priorityTone(priority: Priority): "risk" | "caution" | "clear" {
+  if (priority === "high") return "risk";
+  if (priority === "medium") return "caution";
+  return "clear";
+}
+
+function actionTone(action?: "allow" | "escalate" | "quarantine" | "block"): "risk" | "caution" | "clear" | "info" {
+  if (action === "block" || action === "quarantine") return "risk";
+  if (action === "escalate") return "caution";
+  if (action === "allow") return "clear";
+  return "info";
+}
+
+function mailClassTone(mailClass: InboxAlert["mailClass"]): "risk" | "caution" | "clear" | "info" | "muted" {
+  if (mailClass === "harmful" || mailClass === "spam") return "risk";
+  if (mailClass === "actionable") return "caution";
+  if (mailClass === "informational") return "info";
+  return "muted";
+}
+
+function buildBodyBlocks(rawEmail: string): QuotedBlock[] {
+  return rawEmail
+    .split(/\n{2,}/)
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .map((text) => ({
+      kind: /^(>|on .+ wrote:|forwarded message|from:)/im.test(text) ? "quoted" : "body",
+      text,
+    }));
+}
+
+function SectionLabel({ children }: { children: string }) {
+  return (
+    <div className="text-[11px] font-mono uppercase tracking-[0.2em] text-foreground/40">
+      {children}
+    </div>
+  );
+}
+
+function MetaItem({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <div className="font-mono text-xs uppercase tracking-[0.08em] text-aegis-dim">
+        {label}
+      </div>
+      <div className="truncate text-sm text-aegis-muted">{value}</div>
+    </div>
+  );
+}
+
+function PrimaryFilterButton({
+  active,
+  label,
+  count,
+  onClick,
+}: {
+  active: boolean;
+  label: string;
+  count: number;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn("aegis-chip transition-all duration-150 hover:-translate-y-0.5 hover:text-foreground", active && "aegis-chip-active")}
+    >
+      {label} · {count}
+    </button>
+  );
+}
+
+function CategoryFilterButton({
+  active,
+  label,
+  count,
+  onClick,
+}: {
+  active: boolean;
+  label: string;
+  count: number;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "rounded-full border px-3 py-1.5 font-mono text-xs uppercase tracking-[0.12em] transition-all duration-150 hover:-translate-y-0.5",
+        active
+          ? "border-foreground bg-foreground text-background"
+          : "border-foreground/10 bg-background/60 text-foreground/45 hover:border-foreground/20 hover:text-foreground/70"
+      )}
+    >
+      {label} · {count}
+    </button>
+  );
 }
 
 export default function InboxScannerPanel({
@@ -304,7 +442,9 @@ export default function InboxScannerPanel({
 
   const [alerts, setAlerts] = useState<InboxAlert[]>([]);
   const [meta, setMeta] = useState<InboxMeta | null>(null);
-  const [activeFilter, setActiveFilter] = useState<Filter>("all");
+  const [activeFilter, setActiveFilter] = useState<PrimaryFilter>("all");
+  const [focusCategory, setFocusCategory] = useState<VisibleCategory | "all">("all");
+  const [searchQuery, setSearchQuery] = useState("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [isScanning, setIsScanning] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -318,6 +458,11 @@ export default function InboxScannerPanel({
   const [consensusSource, setConsensusSource] = useState<"env_default" | "admin_override">("env_default");
   const [feedbackSavingById, setFeedbackSavingById] = useState<Record<string, boolean>>({});
   const [feedbackStatusById, setFeedbackStatusById] = useState<Record<string, string>>({});
+  const [reviewedIds, setReviewedIds] = useState<Record<string, true>>({});
+  const [archivedIds, setArchivedIds] = useState<Record<string, true>>({});
+  const [manualReviewIds, setManualReviewIds] = useState<Record<string, true>>({});
+  const [escalationNotes, setEscalationNotes] = useState<Record<string, string>>({});
+  const [isReady, setIsReady] = useState(false);
 
   async function refreshGmailStatus() {
     setCheckingStatus(true);
@@ -399,6 +544,10 @@ export default function InboxScannerPanel({
     void refreshInboxSettings();
   }, []);
 
+  useEffect(() => {
+    setIsReady(true);
+  }, []);
+
   async function scanInbox() {
     setError(null);
 
@@ -444,6 +593,12 @@ export default function InboxScannerPanel({
       setMeta(data.meta);
       setExpandedId(data.alerts[0]?.id || null);
       setActiveFilter("all");
+      setFocusCategory("all");
+      setSearchQuery("");
+      setReviewedIds({});
+      setArchivedIds({});
+      setManualReviewIds({});
+      setEscalationNotes({});
       setFeedbackSavingById({});
       setFeedbackStatusById({});
     } catch (err) {
@@ -516,513 +671,886 @@ export default function InboxScannerPanel({
   }
 
   const counts = useMemo(() => {
+    const visibleAlerts = alerts.filter((alert) => !archivedIds[alert.id]);
     return {
-      all: alerts.length,
-      high: alerts.filter((a) => a.priority === "high").length,
-      medium: alerts.filter((a) => a.priority === "medium").length,
-      low: alerts.filter((a) => a.priority === "low").length,
-      scam_bec: alerts.filter((a) => hasCategory(a, "scam_bec")).length,
-      scam_invoice_fraud: alerts.filter((a) => hasCategory(a, "scam_invoice_fraud")).length,
-      scam_credential_phishing: alerts.filter((a) => hasCategory(a, "scam_credential_phishing")).length,
-      scam_malware_attachment: alerts.filter((a) => hasCategory(a, "scam_malware_attachment")).length,
-      scam_impersonation: alerts.filter((a) => hasCategory(a, "scam_impersonation")).length,
-      security_phishing: alerts.filter((a) => hasCategory(a, "security_phishing")).length,
-      finance_payment: alerts.filter((a) => hasCategory(a, "finance_payment")).length,
-      legal_contract: alerts.filter((a) => hasCategory(a, "legal_contract")).length,
-      deadline_scheduling: alerts.filter((a) => hasCategory(a, "deadline_scheduling")).length,
-      executive_escalation: alerts.filter((a) => hasCategory(a, "executive_escalation")).length,
-      newsletter: alerts.filter((a) => hasCategory(a, "newsletter")).length,
+      all: visibleAlerts.length,
+      high: visibleAlerts.filter((alert) => alert.priority === "high").length,
+      pending: visibleAlerts.filter((alert) => !reviewedIds[alert.id]).length,
+      reviewed: visibleAlerts.filter((alert) => reviewedIds[alert.id]).length,
+      scam_bec: visibleAlerts.filter((alert) => hasCategory(alert, "scam_bec")).length,
+      scam_invoice_fraud: visibleAlerts.filter((alert) => hasCategory(alert, "scam_invoice_fraud")).length,
+      scam_credential_phishing: visibleAlerts.filter((alert) => hasCategory(alert, "scam_credential_phishing")).length,
+      scam_malware_attachment: visibleAlerts.filter((alert) => hasCategory(alert, "scam_malware_attachment")).length,
+      scam_impersonation: visibleAlerts.filter((alert) => hasCategory(alert, "scam_impersonation")).length,
+      security_phishing: visibleAlerts.filter((alert) => hasCategory(alert, "security_phishing")).length,
+      finance_payment: visibleAlerts.filter((alert) => hasCategory(alert, "finance_payment")).length,
+      legal_contract: visibleAlerts.filter((alert) => hasCategory(alert, "legal_contract")).length,
+      deadline_scheduling: visibleAlerts.filter((alert) => hasCategory(alert, "deadline_scheduling")).length,
+      executive_escalation: visibleAlerts.filter((alert) => hasCategory(alert, "executive_escalation")).length,
+      newsletter: visibleAlerts.filter((alert) => hasCategory(alert, "newsletter")).length,
     };
-  }, [alerts]);
+  }, [alerts, archivedIds, reviewedIds]);
 
   const filtered = useMemo(() => {
-    if (activeFilter === "all") return alerts;
-    if (activeFilter === "high") return alerts.filter((a) => a.priority === "high");
-    if (activeFilter === "medium") return alerts.filter((a) => a.priority === "medium");
-    if (activeFilter === "low") return alerts.filter((a) => a.priority === "low");
-    return alerts.filter((a) => hasCategory(a, activeFilter));
-  }, [alerts, activeFilter]);
+    let next = alerts.filter((alert) => !archivedIds[alert.id]);
 
-  const selected = alerts.find((a) => a.id === expandedId) || null;
-  const summary = meta
-    ? `Mode: ${meta.mode} | Processing: ${meta.processingMode || "hybrid_remote_llm"} | Offline: ${meta.offlineState || "disabled"} | Policy: ${meta.policyVersion || "n/a"} | Guardrails: ${meta.guardrailVersion || "n/a"} | Model: ${meta.modelVersion || "n/a"} | Classifier: ${meta.classifierVersion || "n/a"} | Consensus: ${meta.consensusMode || "single"}${meta.consensusMode === "multi" ? ` (${meta.consensusMaxModels || 1})` : ""} [${meta.consensusSource || "env_default"}] | Learning Signals: ${meta.learningSamplesUsed ?? 0} | Scanned: ${meta.scanned} | High: ${meta.highCount} | Medium: ${meta.mediumCount} | Low: ${meta.lowCount}`
-    : "No scans yet.";
+    if (activeFilter === "high") next = next.filter((alert) => alert.priority === "high");
+    if (activeFilter === "pending") next = next.filter((alert) => !reviewedIds[alert.id]);
+    if (activeFilter === "reviewed") next = next.filter((alert) => Boolean(reviewedIds[alert.id]));
+    if (focusCategory !== "all") next = next.filter((alert) => hasCategory(alert, focusCategory));
+
+    const normalizedQuery = searchQuery.trim().toLowerCase();
+    if (!normalizedQuery) return next;
+
+    return next.filter((alert) =>
+      [alert.subject, alert.senderEmail, alert.from, alert.senderDomain, alert.rawEmail]
+        .filter(Boolean)
+        .some((value) => value.toLowerCase().includes(normalizedQuery))
+    );
+  }, [activeFilter, alerts, archivedIds, focusCategory, reviewedIds, searchQuery]);
+
+  const selected = alerts.find((alert) => alert.id === expandedId) || null;
+  const selectedNote = selected ? escalationNotes[selected.id] || "" : "";
+  const selectedBlocks = selected ? buildBodyBlocks(selected.rawEmail) : [];
+  const selectedSignals = selected?.signalGroups?.deterministic.signals || selected?.signals || [];
+  const selectedEvidenceItems = selected
+    ? [
+        {
+          label: "Deadlines",
+          count: selected.extracted.deadlines.length,
+          detail: selected.extracted.deadlines[0] || "No due dates extracted.",
+        },
+        {
+          label: "Money Mentions",
+          count: selected.extracted.moneyMentions.length,
+          detail: selected.extracted.moneyMentions[0] || "No payment language extracted.",
+        },
+        {
+          label: "URLs",
+          count: selected.extracted.urls.length,
+          detail: selected.extracted.urls[0] || "No links extracted.",
+        },
+        {
+          label: "Attachments",
+          count: selected.extracted.attachments.length,
+          detail: selected.extracted.attachments[0] || "No attachment names extracted.",
+        },
+      ]
+    : [];
+
+  const metaSummary = meta
+    ? [
+        `Mode ${meta.mode}`,
+        `Processing ${meta.processingMode || "hybrid_remote_llm"}`,
+        `Offline ${meta.offlineState || "disabled"}`,
+        `Policy ${meta.policyVersion || "n/a"}`,
+        `Guardrails ${meta.guardrailVersion || "n/a"}`,
+        `Consensus ${meta.consensusMode || "single"}${
+          meta.consensusMode === "multi" ? ` (${meta.consensusMaxModels || 1})` : ""
+        }`,
+      ]
+    : [];
+
+  function toggleReviewed(id: string) {
+    setReviewedIds((prev) => {
+      if (prev[id]) {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      }
+      return { ...prev, [id]: true };
+    });
+  }
+
+  function archiveAlert(id: string) {
+    setArchivedIds((prev) => ({ ...prev, [id]: true }));
+    if (expandedId === id) {
+      const nextVisible = filtered.find((alert) => alert.id !== id);
+      setExpandedId(nextVisible?.id || null);
+    }
+  }
+
+  function flagManualReview(id: string) {
+    setManualReviewIds((prev) => ({ ...prev, [id]: true }));
+    setReviewedIds((prev) => ({ ...prev, [id]: true }));
+  }
+
+  function escalationCommandWithNote(alert: InboxAlert) {
+    const note = (escalationNotes[alert.id] || "").trim();
+    if (!note) return suggestedCommand(alert);
+    return `${suggestedCommand(alert)}\n\nOperator note:\n${note}`;
+  }
 
   return (
-    <div className="h-full min-h-0 flex flex-col gap-3 mobile-safe-pad">
-      <div className="surface-card p-3">
-        <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-          <div className="font-semibold text-slate-100">Inbox Scanner</div>
-          <button
-            type="button"
-            onClick={scanInbox}
-            disabled={isScanning || checkingStatus}
-            className="primary-cta px-3 py-2 rounded-lg font-semibold min-h-[40px] w-full sm:w-auto disabled:opacity-50"
-          >
-            {isScanning ? "Scanning..." : "Scan Inbox"}
-          </button>
-        </div>
+    <div
+      className={cn(
+        "flex min-h-0 min-w-0 flex-col gap-4 transition-all duration-300",
+        isReady ? "translate-y-0 opacity-100" : "translate-y-2 opacity-0"
+      )}
+    >
+      <section
+        id="scanner-controls"
+        className="min-w-0 transition-all duration-300"
+        style={{ transitionDelay: "0ms" }}
+      >
+        <PanelFrame
+          title="Scan Control"
+          subtitle="Choose source, confirm consensus behavior, and run a fresh queue scan."
+          status={isScanning ? <ProcessingBadge label="Scanning" /> : <StatusBadge tone="muted">Ready</StatusBadge>}
+          actionButton={
+            <AegisButton onClick={() => void scanInbox()} disabled={isScanning || checkingStatus}>
+              {isScanning ? "Scanning" : "Scan Inbox"}
+            </AegisButton>
+          }
+        >
+          <div className="grid gap-6 xl:grid-cols-[minmax(0,1.15fr)_minmax(320px,0.85fr)]">
+            <div className="grid min-w-0 gap-4">
+              <div className="flex flex-wrap gap-2">
+                <AegisButton
+                  variant={mode === "manual" ? "primary" : "secondary"}
+                  onClick={() => setMode("manual")}
+                  className={cn("h-11 min-w-28 justify-center", mode === "manual" && "border border-foreground")}
+                >
+                  Manual
+                </AegisButton>
+                <AegisButton
+                  variant={mode === "gmail" ? "primary" : "secondary"}
+                  onClick={() => setMode("gmail")}
+                  disabled={offlinePublicEnforced}
+                  title={offlinePublicEnforced ? "Gmail mode is disabled while offline mode is enforced." : undefined}
+                  className={cn("h-11 min-w-28 justify-center", mode === "gmail" && "border border-foreground")}
+                >
+                  Gmail
+                </AegisButton>
+              </div>
 
-        <div className="flex gap-2 mb-3 flex-wrap">
-          <button className={chipClass(mode === "manual")} onClick={() => setMode("manual")}>
-            Manual
-          </button>
-          <button
-            className={chipClass(mode === "gmail")}
-            onClick={() => setMode("gmail")}
-            disabled={offlinePublicEnforced}
-            title={offlinePublicEnforced ? "Gmail mode disabled in enforced offline mode." : "Use Gmail mode"}
-          >
-            Gmail
-          </button>
-        </div>
+              {mode === "manual" ? (
+                <div className="grid gap-2">
+                  <SectionLabel>Manual Input</SectionLabel>
+                  <textarea
+                    className="aegis-input aegis-textarea aegis-textarea-data min-h-56"
+                    value={rawInbox}
+                    onChange={(event) => setRawInbox(event.target.value)}
+                    placeholder="Paste one or more raw emails. Separate messages with --- on its own line."
+                  />
+                </div>
+              ) : (
+                <div className="grid gap-2">
+                  <SectionLabel>Gmail Query</SectionLabel>
+                  <div className="grid min-h-56 content-start gap-4">
+                    <input
+                      aria-label="Gmail Query"
+                      className="aegis-input min-h-14"
+                      value={gmailQuery}
+                      onChange={(event) => setGmailQuery(event.target.value)}
+                      placeholder="in:inbox newer_than:7d"
+                    />
+                    <label className="grid max-w-56 gap-2">
+                      <SectionLabel>Max Items</SectionLabel>
+                      <input
+                        aria-label="Max Items"
+                        className="aegis-input min-h-14"
+                        type="number"
+                        min={1}
+                        max={50}
+                        value={gmailMaxResults}
+                        onChange={(event) => {
+                          const nextValue = Number(event.target.value) || 20;
+                          setGmailMaxResults(Math.max(1, Math.min(50, nextValue)));
+                        }}
+                      />
+                    </label>
+                  </div>
+                </div>
+              )}
 
-        <div className="surface-subcard p-3 mb-3 text-sm text-slate-200">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="text-xs">
-              Consensus mode:{" "}
-              <span className="font-semibold">
-                {consensusEnabled ? `Multi-model (${consensusMaxModels})` : "Single-model (cost saver)"}
-              </span>{" "}
-              <span className="opacity-80">[{consensusSource === "admin_override" ? "admin override" : "env default"}]</span>
-            </div>
-            <button
-              type="button"
-              onClick={() => void refreshInboxSettings()}
-              className="px-3 py-1.5 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[34px] text-xs"
-              disabled={settingsLoading || settingsSaving}
-            >
-              {settingsLoading ? "Loading..." : "Refresh Settings"}
-            </button>
-          </div>
-
-          {settingsLoading ? (
-            <div className="mt-2 text-xs opacity-80">Loading consensus settings...</div>
-          ) : canEditConsensus ? (
-            <div className="mt-3 grid grid-cols-1 md:grid-cols-[1fr_auto_auto] gap-2 items-center">
-              <label className="flex items-center gap-2 text-xs">
+              <label className="grid gap-2">
+                <SectionLabel>Organization Domains</SectionLabel>
                 <input
-                  type="checkbox"
-                  checked={consensusEnabled}
-                  onChange={(e) => setConsensusEnabled(e.target.checked)}
-                  disabled={settingsSaving || settingsLoading || offlinePublicEnforced}
+                  className="aegis-input min-h-14"
+                  value={orgDomainsInput}
+                  onChange={(event) => setOrgDomainsInput(event.target.value)}
+                  placeholder="yourcompany.com, parentorg.com"
                 />
-                Enable multi-model consensus
               </label>
 
-              <input
-                className="field-input text-xs w-full md:w-[140px]"
-                type="number"
-                min={1}
-                max={8}
-                value={consensusMaxModels}
-                onChange={(e) => {
-                  const n = Number(e.target.value) || 1;
-                  setConsensusMaxModels(Math.max(1, Math.min(8, n)));
-                }}
-                disabled={!consensusEnabled || settingsSaving || settingsLoading || offlinePublicEnforced}
-                title="Maximum models to run when consensus is enabled"
-              />
+              {error ? <InlineError message={error} /> : null}
 
-              <button
-                type="button"
-                onClick={() => void saveInboxSettings()}
-                disabled={settingsSaving || settingsLoading || offlinePublicEnforced}
-                className="px-3 py-2 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[36px] text-xs disabled:opacity-60"
-              >
-                {settingsSaving ? "Saving..." : "Save"}
-              </button>
-            </div>
-          ) : (
-            <div className="mt-2 text-xs opacity-80">
-              Admin login is required to change consensus settings.
-            </div>
-          )}
-
-          {settingsError ? <div className="text-xs text-rose-300 mt-2">{settingsError}</div> : null}
-        </div>
-
-        {offlinePublicEnforced ? (
-          <div className="text-xs text-amber-200 mb-3">
-            Enforced offline mode is active. Gmail fetch is disabled; use Manual mode.
-          </div>
-        ) : null}
-
-        <div className="surface-subcard p-3 mb-3 text-sm text-slate-200">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="break-all">
-              Gmail: {gmailStatus.connected ? "Connected" : "Not connected"}
-              {gmailStatus.email ? ` (${gmailStatus.email})` : ""}
-            </div>
-            <div className="flex gap-2 flex-wrap">
-              {!gmailStatus.connected ? (
-                <button
-                  type="button"
-                  onClick={() => {
-                    window.location.href = "/api/inbox/gmail/connect";
-                  }}
-                  className="px-3 py-1.5 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[38px]"
-                >
-                  Connect Gmail
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => void disconnectGmail()}
-                  className="px-3 py-1.5 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[38px]"
-                >
-                  Disconnect
-                </button>
-              )}
-              <button
-                type="button"
-                onClick={() => void refreshGmailStatus()}
-                className="px-3 py-1.5 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[38px]"
-              >
-                Refresh
-              </button>
-            </div>
-          </div>
-        </div>
-
-        {mode === "manual" ? (
-          <textarea
-            className="field-input h-48 sm:h-52 text-sm mb-3 resize-none"
-            value={rawInbox}
-            onChange={(e) => setRawInbox(e.target.value)}
-            placeholder="Paste emails separated by ---"
-          />
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mb-3">
-            <input
-              className="field-input text-sm"
-              value={gmailQuery}
-              onChange={(e) => setGmailQuery(e.target.value)}
-              placeholder="Gmail query, e.g. in:inbox newer_than:30d"
-            />
-            <input
-              className="field-input text-sm"
-              type="number"
-              min={1}
-              max={50}
-              value={gmailMaxResults}
-              onChange={(e) => {
-                const n = Number(e.target.value) || 20;
-                setGmailMaxResults(Math.max(1, Math.min(50, n)));
-              }}
-              placeholder="Max emails (1-50)"
-            />
-          </div>
-        )}
-
-        <input
-          className="field-input text-sm"
-          value={orgDomainsInput}
-          onChange={(e) => setOrgDomainsInput(e.target.value)}
-          placeholder="Org domains (optional), e.g. yourcompany.com"
-        />
-        {error ? <div className="text-xs text-rose-300 mt-2">{error}</div> : null}
-      </div>
-
-      <div className="surface-card p-3">
-        <div className="text-xs sm:text-sm text-slate-300 mb-2 break-words">{summary}</div>
-        <div className="flex gap-2 overflow-x-auto pb-1 mobile-chip-scroll">
-          <button className={chipClass(activeFilter === "all")} onClick={() => setActiveFilter("all")}>
-            All ({counts.all})
-          </button>
-          <button className={chipClass(activeFilter === "high")} onClick={() => setActiveFilter("high")}>
-            High ({counts.high})
-          </button>
-          <button className={chipClass(activeFilter === "medium")} onClick={() => setActiveFilter("medium")}>
-            Medium ({counts.medium})
-          </button>
-          <button className={chipClass(activeFilter === "low")} onClick={() => setActiveFilter("low")}>
-            Low ({counts.low})
-          </button>
-          {FILTER_CATEGORIES.map((category) => (
-            <button
-              key={category}
-              className={chipClass(activeFilter === category)}
-              onClick={() => setActiveFilter(category)}
-            >
-              {categoryLabel(category)} ({counts[category]})
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <div className="min-h-0 flex-1 grid grid-cols-1 lg:grid-cols-2 gap-3">
-        <div className="min-h-0 overflow-auto surface-card max-h-none lg:max-h-96">
-          {filtered.length === 0 ? (
-            <div className="p-4 text-sm text-slate-400">No emails in this category.</div>
-          ) : (
-            filtered.map((alert) => (
-              <button
-                key={alert.id}
-                onClick={() => setExpandedId(alert.id)}
-                className={`w-full text-left p-3 sm:p-4 border-b border-slate-400/20 hover:bg-cyan-400/10 ${
-                  expandedId === alert.id ? "bg-cyan-400/15" : ""
-                }`}
-              >
-                <div className="text-sm font-semibold text-slate-100 truncate">{alert.subject}</div>
-                <div className="text-xs text-slate-400 truncate">{alert.senderEmail || alert.from}</div>
-                <div className="mt-2 flex flex-wrap gap-2 text-xs">
-                  <span className="px-2 py-1 rounded-full border border-cyan-300/45 text-slate-200 bg-cyan-400/10">
-                    {categoryLabel(alert.primaryCategory)}
-                  </span>
-                  {alert.mailClass ? (
-                    <span className="px-2 py-1 rounded-full border border-cyan-300/45 text-slate-200 bg-cyan-400/10 uppercase">
-                      {alert.mailClass}
-                    </span>
-                  ) : null}
-                  {alert.threatType ? (
-                    <span className="px-2 py-1 rounded-full border border-cyan-300/45 text-slate-200 bg-cyan-400/10">
-                      Threat {alert.threatType}
-                    </span>
-                  ) : null}
-                  <span className="px-2 py-1 rounded-full border border-cyan-300/45 text-slate-200 bg-cyan-400/10">
-                    Priority {alert.priorityScore}
-                  </span>
-                  <span className="px-2 py-1 rounded-full border border-cyan-300/45 text-slate-200 bg-cyan-400/10">
-                    Uncertainty {alert.uncertaintyPercent}%
-                  </span>
-                  <span className="px-2 py-1 rounded-full border border-cyan-300/45 text-slate-200 bg-cyan-400/10">
-                    Consensus {alert.consensusScore}%
-                  </span>
-                  <span className="px-2 py-1 rounded-full border border-cyan-300/45 text-slate-200 bg-cyan-400/10 uppercase">
-                    {alert.trustedDecision?.action || "escalate"}
-                  </span>
-                </div>
-              </button>
-            ))
-          )}
-        </div>
-
-        <div className="min-h-0 overflow-auto surface-card p-3 sm:p-4 max-h-none lg:max-h-96">
-          {!selected ? (
-            <div className="text-sm text-slate-400">Select an email to view details.</div>
-          ) : (
-            <div className="flex flex-col gap-3">
-              <div>
-                <div className="text-lg font-semibold text-slate-100">{selected.subject}</div>
-                <div className="text-sm text-slate-400">From: {selected.senderEmail || selected.from}</div>
-                <div className="text-sm text-slate-400">Primary category: {categoryLabel(selected.primaryCategory)}</div>
-                <div className="text-sm text-slate-300">
-                  Trusted decision: {(selected.trustedDecision?.action || "escalate").toUpperCase()} (
-                  {selected.trustedDecision?.riskScore ?? "-"}
-                  /100 risk, {selected.trustedDecision?.confidencePct ?? "-"}% confidence)
-                </div>
-                <div className="mt-2">
-                  <TicketLinkForEmail sourceEmailId={selected.id} />
-                </div>
-              </div>
-
-              <div className="overflow-x-auto rounded-lg border border-slate-400/25">
-                <table className="w-full text-sm border-collapse">
-                  <thead>
-                    <tr className="text-left border-b border-slate-400/25 text-slate-300">
-                      <th className="py-2 px-3">Category</th>
-                      <th className="py-2 px-3">Score</th>
-                      <th className="py-2 px-3">Reason</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {selected.categoryScores.slice(0, 5).map((entry) => (
-                      <tr key={entry.category} className="border-b border-slate-400/15 align-top">
-                        <td className="py-2 px-3 text-slate-100">{categoryLabel(entry.category)}</td>
-                        <td className="py-2 px-3 text-slate-100">{entry.score}</td>
-                        <td className="py-2 px-3 text-slate-400">{entry.reason}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-
-              {selected.riskTags.length > 0 ? (
-                <div className="flex flex-wrap gap-2">
-                  {selected.riskTags.map((tag) => (
-                    <span key={tag} className="text-xs px-2 py-1 rounded-full border border-cyan-300/45 text-slate-200 bg-cyan-400/10">
-                      {tag}
-                    </span>
-                  ))}
-                </div>
+              {offlinePublicEnforced ? (
+                <InlineError message="Enforced offline mode is active. Gmail fetch is disabled; use manual input." />
               ) : null}
+            </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs text-slate-300">
-                <div className="rounded-lg border border-slate-400/25 bg-slate-900/30 p-2">
-                  Trust score: {selected.trustScore}/100
-                </div>
-                <div className="rounded-lg border border-slate-400/25 bg-slate-900/30 p-2">
-                  Reputation score: {selected.reputationScore}/100
-                </div>
-                <div className="rounded-lg border border-slate-400/25 bg-slate-900/30 p-2">
-                  Model consensus: {selected.consensusScore}% ({selected.consensusNote})
-                </div>
-                <div className="rounded-lg border border-slate-400/25 bg-slate-900/30 p-2">
-                  Thread depth: {selected.thread.depth} | Risk density: {selected.thread.riskDensity}
-                </div>
-                {selected.classifier ? (
-                  <div className="rounded-lg border border-slate-400/25 bg-slate-900/30 p-2">
-                    Classifier ({selected.classifier.modelVersion}): {selected.classifier.predictedClass.toUpperCase()} | S/H/A/I{" "}
-                    {Math.round(selected.classifier.probabilities.spam * 100)}/
-                    {Math.round(selected.classifier.probabilities.harmful * 100)}/
-                    {Math.round(selected.classifier.probabilities.actionable * 100)}/
-                    {Math.round(selected.classifier.probabilities.informational * 100)} | Memory samples{" "}
-                    {selected.classifier.memorySampleCount}
+            <div className="grid w-full gap-4">
+              <div className="rounded-lg border border-aegis-border bg-aegis-elevated px-4 py-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <SectionLabel>Gmail Connection</SectionLabel>
+                    <div className="mt-2 text-sm text-aegis-text">
+                      {gmailStatus.connected ? "Connected" : "Not connected"}
+                    </div>
+                    <div className="mt-1 break-all text-sm text-aegis-muted">
+                      {gmailStatus.email || "Connect a Gmail account to scan live inbox messages."}
+                    </div>
                   </div>
-                ) : null}
-              </div>
-
-              <div className="rounded-lg border border-slate-400/25 bg-slate-900/30 p-2 text-xs text-slate-300">
-                Decision note: {selected.trustedDecision?.note || "Decision note unavailable."}
-              </div>
-              {selected.guardrails ? (
-                <div className="rounded-lg border border-slate-400/25 bg-slate-900/30 p-2 text-xs text-slate-300">
-                  Guardrails ({selected.guardrails.policyVersion}):{" "}
-                  {selected.guardrails.ruleHits.length > 0
-                    ? selected.guardrails.ruleHits.join(", ")
-                    : "none"}{" "}
-                  | priority adjusted: {selected.guardrails.priorityAdjusted ? "yes" : "no"} | action adjusted:{" "}
-                  {selected.guardrails.actionAdjusted ? "yes" : "no"} | class adjusted:{" "}
-                  {selected.guardrails.classificationAdjusted ? "yes" : "no"}
+                  <StatusBadge tone={gmailStatus.connected ? "clear" : "muted"}>
+                    {gmailStatus.connected ? "Connected" : "Idle"}
+                  </StatusBadge>
                 </div>
-              ) : null}
-              {selected.decisionTrace?.explanation ? (
-                <div className="rounded-lg border border-slate-400/25 bg-slate-900/30 p-2 text-xs text-slate-300">
-                  Decision trace: {selected.decisionTrace.explanation}
-                </div>
-              ) : null}
-
-              {selected.extracted.attachments.length > 0 ? (
-                <div className="rounded-lg border border-slate-400/25 bg-slate-900/30 p-2 text-xs text-slate-300">
-                  Attachments ({selected.extracted.attachmentRiskScore}/100 risk):{" "}
-                  {selected.extracted.attachments.join(", ")}
-                </div>
-              ) : null}
-
-              {selected.reputationFindings.length > 0 ? (
-                <ul className="text-xs text-slate-400 list-disc pl-5">
-                  {selected.reputationFindings.map((finding) => (
-                    <li key={finding}>{finding}</li>
-                  ))}
-                </ul>
-              ) : null}
-
-              {selected.signals.length > 0 ? (
-                <ul className="text-sm text-slate-300 list-disc pl-5">
-                  {selected.signals.map((signal) => (
-                    <li key={signal}>{signal}</li>
-                  ))}
-                </ul>
-              ) : null}
-
-              <div className="text-sm text-slate-300">Suggested action: {selected.suggestedAction}</div>
-              <pre className="text-sm whitespace-pre-wrap leading-relaxed text-slate-200 break-all">
-                {selected.draftReply}
-              </pre>
-
-              <div className="rounded-lg border border-slate-400/25 bg-slate-900/30 p-2">
-                <div className="text-xs text-slate-200 mb-2">
-                  Learning feedback (updates memory for future scans)
-                </div>
-                <div className="flex flex-wrap gap-2">
+                <div className="mt-4 flex flex-wrap gap-2">
+                  {!gmailStatus.connected ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        window.location.href = "/api/inbox/gmail/connect";
+                      }}
+                      className={buttonClassName("secondary")}
+                    >
+                      Connect Gmail
+                    </button>
+                  ) : (
+                    <button type="button" onClick={() => void disconnectGmail()} className={buttonClassName("ghost")}>
+                      Disconnect
+                    </button>
+                  )}
                   <button
                     type="button"
-                    onClick={() =>
-                      void submitFeedback({
-                        alert: selected,
-                        outcomeLabel: "spam_true_positive",
-                        correctedClass: "spam",
-                        correctedPriority: "low",
-                      })
-                    }
-                    disabled={Boolean(feedbackSavingById[selected.id])}
-                    className="px-3 py-2 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[36px] text-xs disabled:opacity-60"
+                    onClick={() => void refreshGmailStatus()}
+                    className={buttonClassName("secondary")}
+                    disabled={checkingStatus}
                   >
-                    Confirm Spam
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      void submitFeedback({
-                        alert: selected,
-                        outcomeLabel: "harmful_true_positive",
-                        correctedClass: "harmful",
-                        correctedPriority: "high",
-                      })
-                    }
-                    disabled={Boolean(feedbackSavingById[selected.id])}
-                    className="px-3 py-2 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[36px] text-xs disabled:opacity-60"
-                  >
-                    Confirm Harmful
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      void submitFeedback({
-                        alert: selected,
-                        outcomeLabel: safeFeedbackLabel(selected),
-                        correctedClass:
-                          selected.mailClass === "actionable"
-                            ? "actionable"
-                            : "informational",
-                        correctedPriority:
-                          selected.mailClass === "actionable" ? "medium" : "low",
-                      })
-                    }
-                    disabled={Boolean(feedbackSavingById[selected.id])}
-                    className="px-3 py-2 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[36px] text-xs disabled:opacity-60"
-                  >
-                    Mark Safe
+                    {checkingStatus ? "Refreshing" : "Refresh"}
                   </button>
                 </div>
-                {feedbackStatusById[selected.id] ? (
-                  <div className="text-xs text-slate-300 mt-2">{feedbackStatusById[selected.id]}</div>
-                ) : null}
               </div>
 
-              <div className="flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  onClick={() => onEscalate(selected.rawEmail, suggestedCommand(selected))}
-                  className="primary-cta px-3 py-2 rounded-lg font-semibold min-h-[40px] w-full sm:w-auto"
-                >
-                  Escalate to Main Agent
-                </button>
-                <EscalateToHelpdeskButton
-                  sourceEmailId={selected.id}
-                  sender={selected.senderEmail || selected.from}
-                  subject={selected.subject}
-                  date={new Date().toISOString()}
-                  risk={riskSummaryFromAlert(selected)}
-                  decision={toTicketDecision(selected)}
-                  confidence={confidenceFromAlert(selected)}
-                  onCreated={(localTicketId) => setLastCreatedTicketId(localTicketId)}
+              <div className="rounded-lg border border-aegis-border bg-aegis-elevated px-4 py-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <SectionLabel>Consensus</SectionLabel>
+                    <div className="mt-2 text-sm text-aegis-text">
+                      {consensusEnabled ? `Multi-model (${consensusMaxModels})` : "Single-model"}
+                    </div>
+                    <div className="mt-1 text-sm text-aegis-muted">
+                      Source: {consensusSource === "admin_override" ? "admin override" : "environment default"}
+                    </div>
+                  </div>
+                  <StatusBadge tone={consensusEnabled ? "info" : "muted"}>
+                    {settingsLoading ? "Loading" : consensusEnabled ? "Multi" : "Single"}
+                  </StatusBadge>
+                </div>
+
+                {settingsLoading ? (
+                  <div className="mt-4 text-sm text-aegis-muted">Loading settings…</div>
+                ) : canEditConsensus ? (
+                  <div className="mt-4 grid gap-3">
+                    <label className="flex items-center gap-2 text-sm text-aegis-muted">
+                      <input
+                        type="checkbox"
+                        checked={consensusEnabled}
+                        onChange={(event) => setConsensusEnabled(event.target.checked)}
+                        disabled={settingsSaving || offlinePublicEnforced}
+                      />
+                      Enable multi-model consensus
+                    </label>
+                    <div className="flex flex-col gap-2 md:flex-row md:items-center">
+                      <input
+                        className="aegis-input md:flex-1"
+                        type="number"
+                        min={1}
+                        max={8}
+                        value={consensusMaxModels}
+                        onChange={(event) => {
+                          const nextValue = Number(event.target.value) || 1;
+                          setConsensusMaxModels(Math.max(1, Math.min(8, nextValue)));
+                        }}
+                        disabled={!consensusEnabled || settingsSaving || offlinePublicEnforced}
+                        title="Maximum models to run when consensus is enabled"
+                      />
+                      <div className="flex flex-wrap gap-2">
+                        <AegisButton
+                          variant="secondary"
+                          onClick={() => void saveInboxSettings()}
+                          disabled={settingsSaving || offlinePublicEnforced}
+                        >
+                          {settingsSaving ? "Saving" : "Save"}
+                        </AegisButton>
+                        <AegisButton variant="ghost" onClick={() => void refreshInboxSettings()} disabled={settingsSaving}>
+                          Refresh
+                        </AegisButton>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-4 text-sm text-aegis-muted">
+                    Admin login is required to change consensus settings.
+                  </div>
+                )}
+
+                {settingsError ? <InlineError className="mt-3" message={settingsError} /> : null}
+              </div>
+
+              <div className="grid gap-3 md:grid-cols-2">
+                <MetricCard label="Scanned" value={meta?.scanned ?? 0} sub="Current queue size." />
+                <MetricCard
+                  label="High Risk"
+                  value={meta?.highCount ?? 0}
+                  sub="Messages requiring fastest attention."
+                  tone="risk"
                 />
-                <button
-                  type="button"
-                  onClick={() => navigator.clipboard.writeText(selected.rawEmail)}
-                  className="px-3 py-2 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[40px] w-full sm:w-auto"
-                >
-                  Copy Raw Email
-                </button>
-                <button
-                  type="button"
-                  onClick={() => navigator.clipboard.writeText(selected.draftReply)}
-                  className="px-3 py-2 rounded-lg border border-cyan-300/40 text-slate-200 hover:bg-cyan-400/15 transition min-h-[40px] w-full sm:w-auto"
-                >
-                  Copy Draft
-                </button>
               </div>
-              {lastCreatedTicketId ? (
-                <Link href={`/tickets/${lastCreatedTicketId}`} className="text-xs text-cyan-200 underline">
-                  Open newly created ticket: {lastCreatedTicketId}
-                </Link>
-              ) : null}
             </div>
-          )}
-        </div>
+          </div>
+
+          {metaSummary.length > 0 ? (
+            <div className="mt-4 flex flex-wrap gap-2">
+              {metaSummary.map((item) => (
+                <span
+                  key={item}
+                  className="rounded border border-aegis-border bg-aegis-elevated px-2.5 py-1 font-mono text-xs uppercase tracking-[0.06em] text-aegis-dim"
+                >
+                  {item}
+                </span>
+              ))}
+            </div>
+          ) : null}
+        </PanelFrame>
+      </section>
+
+      <div className="grid min-h-0 flex-1 gap-4 lg:grid-cols-2 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.4fr)_minmax(280px,0.72fr)]">
+        <section
+          id="inbox-queue"
+          className="min-h-0 min-w-0 transition-all duration-300 lg:col-span-1"
+          style={{ transitionDelay: "120ms" }}
+        >
+          <PanelFrame
+            title="Inbox Queue"
+            subtitle="Search, filter, and select the next message to inspect."
+            status={<StatusBadge tone="info">{filtered.length} visible</StatusBadge>}
+          >
+            <div className="flex h-full min-h-0 flex-1 flex-col gap-4">
+              <div className="grid gap-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap gap-2">
+                    <StatusBadge tone={mode === "manual" ? "info" : "muted"}>Manual</StatusBadge>
+                    <StatusBadge tone={mode === "gmail" ? "info" : "muted"}>Gmail</StatusBadge>
+                  </div>
+                  <StatusBadge tone={counts.high > 0 ? "risk" : "muted"}>{counts.high} high risk</StatusBadge>
+                </div>
+
+                <label className="relative block">
+                  <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-aegis-dim">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <path
+                        d="m21 21-4.35-4.35M10.5 18a7.5 7.5 0 1 1 0-15 7.5 7.5 0 0 1 0 15Z"
+                        stroke="currentColor"
+                        strokeWidth="1.8"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  </span>
+                  <input
+                    className="aegis-input pl-9"
+                    value={searchQuery}
+                    onChange={(event) => setSearchQuery(event.target.value)}
+                    placeholder="Search sender, subject, domain, or raw text"
+                  />
+                </label>
+
+                <div className="aegis-chip-row">
+                  <PrimaryFilterButton active={activeFilter === "all"} label="All" count={counts.all} onClick={() => setActiveFilter("all")} />
+                  <PrimaryFilterButton active={activeFilter === "high"} label="High Risk" count={counts.high} onClick={() => setActiveFilter("high")} />
+                  <PrimaryFilterButton active={activeFilter === "pending"} label="Pending" count={counts.pending} onClick={() => setActiveFilter("pending")} />
+                  <PrimaryFilterButton active={activeFilter === "reviewed"} label="Reviewed" count={counts.reviewed} onClick={() => setActiveFilter("reviewed")} />
+                </div>
+
+                <div className="flex flex-wrap gap-2">
+                  <CategoryFilterButton active={focusCategory === "all"} label="All Signals" count={counts.all} onClick={() => setFocusCategory("all")} />
+                  {FILTER_CATEGORIES.map((category) => (
+                    <CategoryFilterButton
+                      key={category}
+                      active={focusCategory === category}
+                      label={categoryLabel(category)}
+                      count={counts[category]}
+                      onClick={() => setFocusCategory(category)}
+                    />
+                  ))}
+                </div>
+              </div>
+
+              <div className="flex-1 overflow-auto rounded-lg border border-aegis-border bg-aegis-base">
+                {isScanning ? (
+                  <div className="grid gap-2 p-3">
+                    {Array.from({ length: 6 }).map((_, index) => (
+                      <div key={index} className="aegis-skeleton h-14 rounded-lg" />
+                    ))}
+                  </div>
+                ) : filtered.length === 0 ? (
+                  <EmptyState
+                    className="min-h-72"
+                    icon={
+                      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <path
+                          d="M3 7.5h18M5 5h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Zm0 0 7 7 7-7"
+                          stroke="currentColor"
+                          strokeWidth="1.6"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        />
+                      </svg>
+                    }
+                    title="No queue items for this view"
+                    description="Run a scan or change the active filters to bring messages back into the queue."
+                  />
+                ) : (
+                  filtered.map((alert, index) => {
+                    const isSelected = expandedId === alert.id;
+                    const isReviewed = Boolean(reviewedIds[alert.id]);
+                    const needsManualReview = Boolean(manualReviewIds[alert.id]);
+                    const rowTone = priorityTone(alert.priority);
+
+                    return (
+                      <button
+                        key={alert.id}
+                        type="button"
+                        onClick={() => setExpandedId(alert.id)}
+                        className={cn(
+                          "aegis-table-row w-full border-l-2 px-4 py-3 text-left transition-all duration-300 hover:-translate-y-0.5 hover:shadow-lg",
+                          isReady ? "translate-y-0 opacity-100" : "translate-y-2 opacity-0",
+                          isSelected && "aegis-row-selected",
+                          isReviewed ? "aegis-row-read" : "aegis-row-unread",
+                          "hover:bg-aegis-overlay",
+                          rowTone === "risk" && "border-l-aegis-risk",
+                          rowTone === "caution" && "border-l-aegis-caution",
+                          rowTone === "clear" && "border-l-transparent"
+                        )}
+                        style={{ transitionDelay: `${index * 35}ms` }}
+                      >
+                        <div className="flex w-full items-start justify-between gap-3">
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-sm text-aegis-text">{alert.senderEmail || alert.from}</div>
+                            <div className="mt-1 truncate text-sm text-aegis-text">{alert.subject}</div>
+                            <div className="mt-2 flex flex-wrap gap-1.5">
+                              <StatusBadge tone={priorityTone(alert.priority)}>{alert.priority.toUpperCase()}</StatusBadge>
+                              <StatusBadge tone={mailClassTone(alert.mailClass)}>{(alert.mailClass || "queued").toUpperCase()}</StatusBadge>
+                              {needsManualReview ? <StatusBadge tone="caution">MANUAL</StatusBadge> : null}
+                            </div>
+                          </div>
+                          <div className="flex shrink-0 flex-col items-end gap-1">
+                            <div className="aegis-time">{alert.consensusScore}%</div>
+                            <div className="text-xs text-aegis-dim">{alert.priorityScore} risk</div>
+                          </div>
+                        </div>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          </PanelFrame>
+        </section>
+
+        <section
+          id="email-detail"
+          className="min-h-0 min-w-0 transition-all duration-300 lg:col-span-1"
+          style={{ transitionDelay: "180ms" }}
+        >
+          <PanelFrame
+            title="Email Detail"
+            subtitle="Inspect the selected thread, structured explanation, and raw message body."
+            status={
+              selected ? (
+                <StatusBadge tone={selected.priority === "high" ? "risk" : selected.priority === "medium" ? "caution" : "clear"}>
+                  {selected.priority.toUpperCase()}
+                </StatusBadge>
+              ) : undefined
+            }
+          >
+            <div className="flex h-full min-h-0 flex-1 flex-col gap-4">
+              {!selected ? (
+                <EmptyState
+                  className="flex-1"
+                  icon={
+                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <path
+                        d="M4 5h16v14H4zM8 9h8M8 13h5"
+                        stroke="currentColor"
+                        strokeWidth="1.6"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  }
+                  title="Select a message"
+                  description="Choose a queue row to open the raw email, metadata, and structured signal summary."
+                />
+              ) : (
+                <>
+                  <div className="grid gap-2 border-b border-aegis-border pb-4">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-xl leading-8 text-aegis-text">{selected.subject}</div>
+                        <div className="mt-1 text-sm text-aegis-muted">{selected.senderEmail || selected.from}</div>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <StatusBadge tone={actionTone(selected.trustedDecision?.action)}>{(selected.trustedDecision?.action || "escalate").toUpperCase()}</StatusBadge>
+                        <StatusBadge tone={mailClassTone(selected.mailClass)}>{(selected.mailClass || "queued").toUpperCase()}</StatusBadge>
+                      </div>
+                    </div>
+
+                    <div className="grid gap-3 rounded-lg border border-aegis-border bg-aegis-elevated px-4 py-3 md:grid-cols-3">
+                      <MetaItem label="From" value={selected.senderEmail || selected.from || "Unknown sender"} />
+                      <MetaItem label="Received" value="Unavailable in current scanner output" />
+                      <MetaItem label="Thread Id" value={selected.thread.key || "Unavailable"} />
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col gap-4 xl:flex-row">
+                    <div className="grid min-w-0 flex-1 gap-4">
+                      <div className="grid gap-2">
+                        <SectionLabel>Message Body</SectionLabel>
+                        <div className="max-h-96 overflow-auto rounded-lg border border-aegis-border bg-aegis-base px-4 py-4">
+                          <div className="grid gap-3 font-mono text-sm leading-7 text-aegis-text">
+                            {selectedBlocks.map((block, index) => (
+                              <div
+                                key={`${block.kind}-${index}`}
+                                className={
+                                  block.kind === "quoted"
+                                    ? "rounded-lg border-l-2 border-aegis-border bg-aegis-elevated px-3 py-2 text-aegis-muted"
+                                    : ""
+                                }
+                              >
+                                <pre className="whitespace-pre-wrap break-words font-mono">{block.text}</pre>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="grid gap-2">
+                        <SectionLabel>Structured Explanation</SectionLabel>
+                        <div className="rounded-lg border border-aegis-border bg-aegis-elevated px-4 py-4">
+                          <div className="text-sm leading-6 text-aegis-text">
+                            {selected.explanation?.summary ||
+                              selected.decisionTrace?.explanation ||
+                              "No structured explanation was returned for this message."}
+                          </div>
+                          {selected.explanation?.keyFactors?.length ? (
+                            <ul className="mt-3 grid gap-2">
+                              {selected.explanation.keyFactors.slice(0, 5).map((factor) => (
+                                <li
+                                  key={factor}
+                                  className="rounded border border-aegis-border bg-aegis-base px-3 py-2 text-sm text-aegis-muted"
+                                >
+                                  {factor}
+                                </li>
+                              ))}
+                            </ul>
+                          ) : null}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="grid content-start gap-4 min-w-0">
+                      <div className="grid gap-2">
+                        <SectionLabel>Queue Metadata</SectionLabel>
+                        <div className="grid gap-3 rounded-lg border border-aegis-border bg-aegis-elevated px-4 py-4">
+                          <MetaItem label="Primary Category" value={categoryLabel(selected.primaryCategory)} />
+                          <MetaItem
+                            label="Trusted Decision"
+                            value={`${selected.trustedDecision?.action || "escalate"} · ${
+                              selected.trustedDecision?.confidencePct ?? selected.consensusScore
+                            }% confidence`}
+                          />
+                          <MetaItem label="Thread Density" value={`${selected.thread.depth} depth · ${selected.thread.riskDensity} density`} />
+                          <MetaItem label="Consensus" value={`${selected.consensusScore}%`} />
+                        </div>
+                      </div>
+
+                      <div className="grid gap-2">
+                        <SectionLabel>Signals</SectionLabel>
+                        <div className="grid gap-2 rounded-lg border border-aegis-border bg-aegis-elevated px-4 py-4">
+                          {(selectedSignals.length > 0 ? selectedSignals : ["No deterministic signals captured."])
+                            .slice(0, 5)
+                            .map((signal: string) => (
+                              <div key={signal} className="flex items-start gap-2 text-sm text-aegis-muted">
+                                <span className="mt-1.5 h-1.5 w-1.5 rounded-full bg-aegis-info" />
+                                <span>{signal}</span>
+                              </div>
+                            ))}
+                        </div>
+                      </div>
+
+                      <div className="grid gap-2">
+                        <SectionLabel>Evidence Extracts</SectionLabel>
+                        <div className="grid gap-3 rounded-lg border border-aegis-border bg-aegis-elevated px-4 py-4">
+                          <div className="grid gap-3 sm:grid-cols-2">
+                            {selectedEvidenceItems.map((item) => (
+                              <div
+                                key={item.label}
+                                className="rounded-xl border border-aegis-border bg-aegis-base px-4 py-4"
+                              >
+                                <div className="flex items-start justify-between gap-3">
+                                  <div className="min-w-0">
+                                    <div className="text-xs font-mono uppercase tracking-widest text-foreground/40">
+                                      {item.label}
+                                    </div>
+                                    <div className="mt-2 text-sm leading-6 text-aegis-muted">{item.detail}</div>
+                                  </div>
+                                  <div className="shrink-0 text-2xl font-medium tracking-tight text-aegis-text">
+                                    {item.count}
+                                  </div>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+
+                          {selected.extracted.attachments.length > 0 ? (
+                            <div className="rounded-xl border border-aegis-border bg-aegis-base px-4 py-4">
+                              <div className="text-xs font-mono uppercase tracking-widest text-foreground/40">
+                                Attachment Names
+                              </div>
+                              <div className="mt-3 flex flex-wrap gap-2">
+                                {selected.extracted.attachments.map((attachment) => (
+                                  <span
+                                    key={attachment}
+                                    className="rounded-full border border-aegis-border bg-aegis-elevated px-3 py-1.5 text-xs text-aegis-muted"
+                                  >
+                                    {attachment}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          ) : null}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+          </PanelFrame>
+        </section>
+
+        <section
+          id="triage-actions"
+          className="min-h-0 min-w-0 transition-all duration-300 lg:col-span-2 xl:col-span-1"
+          style={{ transitionDelay: "240ms" }}
+        >
+          <PanelFrame
+            title="Triage Actions"
+            subtitle="Route the selected message, annotate escalation, and record operator follow-through."
+            status={selected ? <StatusBadge tone={priorityTone(selected.priority)}>{selected.priorityScore}/100</StatusBadge> : undefined}
+          >
+            <div className="flex h-full min-h-0 flex-1 flex-col gap-4">
+              {!selected ? (
+                <EmptyState
+                  className="flex-1"
+                  icon={
+                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                      <path
+                        d="M12 3v18M3 12h18"
+                        stroke="currentColor"
+                        strokeWidth="1.6"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  }
+                  title="No active message"
+                  description="Pick a queue item to reveal risk routing, escalation actions, and follow-through controls."
+                />
+              ) : (
+                <>
+                  <div className="grid gap-4 rounded-lg border border-aegis-border bg-aegis-elevated px-4 py-4">
+                    <SectionLabel>Risk Assessment</SectionLabel>
+                    <div className="text-3xl leading-none text-aegis-text">
+                      <span
+                        className={
+                          selected.priority === "high"
+                            ? "text-aegis-risk"
+                            : selected.priority === "medium"
+                              ? "text-aegis-caution"
+                              : "text-aegis-clear"
+                        }
+                      >
+                        {selected.priorityScore}
+                      </span>
+                    </div>
+                    <div
+                      className={
+                        selected.priority === "high"
+                          ? "text-sm text-aegis-risk"
+                          : selected.priority === "medium"
+                            ? "text-sm text-aegis-caution"
+                            : "text-sm text-aegis-clear"
+                      }
+                    >
+                      {selected.priority.toUpperCase()} PRIORITY · {categoryLabel(selected.primaryCategory)}
+                    </div>
+                    <div className="grid gap-2">
+                      <div className="flex items-center justify-between text-xs text-aegis-dim">
+                        <span>Confidence</span>
+                        <span>{selected.trustedDecision?.confidencePct ?? selected.consensusScore}%</span>
+                      </div>
+                      <div className="h-1.5 overflow-hidden rounded-full bg-aegis-base">
+                        <div
+                          className="h-full rounded-full bg-gradient-to-r from-aegis-caution to-aegis-clear"
+                          style={{ width: `${selected.trustedDecision?.confidencePct ?? selected.consensusScore}%` }}
+                        />
+                      </div>
+                    </div>
+                    <div className="grid gap-2 text-sm text-aegis-muted">
+                      {(selectedSignals.length > 0 ? selectedSignals : selected.riskTags).slice(0, 4).map((signal: string) => (
+                        <div key={signal} className="flex items-start gap-2">
+                          <span className="mt-1.5 h-1.5 w-1.5 rounded-full bg-aegis-caution" />
+                          <span>{signal}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="grid gap-4 rounded-lg border border-aegis-border bg-aegis-elevated px-4 py-4">
+                    <SectionLabel>Decision Routing</SectionLabel>
+                    {selected.decision ? (
+                      <>
+                        <div className="flex flex-wrap gap-2">
+                          <StatusBadge tone={mailClassTone(selected.mailClass)}>{humanizeFlag(selected.decision.final_action).toUpperCase()}</StatusBadge>
+                          <StatusBadge tone={selected.decision.risk_level === "high" ? "risk" : selected.decision.risk_level === "medium" ? "caution" : "clear"}>
+                            {humanizeFlag(selected.decision.risk_level)}
+                          </StatusBadge>
+                        </div>
+                        <div className="text-sm leading-6 text-aegis-muted">{selected.decision.reason}</div>
+                      </>
+                    ) : (
+                      <div className="text-sm text-aegis-muted">Decision routing is unavailable for this result.</div>
+                    )}
+
+                    {selected.uncertainty ? (
+                      <div className="grid gap-2 text-sm text-aegis-muted">
+                        <div>Uncertainty score: {formatPercent(selected.uncertainty.score)}</div>
+                        <div>
+                          Types: {selected.uncertainty.type.length > 0 ? selected.uncertainty.type.map(humanizeFlag).join(", ") : "none"}
+                        </div>
+                        <div>
+                          Sources: model {formatPercent(selected.uncertainty.sources.model_confidence)} · conflict {formatPercent(selected.uncertainty.sources.signal_conflict)} · missing {selected.uncertainty.sources.missing_fields}
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <div className="grid gap-2">
+                    <button type="button" onClick={() => onEscalate(selected.rawEmail, escalationCommandWithNote(selected))} className={buttonClassName("primary", false, "justify-center")}>
+                      Escalate to Agent Desk
+                    </button>
+                    <button type="button" onClick={() => toggleReviewed(selected.id)} className={buttonClassName("secondary", false, "justify-center")}>
+                      {reviewedIds[selected.id] ? "Undo Reviewed" : "Mark Reviewed"}
+                    </button>
+                    <button type="button" onClick={() => archiveAlert(selected.id)} className={buttonClassName("ghost", false, "justify-center")}>
+                      Archive / Skip
+                    </button>
+                    <button type="button" onClick={() => flagManualReview(selected.id)} className={buttonClassName("danger", false, "justify-center")}>
+                      Flag for Manual Review
+                    </button>
+                  </div>
+
+                  <div className="grid gap-2">
+                    <SectionLabel>Escalation Note</SectionLabel>
+                    <textarea
+                      className="aegis-input aegis-textarea min-h-24"
+                      placeholder="Optional analyst note to append to the escalation command."
+                      value={selectedNote}
+                      onChange={(event) => setEscalationNotes((prev) => ({ ...prev, [selected.id]: event.target.value }))}
+                    />
+                  </div>
+
+                  <div className="grid gap-2 rounded-lg border border-aegis-border bg-aegis-elevated px-4 py-4">
+                    <SectionLabel>Follow-through</SectionLabel>
+                    <EscalateToHelpdeskButton
+                      sourceEmailId={selected.id}
+                      sender={selected.senderEmail || selected.from}
+                      subject={selected.subject}
+                      date={new Date().toISOString()}
+                      risk={riskSummaryFromAlert(selected)}
+                      decision={toTicketDecision(selected)}
+                      confidence={confidenceFromAlert(selected)}
+                      onCreated={(localTicketId) => setLastCreatedTicketId(localTicketId)}
+                    />
+                    <div className="flex flex-wrap gap-2">
+                      <button type="button" onClick={() => navigator.clipboard.writeText(selected.rawEmail)} className={buttonClassName("secondary")}>
+                        Copy Raw Email
+                      </button>
+                      <button type="button" onClick={() => navigator.clipboard.writeText(selected.draftReply)} className={buttonClassName("secondary")}>
+                        Copy Draft
+                      </button>
+                    </div>
+                    <TicketLinkForEmail sourceEmailId={selected.id} />
+                    {lastCreatedTicketId ? (
+                      <Link href={`/tickets/${lastCreatedTicketId}`} className="font-mono text-xs uppercase tracking-[0.08em] text-aegis-accent">
+                        Open newly created ticket · {lastCreatedTicketId}
+                      </Link>
+                    ) : null}
+                  </div>
+
+                  <div className="grid gap-2 rounded-lg border border-aegis-border bg-aegis-elevated px-4 py-4">
+                    <SectionLabel>Feedback Loop</SectionLabel>
+                    <div className="grid gap-2">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void submitFeedback({
+                            alert: selected,
+                            outcomeLabel: "spam_true_positive",
+                            correctedClass: "spam",
+                            correctedPriority: "low",
+                          })
+                        }
+                        disabled={Boolean(feedbackSavingById[selected.id])}
+                        className={buttonClassName("secondary", false, "justify-center")}
+                      >
+                        Confirm Spam
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void submitFeedback({
+                            alert: selected,
+                            outcomeLabel: "harmful_true_positive",
+                            correctedClass: "harmful",
+                            correctedPriority: "high",
+                          })
+                        }
+                        disabled={Boolean(feedbackSavingById[selected.id])}
+                        className={buttonClassName("secondary", false, "justify-center")}
+                      >
+                        Confirm Harmful
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void submitFeedback({
+                            alert: selected,
+                            outcomeLabel: safeFeedbackLabel(selected),
+                            correctedClass: selected.mailClass === "actionable" ? "actionable" : "informational",
+                            correctedPriority: selected.mailClass === "actionable" ? "medium" : "low",
+                          })
+                        }
+                        disabled={Boolean(feedbackSavingById[selected.id])}
+                        className={buttonClassName("ghost", false, "justify-center")}
+                      >
+                        Mark Safe
+                      </button>
+                    </div>
+                    {feedbackStatusById[selected.id] ? <div className="text-sm text-aegis-muted">{feedbackStatusById[selected.id]}</div> : null}
+                  </div>
+                </>
+              )}
+            </div>
+          </PanelFrame>
+        </section>
       </div>
     </div>
   );
 }
+

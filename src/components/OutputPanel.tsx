@@ -1,225 +1,223 @@
-type Proof = {
-  title: string;
-  url: string;
-  snippet: string;
-  reasonThisHelps: string;
-};
+import type { FormattedFinalOutput } from "@/lib/agent/finalFormatter";
 
-type EntityVerdict = {
-  entity: string;
-  entityType: "person" | "company" | "organization" | "unknown";
-  verdict: "genuine" | "suspicious" | "uncertain";
-  uncertaintyPct: number;
-  rationale: string;
-  proof: Proof[];
-  redFlags: string[];
-  followUpChecks: string[];
-};
+import { AegisButton, EmptyState, StatusBadge } from "@/components/ui/AegisPrimitives";
 
-type AnalysisFinding = {
-  risk: string;
-  severity: "low" | "medium" | "high";
-  whyItMatters: string;
-  suggestedEdit: string;
-};
+type AnalysisFinding = NonNullable<FormattedFinalOutput["analysisSection"]>["findings"][number];
+type EntityVerdict = FormattedFinalOutput["entityVerdicts"][number];
 
-type AnalysisSection = {
-  title: string;
-  sectionType: "contract" | "security" | "finance" | "operations" | "scheduling" | "general";
-  findings: AnalysisFinding[];
-};
-
-type FinalOutput = {
-  summary: {
-    email: string;
-    document: string;
-    deadlines: string[];
-    entities: string[];
-  };
-  entityVerdicts: EntityVerdict[];
-  analysisSection?: AnalysisSection;
-  contractRisks?: AnalysisFinding[]; // legacy compatibility
-  replyDraft: {
-    subject: string;
-    body: string;
-  };
-  meetingInvite: {
-    title: string;
-    datetimeISO: string;
-    ics: string;
-  };
-  notes: {
-    whatIDid: string[];
-    uncertainties: string[];
-  };
-};
-
-function severityClass(severity: AnalysisFinding["severity"]): string {
-  if (severity === "high") return "text-red-300 border-red-500/40 bg-red-500/10";
-  if (severity === "medium") return "text-yellow-300 border-yellow-500/40 bg-yellow-500/10";
-  return "text-emerald-300 border-emerald-500/40 bg-emerald-500/10";
+function toneForSeverity(severity: AnalysisFinding["severity"]): "risk" | "caution" | "clear" {
+  if (severity === "high") return "risk";
+  if (severity === "medium") return "caution";
+  return "clear";
 }
 
-function verdictClass(verdict: EntityVerdict["verdict"]): string {
-  if (verdict === "suspicious") return "text-red-300";
-  if (verdict === "uncertain") return "text-yellow-300";
-  return "text-emerald-300";
+function toneForVerdict(verdict: EntityVerdict["verdict"]): "risk" | "caution" | "clear" {
+  if (verdict === "suspicious") return "risk";
+  if (verdict === "uncertain") return "caution";
+  return "clear";
 }
 
-function asFinalOutput(value: unknown): FinalOutput | null {
+function toneForLevel(level: "low" | "medium" | "high"): "risk" | "caution" | "clear" {
+  if (level === "high") return "risk";
+  if (level === "medium") return "caution";
+  return "clear";
+}
+
+function toneForDecision(action: FormattedFinalOutput["decision"]["final_action"]): "risk" | "caution" | "clear" {
+  if (action === "human_review") return "risk";
+  if (action === "escalate") return "caution";
+  return "clear";
+}
+
+function asFinalOutput(value: unknown): FormattedFinalOutput | null {
   if (!value || typeof value !== "object") return null;
-  return value as FinalOutput;
+  return value as FormattedFinalOutput;
+}
+
+function Section({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <section className="rounded-lg border border-aegis-border bg-aegis-elevated p-4">
+      <div className="text-xs font-mono font-medium uppercase tracking-widest text-aegis-dim">{label}</div>
+      <div className="mt-3">{children}</div>
+    </section>
+  );
 }
 
 export default function OutputPanel({ stream, outputs }: { stream: string; outputs: unknown }) {
   const final = asFinalOutput(outputs);
-  const analysisTitle = final?.analysisSection?.title || (final?.contractRisks ? "Contract Risks" : "Key Risks & Actions");
-  const analysisFindings = final?.analysisSection?.findings || final?.contractRisks || [];
+  const findings = final?.analysisSection?.findings || [];
 
   return (
-    <div className="h-full min-h-0 flex flex-col gap-3">
-      <div className="panel-note">Readable final output with verification evidence and actions.</div>
-
-      <div className="scroll-surface min-h-0 flex-1 overflow-auto p-4 max-h-none md:max-h-96 space-y-4">
-        {!final ? (
-          <div className="text-sm text-[var(--muted)] whitespace-pre-wrap">
-            {stream || "Outputs will appear here after execution."}
-          </div>
-        ) : (
-          <>
-            <section className="output-section p-4">
-              <div className="output-heading text-sm font-semibold mb-2">Executive Summary</div>
-              <div className="text-sm text-[var(--text)] mb-2">{final.summary.email}</div>
-              <div className="text-sm text-[var(--muted)]">{final.summary.document}</div>
-              <div className="mt-3 flex flex-wrap gap-2">
+    <div className="flex h-full min-h-0 flex-col gap-4" id="agent-output">
+      {!final ? (
+        <EmptyState
+          className="min-h-64"
+          title="No final output yet"
+          description={stream || "Run the agent to generate the structured report, claims, evidence, and draft response."}
+        />
+      ) : (
+        <div className="grid gap-4">
+          <Section label="Summary">
+            <div className="grid gap-2">
+              <div className="text-sm leading-relaxed text-aegis-text">{final.summary.email || "No email summary generated."}</div>
+              <div className="text-sm leading-relaxed text-aegis-muted">{final.summary.document || "No supporting document summary generated."}</div>
+              <div className="flex flex-wrap gap-2">
                 {(final.summary.deadlines || []).map((deadline) => (
-                  <span key={deadline} className="meta-pill text-xs px-2 py-1 rounded-full">
-                    Deadline: {deadline}
-                  </span>
+                  <StatusBadge key={deadline} tone="caution">DEADLINE · {deadline}</StatusBadge>
                 ))}
                 {(final.summary.entities || []).map((entity) => (
-                  <span key={entity} className="meta-pill text-xs px-2 py-1 rounded-full">
-                    Entity: {entity}
-                  </span>
+                  <StatusBadge key={entity} tone="info">ENTITY · {entity}</StatusBadge>
                 ))}
               </div>
-            </section>
+            </div>
+          </Section>
 
-            <section className="output-section p-4">
-              <div className="output-heading text-sm font-semibold mb-2">Entity Verification</div>
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm border-collapse">
-                  <thead>
-                    <tr className="text-left text-[var(--muted)] border-b border-[var(--stroke)]">
-                      <th className="py-2 pr-3">Entity</th>
-                      <th className="py-2 pr-3">Type</th>
-                      <th className="py-2 pr-3">Verdict</th>
-                      <th className="py-2 pr-3">Uncertainty</th>
-                      <th className="py-2">Red Flags</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {(final.entityVerdicts || []).map((verdict) => (
-                      <tr key={`${verdict.entity}-${verdict.verdict}`} className="border-b border-[rgba(255,255,255,0.05)] align-top">
-                        <td className="py-2 pr-3 text-[var(--text)]">{verdict.entity}</td>
-                        <td className="py-2 pr-3 text-[var(--muted)]">{verdict.entityType}</td>
-                        <td className={`py-2 pr-3 font-semibold ${verdictClass(verdict.verdict)}`}>{verdict.verdict}</td>
-                        <td className="py-2 pr-3 text-[var(--muted)]">{verdict.uncertaintyPct}%</td>
-                        <td className="py-2 text-[var(--muted)]">{(verdict.redFlags || []).join(", ") || "None"}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+          <div className="grid gap-4 xl:grid-cols-2">
+            <Section label="Risk Assessment">
+              <div className="flex flex-wrap gap-2">
+                <StatusBadge tone={toneForLevel(final.risk_assessment.level)}>{final.risk_assessment.level.toUpperCase()}</StatusBadge>
+                <StatusBadge tone="info">Score {final.risk_assessment.score}</StatusBadge>
+                <StatusBadge tone="info">Evidence {Math.round((final.evidence_quality_score || 0) * 100)}%</StatusBadge>
               </div>
-              <div className="mt-3 space-y-3">
-                {(final.entityVerdicts || []).map((verdict, idx) => (
-                  <div key={`${verdict.entity}-proof-${idx}`} className="rounded-lg border border-[var(--stroke)] bg-[rgba(255,255,255,0.02)] p-3">
-                    <div className="text-xs font-semibold text-[var(--text)] mb-1">
-                      Proof for {verdict.entity}
-                    </div>
-                    <div className="text-xs text-[var(--muted)] mb-2">{verdict.rationale}</div>
-                    {verdict.proof && verdict.proof.length > 0 ? (
-                      <div className="space-y-2">
-                        {verdict.proof.map((item, proofIdx) => (
-                          <div key={`${verdict.entity}-proof-item-${proofIdx}`} className="text-xs text-[var(--muted)]">
-                            {item.url ? (
-                              <a
-                                href={item.url}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="text-[var(--text)] underline break-all"
-                              >
-                                {item.title || item.url}
-                              </a>
-                            ) : (
-                              <div className="text-[var(--text)]">{item.title || "Source"}</div>
-                            )}
-                            {item.snippet ? <div className="mt-1">Snippet: {item.snippet}</div> : null}
-                            <div className="mt-1">Why it helps: {item.reasonThisHelps}</div>
-                          </div>
-                        ))}
+              <div className="mt-3 text-sm leading-relaxed text-aegis-muted">{final.risk_assessment.rationale}</div>
+            </Section>
+
+            <Section label="Decision">
+              <div className="flex flex-wrap gap-2">
+                <StatusBadge tone={toneForDecision(final.decision.final_action)}>{final.decision.final_action.toUpperCase()}</StatusBadge>
+                <StatusBadge tone={toneForLevel(final.decision.risk_level)}>{final.decision.risk_level.toUpperCase()}</StatusBadge>
+              </div>
+              <div className="mt-3 text-sm leading-relaxed text-aegis-muted">{final.decision.reason}</div>
+              <div className="mt-3 text-sm leading-relaxed text-aegis-muted">Uncertainty: {final.uncertainty.summary}</div>
+            </Section>
+          </div>
+
+          <div className="grid gap-4 xl:grid-cols-2">
+            <Section label="Claims">
+              {final.claims.length > 0 ? (
+                <div className="grid gap-3">
+                  {final.claims.map((claim, index) => (
+                    <div key={`${claim.type}-${index}`} className="rounded border border-aegis-border bg-aegis-base p-3">
+                      <div className="flex flex-wrap gap-2">
+                        <StatusBadge tone="info">{claim.type.toUpperCase()}</StatusBadge>
+                        <StatusBadge tone="muted">{Math.round((claim.confidence || 0) * 100)}% confidence</StatusBadge>
+                        <StatusBadge tone="muted">{claim.verification?.status || "unverified"}</StatusBadge>
                       </div>
-                    ) : (
-                      <div className="text-xs text-[var(--muted)]">No proof items provided.</div>
-                    )}
+                      <div className="mt-2 text-sm leading-relaxed text-aegis-text">{claim.text}</div>
+                      <div className="mt-2 text-sm leading-relaxed text-aegis-muted">{claim.verification?.notes || "No verification notes available."}</div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-sm text-aegis-muted">No claims were extracted.</div>
+              )}
+            </Section>
+
+            <Section label="Evidence">
+              {final.evidence.length > 0 ? (
+                <div className="grid gap-3">
+                  {final.evidence.map((evidence, index) => (
+                    <div key={`${evidence.url}-${index}`} className="rounded border border-aegis-border bg-aegis-base p-3">
+                      <div className="flex flex-wrap gap-2">
+                        <StatusBadge tone="info">relevance {Math.round((evidence.relevance_score || 0) * 100)}%</StatusBadge>
+                        <StatusBadge tone="muted">source {Math.round((evidence.source_quality_score || 0) * 100)}%</StatusBadge>
+                        <StatusBadge tone="muted">recency {Math.round((evidence.recency_score || 0) * 100)}%</StatusBadge>
+                      </div>
+                      <div className="mt-2 text-sm font-medium text-aegis-text">{evidence.title || evidence.url}</div>
+                      <div className="mt-2 text-sm leading-relaxed text-aegis-muted">{evidence.snippet || "No excerpt captured."}</div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-sm text-aegis-muted">No evidence was returned.</div>
+              )}
+            </Section>
+          </div>
+
+          <Section label="Entity Verification">
+            <div className="grid gap-3">
+              {final.entityVerdicts.map((verdict, index) => (
+                <div key={`${verdict.entity}-${index}`} className="rounded border border-aegis-border bg-aegis-base p-3">
+                  <div className="flex flex-wrap gap-2">
+                    <StatusBadge tone={toneForVerdict(verdict.verdict)}>{verdict.verdict.toUpperCase()}</StatusBadge>
+                    <StatusBadge tone="muted">{verdict.entityType}</StatusBadge>
+                    <StatusBadge tone="muted">{verdict.uncertaintyPct}% uncertainty</StatusBadge>
+                  </div>
+                  <div className="mt-2 text-sm font-medium text-aegis-text">{verdict.entity}</div>
+                  <div className="mt-2 text-sm leading-relaxed text-aegis-muted">{verdict.rationale}</div>
+                </div>
+              ))}
+            </div>
+          </Section>
+
+          <Section label={final.analysisSection?.title || "Analysis"}>
+            {findings.length > 0 ? (
+              <div className="grid gap-3">
+                {findings.map((finding, index) => (
+                  <div key={`${finding.risk}-${index}`} className="rounded border border-aegis-border bg-aegis-base p-3">
+                    <div className="flex flex-wrap gap-2">
+                      <StatusBadge tone={toneForSeverity(finding.severity)}>{finding.severity.toUpperCase()}</StatusBadge>
+                    </div>
+                    <div className="mt-2 text-sm font-medium text-aegis-text">{finding.risk}</div>
+                    <div className="mt-2 text-sm leading-relaxed text-aegis-muted">{finding.whyItMatters}</div>
+                    <div className="mt-2 text-sm leading-relaxed text-aegis-muted">Suggested edit: {finding.suggestedEdit}</div>
                   </div>
                 ))}
               </div>
-            </section>
+            ) : (
+              <div className="text-sm text-aegis-muted">No structured analysis findings were returned.</div>
+            )}
+          </Section>
 
-            <section className="output-section p-4">
-              <div className="output-heading text-sm font-semibold mb-2">{analysisTitle}</div>
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm border-collapse">
-                  <thead>
-                    <tr className="text-left text-[var(--muted)] border-b border-[var(--stroke)]">
-                      <th className="py-2 pr-3">Risk</th>
-                      <th className="py-2 pr-3">Severity</th>
-                      <th className="py-2 pr-3">Why It Matters</th>
-                      <th className="py-2">Suggested Edit</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {analysisFindings.map((risk, idx) => (
-                      <tr key={`${risk.risk}-${idx}`} className="border-b border-[rgba(255,255,255,0.05)] align-top">
-                        <td className="py-2 pr-3 text-[var(--text)]">{risk.risk}</td>
-                        <td className="py-2 pr-3">
-                          <span className={`text-xs px-2 py-1 rounded-full border ${severityClass(risk.severity)}`}>
-                            {risk.severity}
-                          </span>
-                        </td>
-                        <td className="py-2 pr-3 text-[var(--muted)]">{risk.whyItMatters}</td>
-                        <td className="py-2 text-[var(--muted)]">{risk.suggestedEdit}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </section>
-
-            <section className="output-section p-4">
-              <div className="output-heading text-sm font-semibold mb-1">Reply Draft</div>
-              <div className="text-xs text-[var(--muted)] mb-2">Subject: {final.replyDraft?.subject || "(No subject)"}</div>
-              <pre className="text-sm whitespace-pre-wrap leading-relaxed text-[var(--text)]">
+          <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]">
+            <Section label="Reply Draft">
+              <div className="text-sm text-aegis-muted">Subject: {final.replyDraft?.subject || "(No subject)"}</div>
+              <pre className="mt-3 whitespace-pre-wrap text-sm font-mono leading-relaxed text-aegis-text">
                 {final.replyDraft?.body || "No draft generated."}
               </pre>
-            </section>
+            </Section>
 
-            <section className="output-section p-4">
-              <div className="output-heading text-sm font-semibold mb-1">Meeting Invite</div>
-              <div className="text-sm text-[var(--text)]">Title: {final.meetingInvite?.title || "-"}</div>
-              <div className="text-sm text-[var(--muted)] mb-2">Time: {final.meetingInvite?.datetimeISO || "-"}</div>
-              <button
-                type="button"
-                onClick={() => navigator.clipboard.writeText(final.meetingInvite?.ics || "")}
-                className="secondary-ghost px-3 py-1.5 rounded-lg text-sm"
-              >
-                Copy ICS
-              </button>
-            </section>
-          </>
-        )}
-      </div>
+            <Section label="Meeting Invite">
+              <div className="grid gap-2 text-sm leading-relaxed text-aegis-muted">
+                <div>Title: {final.meetingInvite?.title || "-"}</div>
+                <div>Time: {final.meetingInvite?.datetimeISO || "-"}</div>
+                <AegisButton variant="secondary" onClick={() => navigator.clipboard.writeText(final.meetingInvite?.ics || "")}>Copy ICS</AegisButton>
+              </div>
+            </Section>
+          </div>
+
+          <Section label="Audit Trace">
+            <div className="grid gap-4 xl:grid-cols-2">
+              <div className="grid gap-2">
+                {(final.audit_trace.steps || []).map((step, index) => (
+                  <div key={`${step.id}-${index}`} className="text-sm leading-relaxed text-aegis-muted">
+                    {step.type}
+                    {step.description ? ` · ${step.description}` : ""}
+                    {step.status ? ` (${step.status})` : ""}
+                  </div>
+                ))}
+              </div>
+              <div className="grid gap-2">
+                <div className="flex flex-wrap gap-2">
+                  {(final.audit_trace.models_used || []).map((model) => (
+                    <StatusBadge key={model} tone="muted">{model}</StatusBadge>
+                  ))}
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {(final.audit_trace.flags || []).map((flag) => (
+                    <StatusBadge key={flag} tone="caution">{flag}</StatusBadge>
+                  ))}
+                </div>
+                <div className="grid gap-1">
+                  {(final.audit_trace.timestamps || []).map((timestamp) => (
+                    <div key={timestamp} className="aegis-time">{timestamp}</div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </Section>
+        </div>
+      )}
     </div>
   );
 }

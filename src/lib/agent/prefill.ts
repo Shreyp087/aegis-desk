@@ -7,6 +7,8 @@ export type AgentEscalationPrefill = {
   createdAt: number;
 };
 
+const PREFILL_REMOUNT_GRACE_MS = 2_000;
+
 export function stashAgentEscalationPrefill(input: { rawEmail: string; command: string }) {
   if (typeof window === "undefined") return;
 
@@ -24,14 +26,13 @@ export function stashAgentEscalationPrefill(input: { rawEmail: string; command: 
   }
 }
 
-export function consumeAgentEscalationPrefill(maxAgeMs = 15 * 60 * 1000): AgentEscalationPrefill | null {
+export function readAgentEscalationPrefill(maxAgeMs = 15 * 60 * 1000): AgentEscalationPrefill | null {
   if (typeof window === "undefined") return null;
 
   let raw: string | null = null;
   try {
     raw = window.sessionStorage.getItem(AGENT_ESCALATION_PREFILL_KEY);
     if (!raw) return null;
-    window.sessionStorage.removeItem(AGENT_ESCALATION_PREFILL_KEY);
 
     const parsed = JSON.parse(raw) as Partial<AgentEscalationPrefill>;
     if (
@@ -44,18 +45,45 @@ export function consumeAgentEscalationPrefill(maxAgeMs = 15 * 60 * 1000): AgentE
     }
 
     if (Date.now() - parsed.createdAt > maxAgeMs) {
+      clearAgentEscalationPrefill();
       return null;
+    }
+
+    const consumedAt =
+      typeof (parsed as { consumedAt?: unknown }).consumedAt === "number"
+        ? ((parsed as { consumedAt?: number }).consumedAt as number)
+        : null;
+
+    if (consumedAt && Date.now() - consumedAt > PREFILL_REMOUNT_GRACE_MS) {
+      clearAgentEscalationPrefill();
+      return null;
+    }
+
+    if (!consumedAt) {
+      window.sessionStorage.setItem(
+        AGENT_ESCALATION_PREFILL_KEY,
+        JSON.stringify({
+          ...parsed,
+          consumedAt: Date.now(),
+        })
+      );
     }
 
     return parsed as AgentEscalationPrefill;
   } catch {
     if (raw !== null) {
-      try {
-        window.sessionStorage.removeItem(AGENT_ESCALATION_PREFILL_KEY);
-      } catch {
-        // Ignore.
-      }
+      clearAgentEscalationPrefill();
     }
     return null;
+  }
+}
+
+export function clearAgentEscalationPrefill() {
+  if (typeof window === "undefined") return;
+
+  try {
+    window.sessionStorage.removeItem(AGENT_ESCALATION_PREFILL_KEY);
+  } catch {
+    // Ignore storage failures.
   }
 }

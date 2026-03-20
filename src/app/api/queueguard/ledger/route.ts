@@ -24,7 +24,7 @@ export async function GET(req: Request) {
     }
 
     const limit = parseLimit(url.searchParams.get("limit"));
-    const ledger = getLedger({ action, limit });
+    const ledger = await getLedger({ action, limit });
     return NextResponse.json({ ok: true, ledger, count: ledger.length }, { status: 200 });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);

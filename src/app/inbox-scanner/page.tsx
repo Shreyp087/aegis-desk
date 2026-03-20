@@ -1,10 +1,9 @@
-import DesktopShell from "@/components/DesktopShell";
-import InboxScannerWorkspace from "@/components/inbox/InboxScannerWorkspace";
+import { redirect } from "next/navigation";
 
-export default function InboxScannerPage() {
-  return (
-    <DesktopShell>
-      <InboxScannerWorkspace />
-    </DesktopShell>
-  );
+import { getServerSession } from "@/lib/auth/session";
+
+export default async function InboxScannerPage() {
+  const session = await getServerSession();
+  if (!session) redirect("/sign-in");
+  redirect("/inbox");
 }

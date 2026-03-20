@@ -1,3 +1,5 @@
+import { EmptyState, StatusBadge } from "@/components/ui/AegisPrimitives";
+
 type ResearchEvent = {
   type?: string;
   message?: string;
@@ -9,34 +11,46 @@ type ResearchPanelProps = {
   expanded: boolean;
 };
 
+function toneForResearchType(type: string | undefined): "risk" | "caution" | "clear" | "info" | "muted" {
+  const normalized = (type || "").toLowerCase();
+  if (normalized.includes("redact")) return "caution";
+  if (normalized.includes("search") || normalized.includes("research")) return "info";
+  if (normalized.includes("evidence")) return "clear";
+  return "muted";
+}
+
 export default function ResearchPanel({ research, expanded }: ResearchPanelProps) {
   return (
-    <div className="h-full min-h-0 flex flex-col gap-3">
-      <div className="panel-note">Shows what was redacted and what was searched.</div>
+    <div className="flex h-full min-h-0 flex-col gap-3">
+      <div className="rounded-lg border border-aegis-border bg-aegis-elevated px-3 py-3 text-sm text-aegis-muted">
+        Review redacted queries, research events, and evidence payloads before you trust the final answer.
+      </div>
 
-      <div className={`min-h-0 flex-1 overflow-auto space-y-3 ${expanded ? 'max-h-none' : 'max-h-none md:max-h-96'}`}>
+      <div className={expanded ? "min-h-0 flex-1 overflow-y-auto" : "min-h-0 flex-1 overflow-y-auto lg:max-h-96"}>
         {research.length === 0 ? (
-          <div className="panel-empty text-sm italic">No research events yet.</div>
+          <EmptyState
+            className="min-h-56"
+            title="No research events yet"
+            description="Research activity will appear here after the agent executes the search steps."
+          />
         ) : (
-          research.map((e, idx) => (
-            <div
-              key={idx}
-              className="event-card p-4"
-            >
-              <div className="flex items-center justify-between gap-2">
-                <div className="text-sm text-[var(--text)]">
-                  <span className="font-semibold text-[var(--accent-cyan)]">{e.type}</span>{" "}
-                  <span className="text-[var(--muted)]">- {e.message}</span>
+          <div className="grid gap-3">
+            {research.map((event, index) => (
+              <div key={`${event.type || "research"}-${index}`} className="rounded-lg border border-aegis-border bg-aegis-elevated p-4">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <StatusBadge tone={toneForResearchType(event.type)}>{(event.type || "research").toUpperCase()}</StatusBadge>
+                  </div>
+                  <div className="mt-2 text-sm leading-relaxed text-aegis-text">{event.message || "Research event captured."}</div>
                 </div>
+                {event.data ? (
+                  <pre className="mt-3 whitespace-pre-wrap break-all rounded border border-aegis-border bg-aegis-base px-3 py-3 text-xs font-mono leading-relaxed text-aegis-muted">
+                    {JSON.stringify(event.data, null, 2)}
+                  </pre>
+                ) : null}
               </div>
-
-              {e.data ? (
-                <pre className="mt-3 panel-mono text-sm leading-relaxed whitespace-pre-wrap break-all inner-code p-3">
-                  {JSON.stringify(e.data, null, 2)}
-                </pre>
-              ) : null}
-            </div>
-          ))
+            ))}
+          </div>
         )}
       </div>
     </div>

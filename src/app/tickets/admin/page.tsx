@@ -5,9 +5,9 @@ import { redirect } from "next/navigation";
 
 export default async function TicketAdminPage() {
   const session = await getServerSession();
-  if (!session) redirect("/login/admin");
+  if (!session) redirect("/sign-in");
   if (session.role !== "admin") {
-    redirect("/tickets/user");
+    redirect("/inbox");
   }
 
   return (

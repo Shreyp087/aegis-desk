@@ -1,26 +1,29 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
+
+import PanelFrame from "@/components/PanelFrame";
+import { AegisButton, EmptyState, InlineError, MetricCard, StatusBadge } from "@/components/ui/AegisPrimitives";
+import { useAuth } from "@/context/AuthContext";
 import type { TicketDto, TicketStatus } from "@/lib/ticketing/types";
 
-type AdminProfile = {
-  id: string;
-  name: string;
-  email: string;
-  role: "admin";
-};
+function statusTone(status: TicketStatus): "risk" | "caution" | "clear" | "info" {
+  if (status === "resolved") return "clear";
+  if (status === "in_progress") return "info";
+  return "caution";
+}
 
-function statusBadge(status: TicketStatus): string {
-  if (status === "resolved") return "border-emerald-300/50 bg-emerald-500/10 text-emerald-200";
-  if (status === "in_progress") return "border-cyan-300/50 bg-cyan-500/10 text-cyan-100";
-  return "border-amber-300/50 bg-amber-500/10 text-amber-100";
+function priorityTone(priority: TicketDto["priority"]): "risk" | "caution" | "clear" {
+  if (priority === "high") return "risk";
+  if (priority === "medium") return "caution";
+  return "clear";
 }
 
 export function TicketAdminDesk() {
   const router = useRouter();
-  const [profile, setProfile] = useState<AdminProfile | null>(null);
+  const { user, loading: authLoading } = useAuth();
   const [tickets, setTickets] = useState<TicketDto[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -30,38 +33,11 @@ export function TicketAdminDesk() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [responseDraft, setResponseDraft] = useState("");
 
-  const selected = useMemo(
-    () => tickets.find((ticket) => ticket._id === selectedId) || null,
-    [tickets, selectedId]
-  );
+  const selected = useMemo(() => tickets.find((ticket) => ticket._id === selectedId) || null, [tickets, selectedId]);
 
   useEffect(() => {
     setResponseDraft(selected?.adminResponse || "");
   }, [selected?._id]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const loadProfile = useCallback(async () => {
-    const res = await fetch("/api/auth/me", { cache: "no-store" });
-    const json = (await res.json()) as {
-      ok?: boolean;
-      profile?: { id: string; name: string; email: string; role: "user" | "admin" };
-    };
-    if (!res.ok || !json.ok || !json.profile) {
-      router.replace("/login/admin");
-      return null;
-    }
-    if (json.profile.role !== "admin") {
-      router.replace("/tickets/user");
-      return null;
-    }
-    const adminProfile: AdminProfile = {
-      id: json.profile.id,
-      name: json.profile.name,
-      email: json.profile.email,
-      role: "admin",
-    };
-    setProfile(adminProfile);
-    return adminProfile;
-  }, [router]);
 
   const refreshTickets = useCallback(async () => {
     setLoading(true);
@@ -71,7 +47,7 @@ export function TicketAdminDesk() {
       const res = await fetch(`/api/tickets/all${query}`, { cache: "no-store" });
       const json = (await res.json()) as { ok?: boolean; error?: string; tickets?: TicketDto[] };
       if (res.status === 401 || res.status === 403) {
-        router.replace("/login/admin");
+        router.replace("/sign-in");
         return;
       }
       if (!res.ok || !json?.ok) {
@@ -89,23 +65,23 @@ export function TicketAdminDesk() {
   }, [router, selectedId, statusFilter]);
 
   useEffect(() => {
-    let mounted = true;
-    (async () => {
-      const admin = await loadProfile();
-      if (!mounted || !admin) return;
-      await refreshTickets();
-    })().catch(() => {});
-    return () => {
-      mounted = false;
-    };
-  }, [loadProfile, refreshTickets]);
+    if (!authLoading && !user) {
+      router.replace("/sign-in");
+    }
+  }, [authLoading, router, user]);
 
   useEffect(() => {
+    if (authLoading || !user || user.role !== "admin") return;
+    void refreshTickets();
+  }, [authLoading, refreshTickets, user]);
+
+  useEffect(() => {
+    if (authLoading || !user || user.role !== "admin") return;
     const id = window.setInterval(() => {
       void refreshTickets();
     }, 10000);
     return () => window.clearInterval(id);
-  }, [refreshTickets]);
+  }, [authLoading, refreshTickets, user]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -118,10 +94,22 @@ export function TicketAdminDesk() {
     });
   }, [tickets, search]);
 
-  async function logout() {
-    await fetch("/api/auth/logout", { method: "POST" });
-    router.replace("/login/admin");
-    router.refresh();
+  const summary = useMemo(
+    () => ({
+      total: tickets.length,
+      open: tickets.filter((ticket) => ticket.status === "open").length,
+      inProgress: tickets.filter((ticket) => ticket.status === "in_progress").length,
+      resolved: tickets.filter((ticket) => ticket.status === "resolved").length,
+    }),
+    [tickets]
+  );
+
+  if (authLoading || !user || user.role !== "admin") {
+    return (
+      <div className="flex min-h-screen items-center justify-center">
+        <div className="h-5 w-5 animate-spin rounded-full border-2 border-foreground/20 border-t-foreground/60" />
+      </div>
+    );
   }
 
   async function assignToSelf() {
@@ -183,139 +171,172 @@ export function TicketAdminDesk() {
   }
 
   return (
-    <div className="h-full min-h-0 flex flex-col gap-3">
-      <div className="surface-card p-4 flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <div className="text-base font-semibold text-slate-100">Admin Desk</div>
-          <div className="text-xs text-slate-300">
-            {profile ? `Signed in as ${profile.name} (${profile.email})` : "Verifying admin session..."}
+    <div className="flex min-h-0 flex-col gap-6">
+      <section className="rounded-3xl border border-foreground/8 bg-surface/90 p-6 shadow-sm md:p-8">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+          <div className="max-w-3xl min-w-0">
+            <div className="text-xs font-mono uppercase tracking-widest opacity-40">Admin Operations</div>
+            <h1 className="mt-3 text-2xl font-medium tracking-tight md:text-3xl">Ticket admin desk</h1>
+            <p className="mt-3 max-w-2xl text-base font-light leading-relaxed text-foreground/60">
+              {`Signed in as ${user.name} (${user.email})`}
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <StatusBadge tone="info">Role · admin</StatusBadge>
+            <AegisButton variant="secondary" onClick={() => void refreshTickets()}>
+              Refresh
+            </AegisButton>
           </div>
         </div>
-        <div className="flex gap-2">
-          <button
-            type="button"
-            onClick={() => void refreshTickets()}
-            className="secondary-ghost px-3 py-2 rounded-lg text-sm font-semibold"
-          >
-            Refresh
-          </button>
-          <button
-            type="button"
-            onClick={() => void logout()}
-            className="secondary-ghost px-3 py-2 rounded-lg text-sm font-semibold"
-          >
-            Logout
-          </button>
-        </div>
-      </div>
+      </section>
 
-      <div className="surface-card p-3 flex flex-wrap gap-2">
-        <input
-          className="field-input text-sm flex-1 min-w-[240px]"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder="Search by title, requester, assignee..."
-        />
-        <select
-          className="field-input text-sm w-[180px]"
-          value={statusFilter}
-          onChange={(e) => setStatusFilter(e.target.value as "all" | TicketStatus)}
+      <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <MetricCard label="Total" value={summary.total} sub="Tickets in the current queue." />
+        <MetricCard label="Open" value={summary.open} sub="Awaiting assignment or response." tone="caution" />
+        <MetricCard label="In Progress" value={summary.inProgress} sub="Active operator work." tone="info" />
+        <MetricCard label="Resolved" value={summary.resolved} sub="Closed incidents." tone="clear" />
+      </section>
+
+      <section className="rounded-3xl border border-foreground/8 bg-surface/90 p-5 shadow-sm">
+        <div className="flex flex-col gap-3 lg:flex-row">
+          <input
+            className="aegis-input flex-1 min-w-0"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Search title, requester, assignee, or status"
+          />
+          <select
+            className="aegis-select lg:w-52"
+            value={statusFilter}
+            onChange={(event) => setStatusFilter(event.target.value as "all" | TicketStatus)}
+          >
+            <option value="all">All statuses</option>
+            <option value="open">Open</option>
+            <option value="in_progress">In Progress</option>
+            <option value="resolved">Resolved</option>
+          </select>
+        </div>
+        {error ? <InlineError className="mt-3" message={error} /> : null}
+      </section>
+
+      <div className="grid min-h-0 gap-4 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)] xl:grid-cols-[minmax(0,0.88fr)_minmax(0,1.12fr)]">
+        <PanelFrame
+          title="Queue"
+          subtitle="Priority-driven ticket list"
+          status={<StatusBadge tone={loading ? "caution" : "muted"}>{loading ? "Loading" : `${filtered.length} visible`}</StatusBadge>}
+          className="min-h-[36rem]"
         >
-          <option value="all">All statuses</option>
-          <option value="open">Open</option>
-          <option value="in_progress">In Progress</option>
-          <option value="resolved">Resolved</option>
-        </select>
-      </div>
+          <div className="grid gap-2">
+            {filtered.map((ticket, index) => (
+              <button
+                key={ticket._id}
+                type="button"
+                onClick={() => setSelectedId(ticket._id)}
+                style={{ transitionDelay: `${index * 30}ms` }}
+                className={[
+                  "flex w-full items-start gap-3 rounded-2xl border border-transparent border-l-2 bg-background/70 p-4 text-left transition-all duration-200 ease-out hover:-translate-y-0.5 hover:border-foreground/10 hover:bg-surface",
+                  selectedId === ticket._id ? "border-l-accent bg-surface shadow-sm" : "",
+                  ticket.priority === "high"
+                    ? "border-l-signal-risk"
+                    : ticket.priority === "medium"
+                      ? "border-l-signal-caution"
+                      : "border-l-signal-info",
+                ].join(" ")}
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="text-xs font-mono uppercase tracking-widest opacity-40">{ticket._id}</div>
+                  <div className="mt-2 truncate text-sm font-medium text-foreground">{ticket.title}</div>
+                  <div className="mt-1 truncate text-sm text-foreground/60">{ticket.createdBy.email}</div>
+                </div>
+                <div className="flex shrink-0 flex-col items-end gap-2">
+                  <StatusBadge tone={statusTone(ticket.status)}>{ticket.status.replace("_", " ")}</StatusBadge>
+                  <StatusBadge tone={priorityTone(ticket.priority)}>{ticket.priority}</StatusBadge>
+                </div>
+              </button>
+            ))}
+            {!loading && filtered.length === 0 ? (
+              <EmptyState
+                className="min-h-60"
+                title="No matching tickets"
+                description="Adjust the search or status filter to bring items back into the queue."
+              />
+            ) : null}
+          </div>
+        </PanelFrame>
 
-      {loading ? <div className="text-sm text-slate-300">Loading admin desk...</div> : null}
-      {error ? <div className="text-sm text-rose-300">{error}</div> : null}
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-3 min-h-0">
-        <div className="surface-card min-h-0 max-h-[420px] overflow-auto">
-          {filtered.map((ticket) => (
-            <button
-              key={ticket._id}
-              type="button"
-              onClick={() => setSelectedId(ticket._id)}
-              className={`w-full text-left p-3 border-b border-slate-500/25 ${
-                selectedId === ticket._id ? "bg-cyan-400/15" : "hover:bg-cyan-400/10"
-              }`}
-            >
-              <div className="text-sm font-semibold text-slate-100 truncate">{ticket.title}</div>
-              <div className="text-xs text-slate-300 truncate">{ticket.createdBy.email}</div>
-              <div className="mt-2 flex items-center justify-between gap-2">
-                <span className={`inline-flex px-2 py-1 rounded-full text-xs border ${statusBadge(ticket.status)}`}>
-                  {ticket.status}
-                </span>
-                <span className="text-xs text-slate-300 uppercase">{ticket.priority}</span>
-              </div>
-            </button>
-          ))}
-          {!loading && filtered.length === 0 ? <div className="p-3 text-sm text-slate-300">No matching tickets.</div> : null}
-        </div>
-
-        <div className="surface-card p-3 lg:col-span-2">
+        <PanelFrame
+          title="Detail"
+          subtitle="Assignment, response, and resolution"
+          status={selected ? <StatusBadge tone={statusTone(selected.status)}>{selected.status.replace("_", " ")}</StatusBadge> : <StatusBadge tone="muted">No ticket selected</StatusBadge>}
+          className="min-h-[36rem]"
+        >
           {!selected ? (
-            <div className="text-sm text-slate-300">Select a ticket to manage.</div>
+            <EmptyState
+              className="min-h-96"
+              title="Select a ticket"
+              description="Choose a queue item to assign ownership, write a response, or resolve it."
+            />
           ) : (
-            <div className="flex flex-col gap-3">
-              <div className="text-sm text-slate-300">
-                <span className="font-semibold text-slate-100">{selected.title}</span> •{" "}
-                <span className="panel-mono">{selected._id}</span>
-              </div>
-              <div className="text-xs text-slate-300">
-                Requester: <b>{selected.createdBy.name || selected.createdBy.email}</b> ({selected.createdBy.email})
-              </div>
-              <div className="text-xs text-slate-300">
-                Assigned: <b>{selected.assignedAdmin?.name || "Unassigned"}</b>
-              </div>
-              <div className="text-xs text-slate-200 whitespace-pre-wrap surface-subcard p-2">
-                {selected.description}
+            <div className="grid gap-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-xs font-mono uppercase tracking-widest opacity-40">Active Ticket</div>
+                  <h2 className="mt-3 text-xl font-medium tracking-tight">{selected.title}</h2>
+                  <p className="mt-2 text-sm font-light leading-relaxed text-foreground/60">
+                    Requester: {selected.createdBy.name || selected.createdBy.email} ({selected.createdBy.email})
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <StatusBadge tone={statusTone(selected.status)}>{selected.status.replace("_", " ")}</StatusBadge>
+                  <StatusBadge tone={priorityTone(selected.priority)}>{selected.priority}</StatusBadge>
+                </div>
               </div>
 
-              <label className="text-xs text-slate-300">
-                Admin response
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="rounded-2xl border border-foreground/8 bg-background/70 p-4">
+                  <div className="text-xs font-mono uppercase tracking-widest opacity-40">Description</div>
+                  <div className="mt-3 whitespace-pre-wrap text-sm font-light leading-relaxed text-foreground/80">
+                    {selected.description}
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-foreground/8 bg-background/70 p-4">
+                  <div className="text-xs font-mono uppercase tracking-widest opacity-40">Assignment</div>
+                  <div className="mt-3 grid gap-2 text-sm font-light leading-relaxed text-foreground/60">
+                    <div>Assigned: {selected.assignedAdmin?.name || selected.assignedAdmin?.email || "Unassigned"}</div>
+                    <div>Created: {new Date(selected.createdAt).toLocaleString()}</div>
+                    <div>Updated: {new Date(selected.updatedAt).toLocaleString()}</div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-foreground/8 bg-background/70 p-4">
+                <div className="text-xs font-mono uppercase tracking-widest opacity-40">Admin Response</div>
                 <textarea
-                  className="field-input text-sm mt-1 min-h-[140px] resize-y"
+                  className="aegis-input aegis-textarea mt-3 min-h-44"
                   value={responseDraft}
-                  onChange={(e) => setResponseDraft(e.target.value)}
-                  placeholder="Add troubleshooting steps, updates, or resolution notes..."
+                  onChange={(event) => setResponseDraft(event.target.value)}
+                  placeholder="Add troubleshooting steps, updates, or resolution notes."
                 />
-              </label>
+              </div>
 
-              <div className="flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => void assignToSelf()}
-                  disabled={saving}
-                  className="secondary-ghost px-3 py-2 rounded-lg text-sm font-semibold disabled:opacity-60"
-                >
+              <div className="flex flex-wrap gap-2">
+                <AegisButton variant="secondary" onClick={() => void assignToSelf()} disabled={saving}>
                   Assign to Me
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void submitResponse()}
-                  disabled={saving || responseDraft.trim().length === 0}
-                  className="primary-cta px-3 py-2 rounded-lg text-sm font-semibold disabled:opacity-60"
-                >
-                  {saving ? "Saving..." : "Send Response"}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void markResolved()}
-                  disabled={saving}
-                  className="secondary-ghost px-3 py-2 rounded-lg text-sm font-semibold disabled:opacity-60"
-                >
+                </AegisButton>
+                <AegisButton onClick={() => void submitResponse()} disabled={saving || responseDraft.trim().length === 0}>
+                  {saving ? "Saving" : "Send Response"}
+                </AegisButton>
+                <AegisButton variant="ghost" onClick={() => void markResolved()} disabled={saving}>
                   Mark Resolved
-                </button>
-                <Link href={`/tickets/${selected._id}`} className="secondary-ghost px-3 py-2 rounded-lg text-sm font-semibold no-underline">
-                  Open Ticket Detail
+                </AegisButton>
+                <Link href={`/tickets/${selected._id}`} className="no-underline">
+                  <AegisButton variant="ghost">Open Ticket Detail</AegisButton>
                 </Link>
               </div>
             </div>
           )}
-        </div>
+        </PanelFrame>
       </div>
     </div>
   );

@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import { MetricCard, StatusBadge } from "@/components/ui/AegisPrimitives";
 import type {
   QueueDecision,
   QueueDecisionAction,
@@ -103,7 +105,7 @@ async function parseJson<T>(res: Response): Promise<T | ApiError> {
 }
 
 export function QueueGuardDashboard() {
-  const [sessionId, setSessionId] = useState(() => makeSessionId());
+  const [sessionId] = useState(() => makeSessionId());
   const [persona, setPersona] = useState<Persona>("normal_fan");
   const [decision, setDecision] = useState<QueueDecision | null>(null);
   const [challenge, setChallenge] = useState<StepUpChallenge | undefined>(undefined);
@@ -124,16 +126,6 @@ export function QueueGuardDashboard() {
     sequence: [] as QueueEventType[],
   });
   const holdEndingRef = useRef(false);
-
-  const resetSession = useCallback(() => {
-    setSessionId(makeSessionId());
-    setDecision(null);
-    setChallenge(undefined);
-    setModalOpen(false);
-    setLatencyMs(0);
-    setStatusNote("Started a fresh ephemeral session.");
-    simulatorRef.current = { actionCount: 0, lastEventAt: 0, sequence: [] };
-  }, []);
 
   const refreshLedger = useCallback(async () => {
     const actionQuery = ledgerFilter === "ALL" ? "" : `&action=${ledgerFilter}`;
@@ -294,9 +286,7 @@ export function QueueGuardDashboard() {
   const riskBarWidth = decision ? `${decision.risk}%` : "0%";
   const topFactorsText = useMemo(() => {
     if (!decision || decision.topFactors.length === 0) return "No factors yet";
-    return decision.topFactors
-      .map((factor) => `${factor.label} (${factor.contribution.toFixed(1)})`)
-      .join(" • ");
+    return decision.topFactors.map((factor) => `${factor.label} (${factor.contribution.toFixed(1)})`).join(" • ");
   }, [decision]);
 
   const exportLedger = useCallback(() => {
@@ -310,117 +300,123 @@ export function QueueGuardDashboard() {
   }, [ledger]);
 
   return (
-    <div className="grid gap-3 min-h-0">
-      <div className="surface-card p-4 flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <div className="text-base font-semibold text-slate-100">Aegis QueueGuard Simulator</div>
-          <div className="text-xs text-slate-300">
-            Session <span className="panel-mono">{sessionId}</span> (ephemeral, no raw PII stored)
+    <div className="grid min-h-0 gap-4">
+      <section className="rounded-3xl border border-foreground/8 bg-surface/90 p-6 shadow-sm md:p-8">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+          <div className="max-w-3xl min-w-0">
+            <div className="text-xs font-mono uppercase tracking-widest opacity-40">QueueGuard Dashboard</div>
+            <h1 className="mt-3 text-2xl font-medium tracking-tight md:text-3xl">Risk-based queue verification</h1>
+            <p className="mt-3 max-w-2xl text-base font-light leading-relaxed text-foreground/60">
+              Accessibility-first challenge flow for queue actions, with live scoring, step-up verification, and an auditable ledger.
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <StatusBadge tone="info">Session {sessionId.slice(-6)}</StatusBadge>
+            <StatusBadge tone={requestBusy ? "caution" : "clear"}>{requestBusy ? "Processing" : "Ready"}</StatusBadge>
           </div>
         </div>
-        <div className="flex flex-wrap gap-2">
-          <button
-            type="button"
-            onClick={resetSession}
-            className="secondary-ghost px-3 py-2 rounded-lg text-sm font-semibold"
-          >
-            New Session
-          </button>
-          {challenge ? (
-            <button
-              type="button"
-              onClick={() => setModalOpen(true)}
-              className="primary-cta px-3 py-2 rounded-lg text-sm font-semibold"
-            >
-              Resume Step-Up
-            </button>
-          ) : null}
-        </div>
+      </section>
+
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <MetricCard label="Queue Depth" value={ledger.length} sub="Ledger entries" />
+        <MetricCard label="Risk Score" value={decision ? decision.risk : "--"} sub="Latest score response" tone={decision && decision.risk >= 75 ? "risk" : decision && decision.risk >= 40 ? "caution" : "clear"} />
+        <MetricCard label="Latency" value={latencyMs ? `${latencyMs}ms` : "--"} sub="Most recent API round-trip" tone="info" />
+        <MetricCard label="Step-up" value={challenge ? `L${challenge.level}` : "None"} sub="Current challenge state" tone={challenge ? "caution" : "clear"} />
       </div>
 
-      <div className="grid grid-cols-1 xl:grid-cols-[1.5fr_1fr] gap-3 min-h-0">
-        <section className="glass-panel p-4 flex flex-col gap-3">
-          <div className="flex items-center justify-between gap-2 flex-wrap">
-            <div>
-              <div className="text-sm font-semibold text-slate-100">Queue Simulator</div>
-              <div className="text-xs text-slate-300">Select persona, then trigger queue actions.</div>
+      <div className="grid min-h-0 gap-4 xl:grid-cols-[minmax(0,1.08fr)_minmax(0,0.92fr)]">
+        <section className="flex min-h-0 flex-col rounded-2xl border border-foreground/8 bg-surface p-5 shadow-sm">
+          <div className="flex flex-wrap items-start justify-between gap-3 border-b border-foreground/6 pb-4">
+            <div className="min-w-0">
+              <h2 className="text-sm font-medium tracking-tight text-foreground">Simulator</h2>
+              <p className="mt-1 text-sm font-light leading-relaxed text-foreground/60">
+                Select a persona, then trigger queue actions.
+              </p>
             </div>
-            <div className="text-xs text-slate-400">Latency: {latencyMs}ms</div>
+            <div className="font-mono text-xs text-foreground/50">Latency: {latencyMs}ms</div>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-            {(Object.keys(PERSONA_LABELS) as Persona[]).map((key) => (
-              <button
-                key={key}
-                type="button"
-                onClick={() => setPersona(key)}
-                className={`px-3 py-2 rounded-lg text-sm border ${
-                  persona === key
-                    ? "border-cyan-300/70 bg-cyan-500/20 text-cyan-100"
-                    : "border-[rgba(118,157,199,0.33)] bg-[rgba(11,20,34,0.5)] text-slate-200"
-                }`}
-              >
-                {PERSONA_LABELS[key]}
-              </button>
-            ))}
-          </div>
+          <div className="mt-4 grid min-h-0 gap-4">
+            <div className="grid gap-2">
+              <div className="text-xs font-mono uppercase tracking-widest opacity-40">Persona</div>
+              <div className="grid gap-2 sm:grid-cols-3">
+                {(Object.keys(PERSONA_LABELS) as Persona[]).map((key) => (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => setPersona(key)}
+                    className={[
+                      "rounded-full border px-3 py-2 text-sm transition-all duration-200 ease-out",
+                      persona === key
+                        ? "border-accent bg-accent text-background"
+                        : "border-foreground/8 bg-background/70 text-foreground/60 hover:-translate-y-0.5 hover:border-foreground/15 hover:text-foreground",
+                    ].join(" ")}
+                  >
+                    {PERSONA_LABELS[key]}
+                  </button>
+                ))}
+              </div>
+            </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-            {(Object.keys(ACTION_LABELS) as QueueEventType[]).map((eventType) => (
-              <button
-                key={eventType}
-                type="button"
-                onClick={() => void runAction(eventType)}
-                disabled={requestBusy}
-                className="primary-cta px-3 py-2 rounded-lg text-sm font-semibold disabled:opacity-50"
-              >
-                {ACTION_LABELS[eventType]}
-              </button>
-            ))}
-          </div>
+            <div className="grid gap-2">
+              <div className="text-xs font-mono uppercase tracking-widest opacity-40">Actions</div>
+              <div className="grid gap-2 sm:grid-cols-3">
+                {(Object.keys(ACTION_LABELS) as QueueEventType[]).map((eventType) => (
+                  <button
+                    key={eventType}
+                    type="button"
+                    onClick={() => void runAction(eventType)}
+                    disabled={requestBusy}
+                    className="rounded-full bg-accent px-3 py-2 text-sm font-medium text-background transition-all duration-200 ease-out hover:-translate-y-0.5 hover:opacity-90 disabled:pointer-events-none disabled:opacity-50"
+                  >
+                    {ACTION_LABELS[eventType]}
+                  </button>
+                ))}
+              </div>
+            </div>
 
-          <div className="surface-subcard p-3 space-y-2">
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-xs text-slate-300">Decision</span>
-              <span
-                className={`text-xs px-2 py-1 rounded-full border font-semibold ${
-                  decision ? badgeClass(decision.action) : "text-slate-200 border-slate-500/30 bg-slate-700/20"
-                }`}
-              >
-                {decision?.action || "IDLE"}
-              </span>
-              <span className="text-xs text-slate-300">Step-up L{decision?.stepUpLevel ?? 0}</span>
+            <div className="grid gap-2">
+              <div className="text-xs font-mono uppercase tracking-widest opacity-40">Quick view</div>
+              <div className="rounded-2xl border border-foreground/8 bg-background/70 p-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs text-foreground/60">Decision</span>
+                  <span className={`rounded-full border px-2 py-1 text-xs font-medium ${decision ? badgeClass(decision.action) : "border-foreground/8 bg-surface text-foreground/50"}`}>
+                    {decision?.action || "IDLE"}
+                  </span>
+                  <span className="text-xs text-foreground/60">Step-up L{decision?.stepUpLevel ?? 0}</span>
+                </div>
+                <div className="mt-3 text-xs text-foreground/60">
+                  Risk: <span className="font-medium text-foreground">{decision?.risk ?? 0}</span>/100
+                </div>
+                <div className="mt-3 h-2 overflow-hidden rounded-full bg-foreground/10">
+                  <div className="h-full bg-gradient-to-r from-cyan-400 via-amber-400 to-rose-400 transition-[width] duration-300 ease-out" style={{ width: riskBarWidth }} />
+                </div>
+                <div className="mt-3 text-xs text-foreground/60">Top factors: {topFactorsText}</div>
+                <div className="mt-2 text-xs text-foreground/60">
+                  Friction budget:{" "}
+                  {decision
+                    ? `${decision.frictionBudget.used}/${decision.frictionBudget.cap} used (${decision.frictionBudget.remaining} remaining)`
+                    : "0/100 used"}
+                </div>
+                <div className="mt-2 font-mono text-xs text-foreground/50">Policy: {decision?.policyVersion || "queueguard-policy-v1"}</div>
+              </div>
             </div>
-            <div className="text-xs text-slate-300">
-              Risk: <b>{decision?.risk ?? 0}</b>/100
-            </div>
-            <div className="h-2 rounded-full bg-slate-900/70 overflow-hidden">
-              <div
-                className="h-full bg-gradient-to-r from-cyan-300 via-amber-300 to-rose-300"
-                style={{ width: riskBarWidth }}
-              />
-            </div>
-            <div className="text-xs text-slate-300">Top factors: {topFactorsText}</div>
-            <div className="text-xs text-slate-300">
-              Friction budget:{" "}
-              {decision
-                ? `${decision.frictionBudget.used}/${decision.frictionBudget.cap} used (${decision.frictionBudget.remaining} remaining)`
-                : "0/100 used"}
-            </div>
-            <div className="text-xs text-slate-400">Policy: {decision?.policyVersion || "queueguard-policy-v1"}</div>
-          </div>
 
-          <div className="text-xs text-slate-300">{statusNote}</div>
+            <div className="text-xs font-light text-foreground/60">{statusNote}</div>
+          </div>
         </section>
 
-        <section className="glass-panel p-4 min-h-0 flex flex-col gap-3">
-          <div className="flex items-center justify-between gap-2 flex-wrap">
-            <div className="text-sm font-semibold text-slate-100">Trust Ledger</div>
-            <div className="flex items-center gap-2">
+        <section className="flex min-h-0 flex-col rounded-2xl border border-foreground/8 bg-surface p-5 shadow-sm">
+          <div className="flex flex-wrap items-start justify-between gap-3 border-b border-foreground/6 pb-4">
+            <div className="min-w-0">
+              <h2 className="text-sm font-medium tracking-tight text-foreground">Trust Ledger</h2>
+              <p className="mt-1 text-sm font-light leading-relaxed text-foreground/60">Append-only operational log with hash chain metadata.</p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
               <select
                 value={ledgerFilter}
                 onChange={(e) => setLedgerFilter(e.target.value as "ALL" | QueueDecisionAction)}
-                className="field-input !py-1.5 !px-2 !text-xs w-[120px]"
+                className="w-full min-w-0 rounded-full border border-foreground/8 bg-background/70 px-3 py-2 text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-accent/50 sm:w-28"
                 aria-label="Filter ledger by decision action"
               >
                 <option value="ALL">All</option>
@@ -432,61 +428,60 @@ export function QueueGuardDashboard() {
               <button
                 type="button"
                 onClick={exportLedger}
-                className="secondary-ghost px-3 py-1.5 rounded-lg text-xs font-semibold"
+                className="rounded-full border border-foreground/8 bg-background/70 px-3 py-2 text-xs font-medium text-foreground/60 transition-all duration-200 ease-out hover:-translate-y-0.5 hover:border-foreground/15 hover:text-foreground"
               >
                 Export JSON
               </button>
             </div>
           </div>
 
-          <div className="scroll-surface p-2 max-h-[520px] overflow-auto space-y-2">
-            {ledger.slice(0, 80).map((entry) => (
-              <div key={entry.id} className="event-card p-2 text-xs">
+          <div className="mt-4 flex-1 min-h-0 space-y-2 overflow-y-auto">
+            {ledger.slice(0, 80).map((entry, i) => (
+              <div
+                key={entry.id}
+                style={{ transitionDelay: `${i * 30}ms` }}
+                className="rounded-2xl border border-foreground/8 bg-background/70 p-3 text-xs transition-all duration-200 ease-out"
+              >
                 <div className="flex items-center justify-between gap-2">
-                  <span className="text-slate-100">{formatTime(entry.ts)}</span>
-                  <span className={`px-2 py-0.5 rounded-full border ${badgeClass(entry.decisionAction)}`}>
-                    {entry.decisionAction}
-                  </span>
+                  <span className="font-mono text-foreground/60">{formatTime(entry.ts)}</span>
+                  <span className={`rounded-full border px-2 py-0.5 ${badgeClass(entry.decisionAction)}`}>{entry.decisionAction}</span>
                 </div>
-                <div className="text-slate-300 mt-1">
-                  event={entry.eventType} • risk={entry.risk} • stepUp=L{entry.stepUpLevel} • outcome=
-                  {entry.stepUpOutcome}
+                <div className="mt-1 text-foreground/60">
+                  event={entry.eventType} · risk={entry.risk} · stepUp=L{entry.stepUpLevel} · outcome={entry.stepUpOutcome}
                 </div>
-                <div className="text-slate-400 mt-1">
-                  factors={entry.topFactorKeys.join(", ")} • latency={entry.latencyMs}ms
+                <div className="mt-1 text-foreground/50">
+                  factors={entry.topFactorKeys.join(", ")} · latency={entry.latencyMs}ms
                 </div>
-                <div className="text-slate-500 mt-1 panel-mono break-all">
+                <div className="mt-1 break-all font-mono text-foreground/50">
                   prev={entry.prevHash.slice(0, 16)}... hash={entry.entryHash.slice(0, 16)}...
                 </div>
               </div>
             ))}
-            {ledger.length === 0 ? <div className="text-xs text-slate-400">No ledger events yet.</div> : null}
+            {ledger.length === 0 ? <div className="text-xs text-foreground/50">No ledger events yet.</div> : null}
           </div>
         </section>
       </div>
 
       {modalOpen && challenge ? (
-        <div className="fixed inset-0 z-[120] bg-slate-950/70 flex items-center justify-center p-3">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
           <div
             role="dialog"
             aria-modal="true"
             aria-labelledby="queueguard-stepup-title"
-            className="surface-card w-full max-w-lg p-4 space-y-3"
+            className="w-full max-w-lg space-y-3 rounded-3xl border border-foreground/8 bg-surface p-5 shadow-2xl"
           >
-            <div>
-              <div id="queueguard-stepup-title" className="text-base font-semibold text-slate-100">
+            <div className="border-b border-foreground/6 pb-3">
+              <div id="queueguard-stepup-title" className="text-sm font-medium tracking-tight text-foreground">
                 Step-Up Verification (Level {challenge.level})
               </div>
-              <div className="text-xs text-slate-300">
+              <div className="mt-1 text-xs font-light text-foreground/60">
                 Accessibility-first challenge. No image CAPTCHA. Keyboard-only flow supported.
               </div>
             </div>
 
             {challenge.level === 1 ? (
               <div className="space-y-3">
-                <div className="text-xs text-slate-300">
-                  Hold confirm for 2 seconds. Release to submit verification.
-                </div>
+                <div className="text-xs text-foreground/60">Hold confirm for 2 seconds. Release to submit verification.</div>
                 <button
                   type="button"
                   onMouseDown={() => startHold(2000)}
@@ -506,24 +501,19 @@ export function QueueGuardDashboard() {
                       void endHold();
                     }
                   }}
-                  className="w-full primary-cta px-4 py-3 rounded-lg text-sm font-semibold"
+                  className="inline-flex w-full items-center justify-center gap-2 rounded-full bg-accent px-4 py-3 text-sm font-medium text-background transition-all duration-200 ease-out hover:-translate-y-0.5 hover:opacity-90"
                 >
                   Hold to Confirm
                 </button>
-                <div className="h-2 rounded-full bg-slate-900/70 overflow-hidden">
-                  <div
-                    className="h-full bg-gradient-to-r from-cyan-300 to-emerald-300"
-                    style={{ width: `${Math.round(holdProgress * 100)}%` }}
-                  />
+                <div className="h-2 overflow-hidden rounded-full bg-foreground/10">
+                  <div className="h-full bg-gradient-to-r from-cyan-400 to-emerald-400 transition-[width] duration-75 ease-linear" style={{ width: `${Math.round(holdProgress * 100)}%` }} />
                 </div>
               </div>
             ) : (
               <div className="space-y-3">
-                <div className="text-xs text-slate-300">
-                  Enter OTP or use hold fallback (3 seconds) for accessibility.
-                </div>
-                <div className="surface-subcard p-3 text-xs text-slate-200">
-                  Demo OTP: <span className="panel-mono text-cyan-200">{challenge.otpForDemo || "------"}</span>
+                <div className="text-xs text-foreground/60">Enter OTP or use hold fallback (3 seconds) for accessibility.</div>
+                <div className="rounded-2xl border border-foreground/8 bg-background/70 p-3 text-xs text-foreground">
+                  Demo OTP: <span className="font-mono text-cyan-300">{challenge.otpForDemo || "------"}</span>
                 </div>
                 <div className="flex gap-2">
                   <input
@@ -531,14 +521,14 @@ export function QueueGuardDashboard() {
                     value={otpInput}
                     onChange={(e) => setOtpInput(e.target.value)}
                     placeholder="Enter OTP"
-                    className="field-input !py-2 !px-3"
+                    className="w-full rounded-full border border-foreground/8 bg-background/70 px-3 py-2 text-sm text-foreground placeholder:text-foreground/40 focus:outline-none focus:ring-2 focus:ring-accent/50"
                     inputMode="numeric"
                     aria-label="One time passcode"
                   />
                   <button
                     type="button"
                     onClick={() => void verifyChallenge({ method: "otp", otp: otpInput.trim() })}
-                    className="primary-cta px-3 py-2 rounded-lg text-sm font-semibold whitespace-nowrap"
+                    className="inline-flex shrink-0 items-center justify-center gap-2 rounded-full bg-accent px-3 py-2 text-sm font-medium text-background transition-all duration-200 ease-out hover:-translate-y-0.5 hover:opacity-90 disabled:pointer-events-none disabled:opacity-50"
                     disabled={!otpInput.trim()}
                   >
                     Verify OTP
@@ -563,15 +553,12 @@ export function QueueGuardDashboard() {
                       void endHold();
                     }
                   }}
-                  className="w-full secondary-ghost px-4 py-2.5 rounded-lg text-sm font-semibold"
+                  className="inline-flex w-full items-center justify-center gap-2 rounded-full border border-foreground/8 bg-background/70 px-4 py-2.5 text-sm font-medium text-foreground/60 transition-all duration-200 ease-out hover:-translate-y-0.5 hover:border-foreground/15 hover:text-foreground"
                 >
                   Hold Fallback (3s)
                 </button>
-                <div className="h-2 rounded-full bg-slate-900/70 overflow-hidden">
-                  <div
-                    className="h-full bg-gradient-to-r from-amber-300 to-cyan-300"
-                    style={{ width: `${Math.round(holdProgress * 100)}%` }}
-                  />
+                <div className="h-2 overflow-hidden rounded-full bg-foreground/10">
+                  <div className="h-full bg-gradient-to-r from-amber-400 to-cyan-400 transition-[width] duration-75 ease-linear" style={{ width: `${Math.round(holdProgress * 100)}%` }} />
                 </div>
               </div>
             )}
@@ -583,7 +570,7 @@ export function QueueGuardDashboard() {
                   setModalOpen(false);
                   setStatusNote("Step-up canceled by user.");
                 }}
-                className="secondary-ghost px-3 py-2 rounded-lg text-sm font-semibold"
+                className="inline-flex items-center justify-center gap-2 rounded-full border border-foreground/8 bg-background/70 px-3 py-2 text-sm font-medium text-foreground/60 transition-all duration-200 ease-out hover:-translate-y-0.5 hover:border-foreground/15 hover:text-foreground"
               >
                 Cancel
               </button>

@@ -8,8 +8,13 @@ import OutputPanel from "@/components/OutputPanel";
 import PanelFrame from "@/components/PanelFrame";
 import PlanPanel from "@/components/PlanPanel";
 import ResearchPanel from "@/components/ResearchPanel";
-import { consumeAgentEscalationPrefill } from "@/lib/agent/prefill";
+import { AegisButton, MetricCard, ProcessingBadge, StatusBadge } from "@/components/ui/AegisPrimitives";
+import { clearAgentEscalationPrefill, readAgentEscalationPrefill } from "@/lib/agent/prefill";
 import { OFFLINE_MODE_TEMPLATE_CONFIG } from "@/lib/offline";
+
+function cn(...values: Array<string | false | null | undefined>) {
+  return values.filter(Boolean).join(" ");
+}
 
 const COMMAND_TEMPLATES = [
   {
@@ -50,18 +55,17 @@ export default function AgentWorkspace() {
   const [docText, setDocText] = useState("");
   const [command, setCommand] = useState(DEFAULT_COMMAND);
   const [plan, setPlan] = useState<Record<string, unknown> | null>(null);
-
   const [stream, setStream] = useState<string>("");
   const [ledger, setLedger] = useState<Array<Record<string, unknown>>>([]);
   const [research, setResearch] = useState<Array<Record<string, unknown>>>([]);
   const [outputs, setOutputs] = useState<unknown>(null);
   const [linkupDepth, setLinkupDepth] = useState<LinkupDepth>("standard");
-
   const [expandedPlan, setExpandedPlan] = useState(false);
   const [expandedLedger, setExpandedLedger] = useState(false);
   const [expandedResearch, setExpandedResearch] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   const [prefillNotice, setPrefillNotice] = useState<string | null>(null);
+  const [isReady, setIsReady] = useState(false);
 
   const canRunAgent = emailText.trim().length > 0 && command.trim().length > 0;
   const planStepCount = useMemo(() => {
@@ -72,8 +76,7 @@ export default function AgentWorkspace() {
 
   const readinessLabel = canRunAgent ? "Ready" : "Needs Input";
   const inputWordCount = useMemo(() => countWords(emailText) + countWords(docText), [emailText, docText]);
-  const offlinePublicState =
-    process.env.NEXT_PUBLIC_OFFLINE_MODE_STATE || OFFLINE_MODE_TEMPLATE_CONFIG.state;
+  const offlinePublicState = process.env.NEXT_PUBLIC_OFFLINE_MODE_STATE || OFFLINE_MODE_TEMPLATE_CONFIG.state;
   const offlinePublicEnabled = process.env.NEXT_PUBLIC_OFFLINE_MODE === "true";
   const offlinePublicEnforced = offlinePublicEnabled && offlinePublicState === "enforced";
 
@@ -156,12 +159,19 @@ export default function AgentWorkspace() {
   }, [canRunAgent, command, docText, emailText, isRunning, linkupDepth, offlinePublicEnforced]);
 
   useEffect(() => {
-    const prefill = consumeAgentEscalationPrefill();
-    if (!prefill) return;
+    const prefill = readAgentEscalationPrefill();
+    if (!prefill) return undefined;
 
     if (prefill.rawEmail) setEmailText(prefill.rawEmail);
     if (prefill.command) setCommand(prefill.command);
     setPrefillNotice("Loaded email context from Inbox Scanner.");
+
+    // Clear after the hydrated mount so development remounts do not lose the prefill.
+    const timeoutId = window.setTimeout(() => {
+      clearAgentEscalationPrefill();
+    }, 250);
+
+    return () => window.clearTimeout(timeoutId);
   }, []);
 
   useEffect(() => {
@@ -195,243 +205,228 @@ export default function AgentWorkspace() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [runAgent]);
 
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => setIsReady(true));
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+
   return (
-    <>
-      <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3 mb-4">
-        <div className="flex w-full lg:w-auto items-center gap-2 flex-wrap">
-          <span className="subtle-pill px-3 py-2 rounded-full text-xs text-[var(--muted)]">
-            Agent Desk Workspace
-          </span>
-          <span className="subtle-pill px-3 py-2 rounded-full text-xs text-[var(--muted)]">
-            Offline Mode: {offlinePublicState} ({offlinePublicEnabled ? "active" : "inactive"})
-          </span>
-        </div>
-
-        <div className="text-xs sm:text-sm text-[var(--muted)] subtle-pill px-4 py-2 rounded-full w-full lg:w-auto">
-          Shortcut: Ctrl/Cmd + Enter to run.
-        </div>
-      </div>
-
-      {prefillNotice ? (
-        <div className="surface-card p-3 mb-3 flex flex-wrap items-center justify-between gap-2">
-          <div className="text-sm text-slate-200">{prefillNotice}</div>
-          <button
-            type="button"
-            onClick={() => setPrefillNotice(null)}
-            className="secondary-ghost px-3 py-1.5 rounded-lg text-sm"
-          >
-            Dismiss
-          </button>
-        </div>
-      ) : null}
-
-      <div className="dashboard-metric-grid mb-3">
-        <div className="metric-card">
-          <div className="metric-label">Workspace</div>
-          <div className="metric-value">{readinessLabel}</div>
-          <div className="metric-hint">{canRunAgent ? "Email and command are set." : "Add email and command."}</div>
-        </div>
-        <div className="metric-card">
-          <div className="metric-label">Input Volume</div>
-          <div className="metric-value">{inputWordCount}</div>
-          <div className="metric-hint">Words across email + document.</div>
-        </div>
-        <div className="metric-card">
-          <div className="metric-label">Plan / Events</div>
-          <div className="metric-value">{planStepCount} steps</div>
-          <div className="metric-hint">
-            {ledger.length} ledger | {research.length} research
+    <div className="mx-auto flex min-h-0 w-full max-w-7xl flex-col gap-6 px-4 py-6 md:px-8 md:py-8">
+      <section
+        id="agent-brief"
+        className={cn(
+          "grid gap-6 rounded-3xl border border-foreground/8 bg-surface/90 px-6 py-6 backdrop-blur-sm transition-all duration-300 md:px-8 md:py-8",
+          isReady ? "translate-y-0 opacity-100" : "translate-y-3 opacity-0"
+        )}
+      >
+        <div className="flex flex-col gap-6 xl:flex-row xl:items-end xl:justify-between">
+          <div className="max-w-4xl">
+            <p className="text-xs font-mono uppercase tracking-[0.2em] text-foreground/40">
+              Reasoning Cockpit
+            </p>
+            <h1 className="mt-3 max-w-4xl text-4xl font-light tracking-tight text-foreground md:text-6xl lg:text-7xl">
+              Structured planning, research, and draft generation in one controlled desk.
+            </h1>
+            <p className="mt-4 max-w-2xl text-base font-light leading-relaxed text-foreground/60">
+              Paste the thread, define the analytical objective, inspect the plan and trust ledger, and only then use
+              the generated output.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <StatusBadge tone={offlinePublicEnforced ? "risk" : offlinePublicEnabled ? "caution" : "muted"}>
+              Offline {offlinePublicState}
+            </StatusBadge>
+            {isRunning ? <ProcessingBadge label="Running" /> : <StatusBadge tone="info">{readinessLabel}</StatusBadge>}
           </div>
         </div>
-        <div className="metric-card">
-          <div className="metric-label">Execution</div>
-          <div className="metric-value">
-            {offlinePublicEnforced ? "Offline Locked" : isRunning ? "Running..." : outputs ? "Complete" : "Idle"}
+
+        {prefillNotice ? (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-foreground/8 bg-background/60 px-4 py-3">
+            <div className="text-sm text-foreground/60">{prefillNotice}</div>
+            <AegisButton variant="ghost" onClick={() => setPrefillNotice(null)}>
+              Dismiss
+            </AegisButton>
           </div>
-          <div className="metric-hint">
-            {offlinePublicEnforced ? "Plan/Run APIs are blocked in enforced mode." : stream || "Run to generate outputs."}
-          </div>
-        </div>
-      </div>
+        ) : null}
 
-      <div className="quick-template-row mb-3 mobile-chip-scroll">
-        <span className="quick-template-label">Command templates</span>
-        {COMMAND_TEMPLATES.map((template) => (
-          <button
-            key={template.label}
-            type="button"
-            onClick={() => setCommand(template.value)}
-            className="quick-template-chip"
-          >
-            {template.label}
-          </button>
-        ))}
-      </div>
-
-      <div className="surface-card p-3 mb-3 flex flex-wrap items-center gap-3">
-        <label className="text-xs text-[var(--muted)]">
-          LinkUp Search Depth
-        </label>
-        <select
-          value={linkupDepth}
-          onChange={(e) => setLinkupDepth(e.target.value as LinkupDepth)}
-          className="field-input text-sm w-[220px]"
-          disabled={isRunning || offlinePublicEnforced}
-        >
-          <option value="standard">Standard (default, lower cost)</option>
-          <option value="deep">Deep (manual, higher cost)</option>
-        </select>
-        <span className="text-xs text-[var(--muted)]">
-          Deep mode is off by default and only used when you explicitly enable it here.
-        </span>
-      </div>
-
-      <div className="agent-dashboard grid gap-3 min-h-0">
-        <PanelFrame
-          title="Command + Inputs"
-          subtitle="Paste email/doc context, refine command, and run from this single workspace."
-          className="pb-0"
-          actionButton={
-            <div className="flex w-full sm:w-auto items-center justify-end gap-2 flex-wrap panel-head-actions">
-              <button
-                type="button"
-                onClick={clearWorkspace}
-                className="secondary-ghost px-3 py-2 rounded-xl text-sm font-semibold min-h-[40px]"
-              >
-                Clear
-              </button>
-              <button
-                type="button"
-                onClick={runAgent}
-                disabled={!canRunAgent || isRunning || offlinePublicEnforced}
-                title={
-                  offlinePublicEnforced
-                    ? "Disabled while offline mode is enforced."
-                    : !canRunAgent
-                      ? "Add Email and Command to run the agent."
-                      : "Run Agent"
-                }
-                className="primary-cta px-4 py-2.5 rounded-xl font-semibold min-h-[40px] w-full sm:w-auto active:scale-95 cursor-pointer transition-all duration-200 text-sm disabled:opacity-45 disabled:cursor-not-allowed"
-              >
-                {isRunning ? "Running..." : "Run Agent"}
-              </button>
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          {[
+            { label: "Workspace", value: readinessLabel, sub: canRunAgent ? "Input and command present." : "Add thread and command." },
+            { label: "Input Volume", value: inputWordCount, sub: "Words across email and supporting context." },
+            {
+              label: "Plan / Events",
+              value: `${planStepCount} steps`,
+              sub: `${ledger.length} ledger · ${research.length} research`,
+              tone: "info" as const,
+            },
+            {
+              label: "Execution",
+              value: offlinePublicEnforced ? "Offline Locked" : isRunning ? "Running" : outputs ? "Complete" : "Idle",
+              sub: offlinePublicEnforced ? "Plan/run APIs blocked in enforced mode." : stream || "No active run.",
+              tone: offlinePublicEnforced ? ("risk" as const) : outputs ? ("clear" as const) : isRunning ? ("caution" as const) : ("muted" as const),
+            },
+          ].map((card, index) => (
+            <div key={card.label} className="min-w-0 transition-all duration-300" style={{ transitionDelay: `${index * 60}ms` }}>
+              <MetricCard label={card.label} value={card.value} sub={card.sub} tone={card.tone} />
             </div>
-          }
-        >
-          <CommandPanel
-            emailText={emailText}
-            setEmailText={setEmailText}
-            docText={docText}
-            setDocText={setDocText}
-            command={command}
-            setCommand={setCommand}
-          />
-        </PanelFrame>
+          ))}
+        </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 min-h-0">
-          <PanelFrame
-            title="Intent Compiler (Plan)"
-            subtitle="What the agent intends to do (step-based, tool-driven)."
-            className="pt-0"
-            actionButton={
+        <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+          <div className="flex flex-wrap gap-2">
+            {COMMAND_TEMPLATES.map((template, index) => (
               <button
+                key={template.label}
                 type="button"
-                onClick={() => setExpandedPlan(!expandedPlan)}
-                className="text-[var(--muted)] hover:text-[var(--accent-cyan)] transition-colors duration-200"
-                title={expandedPlan ? "Collapse Plan Panel" : "Expand Plan Panel"}
+                onClick={() => setCommand(template.value)}
+                className="aegis-chip transition-all duration-150 hover:-translate-y-0.5 hover:text-foreground"
+                style={{ transitionDelay: `${index * 40}ms` }}
               >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d={
-                      expandedPlan
-                        ? "M6 18L18 6M6 6l12 12"
-                        : "M4 8V4m0 0h4m-4 0l5 5m11-1V4m0 0h-4m4 0l-5 5"
-                    }
-                  />
-                </svg>
+                {template.label}
               </button>
-            }
+            ))}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-foreground/8 bg-background/60 px-4 py-3">
+            <label className="text-xs font-mono font-medium uppercase tracking-[0.2em] text-foreground/40">
+              LinkUp depth
+            </label>
+            <select
+              value={linkupDepth}
+              onChange={(event) => setLinkupDepth(event.target.value as LinkupDepth)}
+              className="aegis-select min-w-44"
+              disabled={isRunning || offlinePublicEnforced}
+            >
+              <option value="standard">Standard</option>
+              <option value="deep">Deep</option>
+            </select>
+            <span className="max-w-xl text-sm font-light leading-relaxed text-foreground/60">
+              Use deep mode only when you explicitly want more external research depth.
+            </span>
+          </div>
+        </div>
+      </section>
+
+      <div
+        id="agent-input"
+        className="grid min-h-0 gap-4 lg:grid-cols-2 xl:grid-cols-[minmax(0,0.95fr)_minmax(0,1.55fr)]"
+      >
+        <div className="grid min-w-0 gap-4">
+          <PanelFrame
+            title="Intelligence Input"
+            subtitle="Paste the email thread and any supporting context."
+            status={<StatusBadge tone="info">{countWords(emailText)} email words</StatusBadge>}
           >
-            <PlanPanel plan={plan} stream={stream} expanded={expandedPlan} />
+            <CommandPanel
+              emailText={emailText}
+              setEmailText={setEmailText}
+              docText={docText}
+              setDocText={setDocText}
+              command={command}
+              setCommand={setCommand}
+            />
           </PanelFrame>
 
           <PanelFrame
-            title="Trust Ledger (Replay)"
-            subtitle="Auditable timeline of actions, decisions, and tool calls."
-            className="pt-0"
+            title="Command"
+            subtitle="Control the analytical objective and execution from a single surface."
             actionButton={
-              <button
-                type="button"
-                onClick={() => setExpandedLedger(!expandedLedger)}
-                className="text-[var(--muted)] hover:text-[var(--accent-cyan)] transition-colors duration-200"
-                title={expandedLedger ? "Collapse Ledger Panel" : "Expand Ledger Panel"}
-              >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d={
-                      expandedLedger
-                        ? "M6 18L18 6M6 6l12 12"
-                        : "M4 8V4m0 0h4m-4 0l5 5m11-1V4m0 0h-4m4 0l-5 5"
-                    }
-                  />
-                </svg>
-              </button>
+              <div className="flex flex-wrap gap-2">
+                <AegisButton variant="ghost" onClick={clearWorkspace}>
+                  Clear
+                </AegisButton>
+                <AegisButton onClick={() => void runAgent()} disabled={!canRunAgent || isRunning || offlinePublicEnforced}>
+                  {isRunning ? "Running" : "Run Analysis"}
+                </AegisButton>
+              </div>
             }
           >
-            <LedgerPanel ledger={ledger} expanded={expandedLedger} />
-          </PanelFrame>
-
-          <PanelFrame
-            title="Web Research (Linkup + Redaction)"
-            subtitle="Redacted queries + sources used to ground decisions."
-            className="pt-0"
-            actionButton={
-              <button
-                type="button"
-                onClick={() => setExpandedResearch(!expandedResearch)}
-                className="text-[var(--muted)] hover:text-[var(--accent-cyan)] transition-colors duration-200"
-                title={expandedResearch ? "Collapse Research Panel" : "Expand Research Panel"}
-              >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d={
-                      expandedResearch
-                        ? "M6 18L18 6M6 6l12 12"
-                        : "M4 8V4m0 0h4m-4 0l5 5m11-1V4m0 0h-4m4 0l-5 5"
-                    }
-                  />
-                </svg>
-              </button>
-            }
-          >
-            <ResearchPanel research={research} expanded={expandedResearch} />
+            <div className="grid gap-3">
+              <div className="text-sm font-light text-foreground/60">Keyboard shortcut: `Ctrl/Cmd + Enter`</div>
+              {stream ? (
+                <div className="rounded-2xl border border-foreground/8 bg-background/60 px-4 py-3 text-sm text-foreground/60">
+                  {stream}
+                </div>
+              ) : null}
+            </div>
           </PanelFrame>
         </div>
 
-        <PanelFrame
-          title="Outputs (Drafts + Evidence)"
-          subtitle="Final deliverable: verdicts, risks, drafts, and artifacts."
-        >
-          <OutputPanel stream={stream} outputs={outputs} />
-        </PanelFrame>
-      </div>
+        <div id="agent-output" className="min-w-0">
+          <div
+            className={cn(
+              "grid min-w-0 gap-4 rounded-3xl border border-foreground/8 bg-surface/90 p-4 transition-all duration-300 md:p-5",
+              isReady ? "translate-y-0 opacity-100" : "translate-y-3 opacity-0"
+            )}
+            style={{ transitionDelay: "120ms" }}
+          >
+            <div className="flex flex-wrap items-center gap-2 border-b border-foreground/8 pb-4">
+              {["Plan", "Trust", "Research", "Output"].map((label, index) => (
+                <button
+                  key={label}
+                  type="button"
+                  className={cn(
+                    "rounded-full px-3 py-1.5 text-sm font-medium transition-colors duration-150",
+                    index === 0
+                      ? "bg-foreground text-background"
+                      : "text-foreground/40 hover:text-foreground/70"
+                  )}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
 
-      <style jsx global>{`
-        @media (min-width: 1024px) {
-          .agent-dashboard {
-            grid-template-rows: minmax(330px, 2.2fr) minmax(280px, 1.1fr) minmax(290px, 1.4fr);
-          }
-        }
-      `}</style>
-    </>
+            <div className="grid gap-4 xl:grid-cols-3">
+              <div className="min-w-0 transition-all duration-300" style={{ transitionDelay: "160ms" }}>
+                <PanelFrame
+                  title="Plan"
+                  subtitle="Structured execution steps before run output."
+                  actionButton={
+                    <AegisButton variant="ghost" onClick={() => setExpandedPlan((current) => !current)}>
+                      {expandedPlan ? "Compact" : "Focus"}
+                    </AegisButton>
+                  }
+                >
+                  <PlanPanel plan={plan} stream={stream} expanded={expandedPlan} />
+                </PanelFrame>
+              </div>
+              <div className="min-w-0 transition-all duration-300" style={{ transitionDelay: "220ms" }}>
+                <PanelFrame
+                  title="Trust"
+                  subtitle="Ledger of local and model-driven actions."
+                  actionButton={
+                    <AegisButton variant="ghost" onClick={() => setExpandedLedger((current) => !current)}>
+                      {expandedLedger ? "Compact" : "Focus"}
+                    </AegisButton>
+                  }
+                >
+                  <LedgerPanel ledger={ledger} expanded={expandedLedger} />
+                </PanelFrame>
+              </div>
+              <div className="min-w-0 transition-all duration-300" style={{ transitionDelay: "280ms" }}>
+                <PanelFrame
+                  title="Research"
+                  subtitle="Redacted search activity and evidence traces."
+                  actionButton={
+                    <AegisButton variant="ghost" onClick={() => setExpandedResearch((current) => !current)}>
+                      {expandedResearch ? "Compact" : "Focus"}
+                    </AegisButton>
+                  }
+                >
+                  <ResearchPanel research={research} expanded={expandedResearch} />
+                </PanelFrame>
+              </div>
+            </div>
+
+            <div className="min-w-0 transition-all duration-300" style={{ transitionDelay: "340ms" }}>
+              <PanelFrame title="Output" subtitle="Final structured report, evidence summary, and draft response.">
+                <OutputPanel stream={stream} outputs={outputs} />
+              </PanelFrame>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
