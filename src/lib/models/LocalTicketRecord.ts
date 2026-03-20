@@ -50,7 +50,6 @@ const LocalTicketRecordSchema = new Schema(
   }
 );
 
-LocalTicketRecordSchema.index({ sourceEmailId: 1 }, { unique: true });
 LocalTicketRecordSchema.index({ syncState: 1, createdAt: -1 });
 LocalTicketRecordSchema.index({ "admin.status": 1, updatedAt: -1 });
 LocalTicketRecordSchema.index({ createdAt: -1 });

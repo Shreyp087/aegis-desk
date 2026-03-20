@@ -19,7 +19,6 @@ const EntityProfileCacheSchema = new Schema(
   }
 );
 
-EntityProfileCacheSchema.index({ cacheKey: 1 }, { unique: true });
 EntityProfileCacheSchema.index({ entity: 1, createdAt: -1 });
 EntityProfileCacheSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 EntityProfileCacheSchema.index({ lastAccessedAt: -1 });
@@ -30,4 +29,3 @@ export type EntityProfileCacheDocument = InferSchemaType<typeof EntityProfileCac
 
 export const EntityProfileCacheModel =
   models.EntityProfileCache || model("EntityProfileCache", EntityProfileCacheSchema);
-

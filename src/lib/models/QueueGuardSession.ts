@@ -79,7 +79,6 @@ const QueueGuardSessionSchema = new Schema(
   }
 );
 
-QueueGuardSessionSchema.index({ sessionId: 1 }, { unique: true });
 QueueGuardSessionSchema.index({ lastSeenAtMs: -1 });
 
 export type QueueGuardSessionDocument = InferSchemaType<typeof QueueGuardSessionSchema> & {

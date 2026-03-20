@@ -14,7 +14,6 @@ const AdminSchema = new Schema(
   }
 );
 
-AdminSchema.index({ email: 1 }, { unique: true });
 AdminSchema.index({ createdAt: -1 });
 
 export type AdminDocument = InferSchemaType<typeof AdminSchema> & { _id: string };
