@@ -168,14 +168,14 @@ export default function AgentWorkspace() {
     }
   }, [canRunAgent, command, docText, emailText, isRunning, linkupDepth, offlinePublicEnforced]);
 
-  const exportPdf = useCallback(() => {
+  const exportPdf = useCallback(async () => {
     if (!outputs) {
       setStream("Run the agent first so there is a structured report to export.");
       return;
     }
 
     try {
-      exportStructuredReportPdf({
+      await exportStructuredReportPdf({
         final: outputs as AnalysisReportExportPayload["final"],
         plan,
         ledger,

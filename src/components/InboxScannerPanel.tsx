@@ -209,6 +209,30 @@ type InboxSettingsResponse = {
   settings: InboxConsensusSettings;
 };
 
+const INBOX_SCANNER_SESSION_KEY = "aegis:inbox-scanner-session:v1";
+
+type PersistedInboxScannerSession = {
+  version: 1;
+  savedAt: number;
+  mode: Mode;
+  rawInbox: string;
+  orgDomainsInput: string;
+  gmailQuery: string;
+  gmailMaxResults: number;
+  alerts: InboxAlert[];
+  meta: InboxMeta | null;
+  activeFilter: PrimaryFilter;
+  focusCategory: VisibleCategory | "all";
+  searchQuery: string;
+  expandedId: string | null;
+  reviewedIds: Record<string, true>;
+  archivedIds: Record<string, true>;
+  manualReviewIds: Record<string, true>;
+  escalationNotes: Record<string, string>;
+  feedbackStatusById: Record<string, string>;
+  lastCreatedTicketId: string | null;
+};
+
 type QuotedBlock = {
   kind: "quoted" | "body";
   text: string;
@@ -349,6 +373,78 @@ function buildEscalationScannerContext(alert: InboxAlert): AgentEscalationScanne
     extracted: alert.extracted,
     capturedAt: Date.now(),
   };
+}
+
+function readInboxScannerSession(): PersistedInboxScannerSession | null {
+  if (typeof window === "undefined") return null;
+
+  try {
+    const raw = window.sessionStorage.getItem(INBOX_SCANNER_SESSION_KEY);
+    if (!raw) return null;
+
+    const parsed = JSON.parse(raw) as Partial<PersistedInboxScannerSession>;
+    if (
+      parsed.version !== 1 ||
+      !Array.isArray(parsed.alerts) ||
+      typeof parsed.mode !== "string" ||
+      typeof parsed.savedAt !== "number"
+    ) {
+      return null;
+    }
+
+    return {
+      version: 1,
+      savedAt: parsed.savedAt,
+      mode: parsed.mode === "gmail" ? "gmail" : "manual",
+      rawInbox: typeof parsed.rawInbox === "string" ? parsed.rawInbox : "",
+      orgDomainsInput: typeof parsed.orgDomainsInput === "string" ? parsed.orgDomainsInput : "",
+      gmailQuery: typeof parsed.gmailQuery === "string" ? parsed.gmailQuery : "in:inbox",
+      gmailMaxResults: Math.max(1, Math.min(50, Number(parsed.gmailMaxResults) || 20)),
+      alerts: parsed.alerts as InboxAlert[],
+      meta: (parsed.meta as InboxMeta | null | undefined) ?? null,
+      activeFilter:
+        parsed.activeFilter === "high" ||
+        parsed.activeFilter === "pending" ||
+        parsed.activeFilter === "reviewed"
+          ? parsed.activeFilter
+          : "all",
+      focusCategory:
+        parsed.focusCategory === "all" ||
+        FILTER_CATEGORIES.includes(parsed.focusCategory as VisibleCategory)
+          ? (parsed.focusCategory as VisibleCategory | "all")
+          : "all",
+      searchQuery: typeof parsed.searchQuery === "string" ? parsed.searchQuery : "",
+      expandedId: typeof parsed.expandedId === "string" ? parsed.expandedId : null,
+      reviewedIds: (parsed.reviewedIds as Record<string, true> | undefined) ?? {},
+      archivedIds: (parsed.archivedIds as Record<string, true> | undefined) ?? {},
+      manualReviewIds: (parsed.manualReviewIds as Record<string, true> | undefined) ?? {},
+      escalationNotes: (parsed.escalationNotes as Record<string, string> | undefined) ?? {},
+      feedbackStatusById: (parsed.feedbackStatusById as Record<string, string> | undefined) ?? {},
+      lastCreatedTicketId: typeof parsed.lastCreatedTicketId === "string" ? parsed.lastCreatedTicketId : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function persistInboxScannerSession(session: PersistedInboxScannerSession) {
+  if (typeof window === "undefined") return;
+
+  try {
+    window.sessionStorage.setItem(INBOX_SCANNER_SESSION_KEY, JSON.stringify(session));
+  } catch {
+    // Ignore storage failures for oversize/private browsing cases.
+  }
+}
+
+function clearInboxScannerSessionStorage() {
+  if (typeof window === "undefined") return;
+
+  try {
+    window.sessionStorage.removeItem(INBOX_SCANNER_SESSION_KEY);
+  } catch {
+    // Ignore storage failures.
+  }
 }
 
 function safeFeedbackLabel(alert: InboxAlert): FeedbackOutcome {
@@ -506,6 +602,8 @@ export default function InboxScannerPanel({
   const [archivedIds, setArchivedIds] = useState<Record<string, true>>({});
   const [manualReviewIds, setManualReviewIds] = useState<Record<string, true>>({});
   const [escalationNotes, setEscalationNotes] = useState<Record<string, string>>({});
+  const [sessionHydrated, setSessionHydrated] = useState(false);
+  const [sessionNotice, setSessionNotice] = useState<string | null>(null);
   const [isReady, setIsReady] = useState(false);
 
   async function refreshGmailStatus() {
@@ -586,11 +684,83 @@ export default function InboxScannerPanel({
   useEffect(() => {
     void refreshGmailStatus();
     void refreshInboxSettings();
+
+    const session = readInboxScannerSession();
+    if (session) {
+      setMode(session.mode);
+      setRawInbox(session.rawInbox);
+      setOrgDomainsInput(session.orgDomainsInput);
+      setGmailQuery(session.gmailQuery);
+      setGmailMaxResults(session.gmailMaxResults);
+      setAlerts(session.alerts);
+      setMeta(session.meta);
+      setActiveFilter(session.activeFilter);
+      setFocusCategory(session.focusCategory);
+      setSearchQuery(session.searchQuery);
+      setExpandedId(session.expandedId || session.alerts[0]?.id || null);
+      setReviewedIds(session.reviewedIds);
+      setArchivedIds(session.archivedIds);
+      setManualReviewIds(session.manualReviewIds);
+      setEscalationNotes(session.escalationNotes);
+      setFeedbackStatusById(session.feedbackStatusById);
+      setLastCreatedTicketId(session.lastCreatedTicketId);
+
+      if (session.alerts.length > 0) {
+        setSessionNotice("Restored the inbox queue from this browser session.");
+      }
+    }
+
+    setSessionHydrated(true);
   }, []);
 
   useEffect(() => {
     setIsReady(true);
   }, []);
+
+  useEffect(() => {
+    if (!sessionHydrated) return;
+
+    persistInboxScannerSession({
+      version: 1,
+      savedAt: Date.now(),
+      mode,
+      rawInbox,
+      orgDomainsInput,
+      gmailQuery,
+      gmailMaxResults,
+      alerts,
+      meta,
+      activeFilter,
+      focusCategory,
+      searchQuery,
+      expandedId,
+      reviewedIds,
+      archivedIds,
+      manualReviewIds,
+      escalationNotes,
+      feedbackStatusById,
+      lastCreatedTicketId,
+    });
+  }, [
+    activeFilter,
+    alerts,
+    archivedIds,
+    escalationNotes,
+    expandedId,
+    feedbackStatusById,
+    focusCategory,
+    gmailMaxResults,
+    gmailQuery,
+    lastCreatedTicketId,
+    manualReviewIds,
+    meta,
+    mode,
+    orgDomainsInput,
+    rawInbox,
+    reviewedIds,
+    searchQuery,
+    sessionHydrated,
+  ]);
 
   async function scanInbox() {
     setError(null);
@@ -645,6 +815,12 @@ export default function InboxScannerPanel({
       setEscalationNotes({});
       setFeedbackSavingById({});
       setFeedbackStatusById({});
+      setLastCreatedTicketId(null);
+      setSessionNotice(
+        mode === "gmail"
+          ? "Gmail queue saved for this browser session. You can switch workspaces or refresh without rescanning."
+          : "Scanner results saved for this browser session."
+      );
     } catch (err) {
       const detail = err instanceof Error ? err.message : "Scan failed.";
       setError(detail);
@@ -819,6 +995,25 @@ export default function InboxScannerPanel({
     setReviewedIds((prev) => ({ ...prev, [id]: true }));
   }
 
+  function clearSessionQueue() {
+    setAlerts([]);
+    setMeta(null);
+    setExpandedId(null);
+    setActiveFilter("all");
+    setFocusCategory("all");
+    setSearchQuery("");
+    setReviewedIds({});
+    setArchivedIds({});
+    setManualReviewIds({});
+    setEscalationNotes({});
+    setFeedbackSavingById({});
+    setFeedbackStatusById({});
+    setLastCreatedTicketId(null);
+    setError(null);
+    setSessionNotice("Cleared the saved inbox queue for this browser session.");
+    clearInboxScannerSessionStorage();
+  }
+
   function escalationCommandWithNote(alert: InboxAlert) {
     const note = (escalationNotes[alert.id] || "").trim();
     if (!note) return suggestedCommand(alert);
@@ -842,9 +1037,14 @@ export default function InboxScannerPanel({
           subtitle="Choose source, confirm consensus behavior, and run a fresh queue scan."
           status={isScanning ? <ProcessingBadge label="Scanning" /> : <StatusBadge tone="muted">Ready</StatusBadge>}
           actionButton={
-            <AegisButton onClick={() => void scanInbox()} disabled={isScanning || checkingStatus}>
-              {isScanning ? "Scanning" : "Scan Inbox"}
-            </AegisButton>
+            <div className="flex flex-wrap gap-2">
+              <AegisButton variant="ghost" onClick={clearSessionQueue} disabled={isScanning || alerts.length === 0}>
+                Clear Session
+              </AegisButton>
+              <AegisButton onClick={() => void scanInbox()} disabled={isScanning || checkingStatus}>
+                {isScanning ? "Scanning" : "Scan Inbox"}
+              </AegisButton>
+            </div>
           }
         >
           <div className="grid gap-6 xl:grid-cols-[minmax(0,1.15fr)_minmax(320px,0.85fr)]">
@@ -919,6 +1119,17 @@ export default function InboxScannerPanel({
               </label>
 
               {error ? <InlineError message={error} /> : null}
+
+              {sessionNotice ? (
+                <div className="rounded-lg border border-aegis-border bg-aegis-elevated px-4 py-3 text-sm text-aegis-muted">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <span>{sessionNotice}</span>
+                    <AegisButton variant="ghost" onClick={() => setSessionNotice(null)}>
+                      Dismiss
+                    </AegisButton>
+                  </div>
+                </div>
+              ) : null}
 
               {offlinePublicEnforced ? (
                 <InlineError message="Enforced offline mode is active. Gmail fetch is disabled; use manual input." />

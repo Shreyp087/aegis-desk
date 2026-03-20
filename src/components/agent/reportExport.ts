@@ -35,13 +35,46 @@ export type AnalysisReportExportPayload = {
   scannerContext?: AgentEscalationScannerContext | null;
 };
 
-function escapeHtml(value: unknown): string {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/\"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+type PdfState = {
+  doc: import("jspdf").jsPDF;
+  pageWidth: number;
+  pageHeight: number;
+  marginX: number;
+  marginY: number;
+  width: number;
+  y: number;
+  subject: string;
+  generatedAt: string;
+};
+
+const COLORS = {
+  ink: [15, 23, 42] as const,
+  muted: [71, 85, 105] as const,
+  line: [203, 213, 225] as const,
+  panel: [248, 250, 252] as const,
+  panelStrong: [239, 246, 255] as const,
+  accent: [29, 78, 216] as const,
+  accentSoft: [219, 234, 254] as const,
+  caution: [180, 83, 9] as const,
+  danger: [185, 28, 28] as const,
+  clear: [4, 120, 87] as const,
+} as const;
+
+function setColor(doc: import("jspdf").jsPDF, color: readonly [number, number, number]) {
+  doc.setTextColor(color[0], color[1], color[2]);
+}
+
+function setDrawColor(doc: import("jspdf").jsPDF, color: readonly [number, number, number]) {
+  doc.setDrawColor(color[0], color[1], color[2]);
+}
+
+function setFillColor(doc: import("jspdf").jsPDF, color: readonly [number, number, number]) {
+  doc.setFillColor(color[0], color[1], color[2]);
+}
+
+function subjectSlug(value: string): string {
+  const base = value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return base || "analysis-report";
 }
 
 function formatPercent(value: number, scale: "ratio" | "percent" = "ratio"): string {
@@ -68,510 +101,512 @@ function normalizePlanSteps(plan: unknown): PlanStep[] {
   return Array.isArray(maybeSteps) ? (maybeSteps as PlanStep[]) : [];
 }
 
-function stringifyLines(values: string[] | undefined, empty = "None captured"): string {
-  return values && values.length > 0 ? values.map((item) => escapeHtml(item)).join("</li><li>") : escapeHtml(empty);
+function stringifyUnknown(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
 }
 
-function subjectSlug(value: string): string {
-  const base = value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-  return base || "analysis-report";
+function joinOrFallback(values: string[] | undefined, fallback = "None recorded"): string {
+  return values && values.length > 0 ? values.join(", ") : fallback;
 }
 
-function buildOverviewCards(payload: AnalysisReportExportPayload): string {
-  const scanner = payload.scannerContext;
-  const cards = [
-    { label: "Final Action", value: payload.final.decision.final_action.replace(/_/g, " ") },
-    { label: "Risk Level", value: `${payload.final.risk_assessment.level} · ${payload.final.risk_assessment.score}` },
-    { label: "Uncertainty", value: `${payload.final.uncertainty.level} · ${formatPercent(payload.final.uncertainty.score)}` },
-    { label: "Evidence Quality", value: formatPercent(payload.final.evidence_quality_score || 0) },
-  ];
+function splitText(doc: import("jspdf").jsPDF, text: string, width: number): string[] {
+  return doc.splitTextToSize(text || "", width) as string[];
+}
 
-  if (scanner) {
-    cards.push({ label: "Scanner Priority", value: `${scanner.priority} · ${scanner.priorityScore}` });
-    cards.push({ label: "Scanner Route", value: scanner.decision?.final_action?.replace(/_/g, " ") || scanner.trustedDecision?.action || "n/a" });
+function lineHeight(fontSize: number, multiplier = 1.45): number {
+  return fontSize * multiplier;
+}
+
+function pageHeader(state: PdfState) {
+  const { doc, marginX, marginY, pageWidth, subject, generatedAt } = state;
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(10);
+  setColor(doc, COLORS.muted);
+  doc.text("AEGIS DESK / STRUCTURED ANALYSIS REPORT", marginX, marginY - 16);
+  doc.setFont("helvetica", "normal");
+  doc.text(generatedAt, pageWidth - marginX, marginY - 16, { align: "right" });
+  setDrawColor(doc, COLORS.line);
+  doc.line(marginX, marginY - 8, pageWidth - marginX, marginY - 8);
+
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(22);
+  setColor(doc, COLORS.ink);
+  const titleLines = splitText(doc, subject, state.width);
+  doc.text(titleLines, marginX, marginY + 16);
+
+  state.y = marginY + 16 + titleLines.length * lineHeight(22, 1.15) + 10;
+}
+
+function footer(state: PdfState) {
+  const { doc, marginX, pageWidth, pageHeight } = state;
+  const page = doc.getCurrentPageInfo().pageNumber;
+  setDrawColor(doc, COLORS.line);
+  doc.line(marginX, pageHeight - 26, pageWidth - marginX, pageHeight - 26);
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(9);
+  setColor(doc, COLORS.muted);
+  doc.text(`Page ${page}`, pageWidth - marginX, pageHeight - 12, { align: "right" });
+  doc.text("Prepared from the Aegis Desk structured workflow.", marginX, pageHeight - 12);
+}
+
+function newPage(state: PdfState) {
+  footer(state);
+  state.doc.addPage();
+  pageHeader(state);
+}
+
+function ensureSpace(state: PdfState, needed: number) {
+  if (state.y + needed <= state.pageHeight - state.marginY - 28) return;
+  newPage(state);
+}
+
+function sectionHeader(state: PdfState, label: string, title: string, subtitle?: string) {
+  ensureSpace(state, subtitle ? 70 : 52);
+  state.doc.setFont("helvetica", "bold");
+  state.doc.setFontSize(10);
+  setColor(state.doc, COLORS.accent);
+  state.doc.text(label.toUpperCase(), state.marginX, state.y);
+
+  state.doc.setFontSize(16);
+  setColor(state.doc, COLORS.ink);
+  state.doc.text(title, state.marginX, state.y + 16);
+
+  if (subtitle) {
+    state.doc.setFont("helvetica", "normal");
+    state.doc.setFontSize(11);
+    setColor(state.doc, COLORS.muted);
+    const lines = splitText(state.doc, subtitle, state.width);
+    state.doc.text(lines, state.marginX, state.y + 32);
+    state.y += 32 + lines.length * lineHeight(11) + 6;
+  } else {
+    state.y += 28;
   }
 
-  return cards
-    .map(
-      (card) => `
-        <div class="stat-card">
-          <div class="stat-label">${escapeHtml(card.label)}</div>
-          <div class="stat-value">${escapeHtml(card.value)}</div>
-        </div>
-      `
-    )
-    .join("");
+  setDrawColor(state.doc, COLORS.line);
+  state.doc.line(state.marginX, state.y, state.marginX + state.width, state.y);
+  state.y += 14;
 }
 
-function buildScannerSection(scanner?: AgentEscalationScannerContext | null): string {
-  if (!scanner) return "";
-
-  const deterministic = scanner.signalGroups?.deterministic
-    ? escapeHtml(JSON.stringify(scanner.signalGroups.deterministic, null, 2))
-    : "";
-  const learned = scanner.signalGroups?.learned ? escapeHtml(JSON.stringify(scanner.signalGroups.learned, null, 2)) : "";
-
-  return `
-    <section class="section">
-      <div class="section-header">
-        <div>
-          <div class="eyebrow">Inbox Scanner</div>
-          <h2>Initial Triage Context</h2>
-        </div>
-        <div class="meta-pill">Captured ${escapeHtml(formatTimestamp(scanner.capturedAt))}</div>
-      </div>
-      <div class="meta-grid">
-        <div><span>Subject</span><strong>${escapeHtml(scanner.subject || "-")}</strong></div>
-        <div><span>Sender</span><strong>${escapeHtml(scanner.from || scanner.senderEmail || "-")}</strong></div>
-        <div><span>Domain</span><strong>${escapeHtml(scanner.senderDomain || "-")}</strong></div>
-        <div><span>Category</span><strong>${escapeHtml(scanner.primaryCategory || "-")}</strong></div>
-        <div><span>Mail Class</span><strong>${escapeHtml(scanner.mailClass || "unknown")}</strong></div>
-        <div><span>Threat Type</span><strong>${escapeHtml(scanner.threatType || "unknown")}</strong></div>
-        <div><span>Priority</span><strong>${escapeHtml(`${scanner.priority} · ${scanner.priorityScore}`)}</strong></div>
-        <div><span>Trust / Reputation</span><strong>${escapeHtml(`${scanner.trustScore} / ${scanner.reputationScore}`)}</strong></div>
-        <div><span>Consensus</span><strong>${escapeHtml(`${scanner.consensusScore}%${typeof scanner.consensusStrength === "number" ? ` · ${formatPercent(scanner.consensusStrength)}` : ""}`)}</strong></div>
-        <div><span>Uncertainty</span><strong>${escapeHtml(`${scanner.uncertaintyPercent}%${scanner.uncertainty ? ` · ${scanner.uncertainty.type.join(", ") || "none"}` : ""}`)}</strong></div>
-        <div><span>Routing</span><strong>${escapeHtml(scanner.decision?.final_action || scanner.trustedDecision?.action || "n/a")}</strong></div>
-        <div><span>Confidence</span><strong>${escapeHtml(String(scanner.trustedDecision?.confidencePct ?? scanner.consensusScore))}%</strong></div>
-      </div>
-      <div class="callout-grid two-up">
-        <div class="callout-card">
-          <div class="card-title">Explanation</div>
-          <p>${escapeHtml(scanner.explanation?.summary || scanner.trustedDecision?.note || scanner.consensusNote || "No scanner explanation available.")}</p>
-          <ul><li>${stringifyLines(scanner.explanation?.keyFactors || scanner.riskTags.slice(0, 5), "No scanner factors recorded")}</li></ul>
-        </div>
-        <div class="callout-card">
-          <div class="card-title">Signals</div>
-          <ul><li>${stringifyLines(scanner.signals.slice(0, 8), "No scanner signals recorded")}</li></ul>
-          ${scanner.disagreementFlags.length > 0 ? `<div class="sub-meta">Disagreement flags: ${escapeHtml(scanner.disagreementFlags.join(", "))}</div>` : ""}
-        </div>
-      </div>
-      ${deterministic || learned ? `
-      <div class="code-grid two-up">
-        ${deterministic ? `<div><div class="card-title">Deterministic Signal Groups</div><pre>${deterministic}</pre></div>` : ""}
-        ${learned ? `<div><div class="card-title">Learned Signal Groups</div><pre>${learned}</pre></div>` : ""}
-      </div>` : ""}
-    </section>
-  `;
+function paragraph(state: PdfState, text: string, opts?: { size?: number; color?: readonly [number, number, number]; bold?: boolean }) {
+  const size = opts?.size ?? 11;
+  const lines = splitText(state.doc, text || "", state.width);
+  const height = lines.length * lineHeight(size) + 2;
+  ensureSpace(state, height);
+  state.doc.setFont("helvetica", opts?.bold ? "bold" : "normal");
+  state.doc.setFontSize(size);
+  setColor(state.doc, opts?.color ?? COLORS.muted);
+  state.doc.text(lines, state.marginX, state.y);
+  state.y += height;
 }
 
-function buildClaimsSection(final: FormattedFinalOutput): string {
-  if (final.claims.length === 0) {
-    return `<section class="section"><div class="section-header"><div><div class="eyebrow">Claims</div><h2>Structured Claims</h2></div></div><p class="muted-copy">No claims were extracted in the final synthesis.</p></section>`;
+function bullets(state: PdfState, items: string[], opts?: { color?: readonly [number, number, number] }) {
+  const bulletItems = items.length > 0 ? items : ["None recorded."];
+  for (const item of bulletItems) {
+    const bulletX = state.marginX + 4;
+    const textX = state.marginX + 14;
+    const lines = splitText(state.doc, item, state.width - 14);
+    const height = lines.length * lineHeight(11) + 4;
+    ensureSpace(state, height);
+    setFillColor(state.doc, COLORS.accent);
+    state.doc.circle(bulletX, state.y - 4, 1.5, "F");
+    state.doc.setFont("helvetica", "normal");
+    state.doc.setFontSize(11);
+    setColor(state.doc, opts?.color ?? COLORS.muted);
+    state.doc.text(lines, textX, state.y);
+    state.y += height;
   }
-
-  return `
-    <section class="section">
-      <div class="section-header">
-        <div>
-          <div class="eyebrow">Claims</div>
-          <h2>Structured Claims</h2>
-        </div>
-      </div>
-      <div class="stack">
-        ${final.claims
-          .map(
-            (claim) => `
-              <div class="detail-card">
-                <div class="detail-head">
-                  <span class="badge">${escapeHtml(claim.type.replace(/_/g, " "))}</span>
-                  <span class="muted-copy">${escapeHtml(formatPercent(claim.confidence))} extraction confidence</span>
-                  <span class="muted-copy">${escapeHtml(claim.verification?.status || "unverified")}</span>
-                </div>
-                <div class="detail-body">${escapeHtml(claim.text)}</div>
-                <div class="detail-note">${escapeHtml(claim.verification?.notes || "No verification notes recorded.")}</div>
-              </div>
-            `
-          )
-          .join("")}
-      </div>
-    </section>
-  `;
 }
 
-function buildEvidenceSection(final: FormattedFinalOutput): string {
-  return `
-    <section class="section">
-      <div class="section-header">
-        <div>
-          <div class="eyebrow">Research</div>
-          <h2>Evidence & Conflicts</h2>
-        </div>
-        <div class="meta-pill">Quality ${escapeHtml(formatPercent(final.evidence_quality_score || 0))}</div>
-      </div>
-      ${final.conflicts.length > 0 ? `
-        <div class="callout-card conflict-card">
-          <div class="card-title">Conflicts</div>
-          <ul><li>${stringifyLines(final.conflicts.map((conflict) => `${conflict.type}: ${conflict.summary}`), "No conflicts recorded")}</li></ul>
-        </div>
-      ` : ""}
-      ${final.evidence.length > 0 ? `
-        <div class="stack">
-          ${final.evidence
-            .map(
-              (item) => `
-                <div class="detail-card">
-                  <div class="detail-head">
-                    <span class="badge">${escapeHtml(formatPercent(item.relevance_score || 0))} relevance</span>
-                    <span class="muted-copy">Source ${escapeHtml(formatPercent(item.source_quality_score || 0))}</span>
-                    <span class="muted-copy">Recency ${escapeHtml(formatPercent(item.recency_score || 0))}</span>
-                  </div>
-                  <div class="detail-title">${escapeHtml(item.title || item.url || "Evidence item")}</div>
-                  <div class="detail-body">${escapeHtml(item.snippet || "No excerpt captured.")}</div>
-                  ${item.url ? `<div class="detail-note">${escapeHtml(item.url)}</div>` : ""}
-                </div>
-              `
-            )
-            .join("")}
-        </div>
-      ` : `<p class="muted-copy">No external evidence was captured in this run.</p>`}
-    </section>
-  `;
+function keyValueGrid(state: PdfState, items: Array<{ label: string; value: string }>) {
+  const gap = 12;
+  const colWidth = (state.width - gap) / 2;
+  const boxPadding = 10;
+
+  for (let index = 0; index < items.length; index += 2) {
+    const row = items.slice(index, index + 2);
+    const heights = row.map((item) => {
+      state.doc.setFont("helvetica", "bold");
+      state.doc.setFontSize(11);
+      const valueLines = splitText(state.doc, item.value, colWidth - boxPadding * 2);
+      return 16 + valueLines.length * lineHeight(11) + 14;
+    });
+    const rowHeight = Math.max(...heights, 58);
+    ensureSpace(state, rowHeight + 8);
+
+    row.forEach((item, column) => {
+      const x = state.marginX + column * (colWidth + gap);
+      setFillColor(state.doc, COLORS.panel);
+      setDrawColor(state.doc, COLORS.line);
+      state.doc.roundedRect(x, state.y, colWidth, rowHeight, 8, 8, "FD");
+
+      state.doc.setFont("helvetica", "bold");
+      state.doc.setFontSize(9);
+      setColor(state.doc, COLORS.muted);
+      state.doc.text(item.label.toUpperCase(), x + boxPadding, state.y + 12);
+
+      state.doc.setFont("helvetica", "normal");
+      state.doc.setFontSize(11);
+      setColor(state.doc, COLORS.ink);
+      const valueLines = splitText(state.doc, item.value, colWidth - boxPadding * 2);
+      state.doc.text(valueLines, x + boxPadding, state.y + 28);
+    });
+
+    state.y += rowHeight + 8;
+  }
 }
 
-function buildEntitySection(final: FormattedFinalOutput): string {
-  return `
-    <section class="section">
-      <div class="section-header">
-        <div>
-          <div class="eyebrow">Trust</div>
-          <h2>Entity Verification</h2>
-        </div>
-      </div>
-      ${final.entityVerdicts.length > 0 ? `
-        <div class="stack">
-          ${final.entityVerdicts
-            .map(
-              (verdict) => `
-                <div class="detail-card">
-                  <div class="detail-head">
-                    <span class="badge">${escapeHtml(verdict.verdict)}</span>
-                    <span class="muted-copy">${escapeHtml(verdict.entityType)}</span>
-                    <span class="muted-copy">${escapeHtml(String(verdict.uncertaintyPct))}% uncertainty</span>
-                  </div>
-                  <div class="detail-title">${escapeHtml(verdict.entity)}</div>
-                  <div class="detail-body">${escapeHtml(verdict.rationale)}</div>
-                  ${verdict.redFlags.length > 0 ? `<div class="detail-note">Red flags: ${escapeHtml(verdict.redFlags.join(", "))}</div>` : ""}
-                </div>
-              `
-            )
-            .join("")}
-        </div>
-      ` : `<p class="muted-copy">No entity verdicts were produced.</p>`}
-    </section>
-  `;
+function metricCards(
+  state: PdfState,
+  items: Array<{ label: string; value: string; tone?: "risk" | "caution" | "clear" | "info"; sub?: string }>
+) {
+  const gap = 12;
+  const cols = 2;
+  const cardWidth = (state.width - gap) / cols;
+
+  for (let index = 0; index < items.length; index += cols) {
+    const row = items.slice(index, index + cols);
+    const heights = row.map((item) => {
+      state.doc.setFont("helvetica", "bold");
+      state.doc.setFontSize(18);
+      const valueLines = splitText(state.doc, item.value, cardWidth - 24);
+      const subLines = item.sub ? splitText(state.doc, item.sub, cardWidth - 24) : [];
+      return 44 + valueLines.length * lineHeight(18, 1.15) + subLines.length * lineHeight(10, 1.4);
+    });
+    const rowHeight = Math.max(...heights, 84);
+    ensureSpace(state, rowHeight + 8);
+
+    row.forEach((item, column) => {
+      const x = state.marginX + column * (cardWidth + gap);
+      setFillColor(state.doc, COLORS.panelStrong);
+      setDrawColor(state.doc, COLORS.line);
+      state.doc.roundedRect(x, state.y, cardWidth, rowHeight, 10, 10, "FD");
+
+      state.doc.setFont("helvetica", "bold");
+      state.doc.setFontSize(9);
+      setColor(state.doc, COLORS.muted);
+      state.doc.text(item.label.toUpperCase(), x + 12, state.y + 14);
+
+      const toneColor =
+        item.tone === "risk"
+          ? COLORS.danger
+          : item.tone === "caution"
+            ? COLORS.caution
+            : item.tone === "clear"
+              ? COLORS.clear
+              : COLORS.accent;
+      state.doc.setFont("helvetica", "bold");
+      state.doc.setFontSize(18);
+      setColor(state.doc, toneColor);
+      const valueLines = splitText(state.doc, item.value, cardWidth - 24);
+      state.doc.text(valueLines, x + 12, state.y + 34);
+
+      if (item.sub) {
+        state.doc.setFont("helvetica", "normal");
+        state.doc.setFontSize(10);
+        setColor(state.doc, COLORS.muted);
+        const subLines = splitText(state.doc, item.sub, cardWidth - 24);
+        const offset = valueLines.length * lineHeight(18, 1.15);
+        state.doc.text(subLines, x + 12, state.y + 44 + offset);
+      }
+    });
+
+    state.y += rowHeight + 8;
+  }
 }
 
-function buildAnalysisSection(final: FormattedFinalOutput): string {
-  return `
-    <section class="section">
-      <div class="section-header">
-        <div>
-          <div class="eyebrow">Analysis</div>
-          <h2>${escapeHtml(final.analysisSection?.title || "Key Findings")}</h2>
-        </div>
-      </div>
-      ${(final.analysisSection?.findings || []).length > 0 ? `
-        <div class="stack">
-          ${final.analysisSection.findings
-            .map(
-              (finding) => `
-                <div class="detail-card">
-                  <div class="detail-head">
-                    <span class="badge">${escapeHtml(finding.severity)}</span>
-                  </div>
-                  <div class="detail-title">${escapeHtml(finding.risk)}</div>
-                  <div class="detail-body">${escapeHtml(finding.whyItMatters)}</div>
-                  <div class="detail-note">Suggested edit: ${escapeHtml(finding.suggestedEdit)}</div>
-                </div>
-              `
-            )
-            .join("")}
-        </div>
-      ` : `<p class="muted-copy">No structured findings were generated.</p>`}
-    </section>
-  `;
+function divider(state: PdfState) {
+  ensureSpace(state, 12);
+  setDrawColor(state.doc, COLORS.line);
+  state.doc.line(state.marginX, state.y, state.marginX + state.width, state.y);
+  state.y += 12;
 }
 
-function buildTraceSection(payload: AnalysisReportExportPayload): string {
-  const planSteps = normalizePlanSteps(payload.plan);
-  const ledger = payload.ledger || [];
-  const research = payload.research || [];
-  const final = payload.final;
+function preBlock(state: PdfState, title: string, text: string) {
+  const headerHeight = 18;
+  state.doc.setFont("courier", "normal");
+  state.doc.setFontSize(9);
+  const lines = splitText(state.doc, text || "None recorded.", state.width - 24);
+  const height = Math.max(52, headerHeight + lines.length * lineHeight(9, 1.4) + 16);
+  ensureSpace(state, height + 8);
 
-  return `
-    <section class="section">
-      <div class="section-header">
-        <div>
-          <div class="eyebrow">Trace</div>
-          <h2>Plan, Execution, and Audit Trail</h2>
-        </div>
-      </div>
-      <div class="callout-grid two-up">
-        <div class="callout-card">
-          <div class="card-title">Planned Steps</div>
-          ${planSteps.length > 0 ? `<ol class="ordered-list">${planSteps
-            .map(
-              (step) => `<li><strong>${escapeHtml(step.type || step.id || "step")}</strong> ${escapeHtml(step.description || step.desc || step.reason || step.title || "")}</li>`
-            )
-            .join("")}</ol>` : `<p class="muted-copy">No plan steps recorded.</p>`}
-        </div>
-        <div class="callout-card">
-          <div class="card-title">Audit Trace</div>
-          <ul><li>${stringifyLines(final.audit_trace.flags || [], "No audit flags recorded")}</li></ul>
-          <div class="sub-meta">Models: ${escapeHtml((final.audit_trace.models_used || []).join(", ") || "Not recorded")}</div>
-          <div class="sub-meta">Timestamps: ${escapeHtml((final.audit_trace.timestamps || []).join(" · ") || "Not recorded")}</div>
-        </div>
-      </div>
-      <div class="code-grid two-up">
-        <div>
-          <div class="card-title">Ledger Events</div>
-          <pre>${escapeHtml(JSON.stringify(ledger, null, 2) || "[]")}</pre>
-        </div>
-        <div>
-          <div class="card-title">Research Events</div>
-          <pre>${escapeHtml(JSON.stringify(research, null, 2) || "[]")}</pre>
-        </div>
-      </div>
-    </section>
-  `;
+  setFillColor(state.doc, COLORS.panel);
+  setDrawColor(state.doc, COLORS.line);
+  state.doc.roundedRect(state.marginX, state.y, state.width, height, 8, 8, "FD");
+  state.doc.setFont("helvetica", "bold");
+  state.doc.setFontSize(9);
+  setColor(state.doc, COLORS.muted);
+  state.doc.text(title.toUpperCase(), state.marginX + 10, state.y + 12);
+
+  state.doc.setFont("courier", "normal");
+  state.doc.setFontSize(9);
+  setColor(state.doc, COLORS.ink);
+  state.doc.text(lines, state.marginX + 10, state.y + 26);
+  state.y += height + 8;
 }
 
-function buildInputsSection(payload: AnalysisReportExportPayload): string {
-  return `
-    <section class="section">
-      <div class="section-header">
-        <div>
-          <div class="eyebrow">Appendix</div>
-          <h2>Inputs and Generated Artifacts</h2>
-        </div>
-      </div>
-      <div class="callout-grid two-up">
-        <div class="callout-card">
-          <div class="card-title">Command</div>
-          <p>${escapeHtml(payload.command || "No command recorded.")}</p>
-        </div>
-        <div class="callout-card">
-          <div class="card-title">Meeting Invite</div>
-          <p><strong>${escapeHtml(payload.final.meetingInvite?.title || "-")}</strong></p>
-          <p>${escapeHtml(payload.final.meetingInvite?.datetimeISO || "No time recorded")}</p>
-          <pre>${escapeHtml(payload.final.meetingInvite?.ics || "No ICS artifact recorded.")}</pre>
-        </div>
-      </div>
-      <div class="code-grid two-up">
-        <div>
-          <div class="card-title">Email Input</div>
-          <pre>${escapeHtml(payload.emailText || "No email text recorded.")}</pre>
-        </div>
-        <div>
-          <div class="card-title">Supporting Context</div>
-          <pre>${escapeHtml(payload.docText || "No supporting context recorded.")}</pre>
-        </div>
-      </div>
-      <div class="callout-card">
-        <div class="card-title">Reply Draft</div>
-        <pre>${escapeHtml(`Subject: ${payload.final.replyDraft?.subject || ""}\n\n${payload.final.replyDraft?.body || "No reply draft generated."}`)}</pre>
-      </div>
-    </section>
-  `;
+function detailCards(state: PdfState, items: Array<{ title: string; badges?: string[]; body: string; note?: string }>) {
+  for (const item of items) {
+    const bodyLines = splitText(state.doc, item.body, state.width - 24);
+    const noteLines = item.note ? splitText(state.doc, item.note, state.width - 24) : [];
+    const badgeLines = item.badges && item.badges.length > 0 ? 1 : 0;
+    const height = 34 + badgeLines * 16 + bodyLines.length * lineHeight(11) + noteLines.length * lineHeight(10, 1.4) + 20;
+    ensureSpace(state, Math.max(height, 68));
+
+    setFillColor(state.doc, COLORS.panel);
+    setDrawColor(state.doc, COLORS.line);
+    state.doc.roundedRect(state.marginX, state.y, state.width, Math.max(height, 68), 8, 8, "FD");
+
+    let localY = state.y + 14;
+    state.doc.setFont("helvetica", "bold");
+    state.doc.setFontSize(12);
+    setColor(state.doc, COLORS.ink);
+    const titleLines = splitText(state.doc, item.title, state.width - 24);
+    state.doc.text(titleLines, state.marginX + 10, localY);
+    localY += titleLines.length * lineHeight(12, 1.2) + 4;
+
+    if (item.badges && item.badges.length > 0) {
+      state.doc.setFont("helvetica", "normal");
+      state.doc.setFontSize(9);
+      setColor(state.doc, COLORS.accent);
+      state.doc.text(item.badges.join("  ·  "), state.marginX + 10, localY);
+      localY += 14;
+    }
+
+    state.doc.setFont("helvetica", "normal");
+    state.doc.setFontSize(11);
+    setColor(state.doc, COLORS.muted);
+    state.doc.text(bodyLines, state.marginX + 10, localY);
+    localY += bodyLines.length * lineHeight(11);
+
+    if (item.note) {
+      state.doc.setFontSize(10);
+      setColor(state.doc, COLORS.muted);
+      state.doc.text(noteLines, state.marginX + 10, localY + 2);
+    }
+
+    state.y += Math.max(height, 68) + 8;
+  }
 }
 
-function buildReportHtml(payload: AnalysisReportExportPayload): string {
+function buildPdf(payload: AnalysisReportExportPayload, doc: import("jspdf").jsPDF) {
   const subject = payload.scannerContext?.subject || payload.final.summary.email || "Aegis Desk Report";
-  const generatedAt = formatTimestamp(new Date().toISOString());
+  const state: PdfState = {
+    doc,
+    pageWidth: doc.internal.pageSize.getWidth(),
+    pageHeight: doc.internal.pageSize.getHeight(),
+    marginX: 40,
+    marginY: 42,
+    width: doc.internal.pageSize.getWidth() - 80,
+    y: 42,
+    subject,
+    generatedAt: formatTimestamp(new Date().toISOString()),
+  };
 
-  return `
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <title>${escapeHtml(subject)}</title>
-    <style>
-      :root {
-        color-scheme: light;
-        --ink: #111827;
-        --muted: #4b5563;
-        --line: #d4d8df;
-        --panel: #f8fafc;
-        --panel-strong: #eef2f7;
-        --accent: #1d4ed8;
-        --accent-soft: rgba(29, 78, 216, 0.1);
-        --risk: #b91c1c;
-        --caution: #b45309;
-        --clear: #047857;
-      }
-      * { box-sizing: border-box; }
-      body {
-        margin: 0;
-        background: #e5e7eb;
-        color: var(--ink);
-        font-family: "IBM Plex Sans", Arial, sans-serif;
-        -webkit-print-color-adjust: exact;
-        print-color-adjust: exact;
-      }
-      .page {
-        width: 210mm;
-        min-height: 297mm;
-        margin: 0 auto;
-        padding: 18mm;
-        background: white;
-      }
-      .report-header {
-        display: flex;
-        justify-content: space-between;
-        gap: 24px;
-        align-items: flex-start;
-        padding-bottom: 18px;
-        border-bottom: 1px solid var(--line);
-      }
-      .brand { font-family: "IBM Plex Mono", monospace; letter-spacing: 0.18em; font-size: 11px; text-transform: uppercase; color: var(--muted); }
-      h1 { margin: 10px 0 8px; font-size: 32px; line-height: 1.1; }
-      .lede { margin: 0; font-size: 15px; line-height: 1.7; color: var(--muted); max-width: 70ch; }
-      .meta-pill { display: inline-flex; align-items: center; border: 1px solid var(--line); padding: 6px 10px; border-radius: 999px; background: var(--panel); font-size: 11px; color: var(--muted); }
-      .overview-grid, .meta-grid, .callout-grid, .code-grid {
-        display: grid;
-        gap: 14px;
-      }
-      .overview-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 18px; }
-      .meta-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-      .two-up { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .stat-card, .callout-card, .detail-card {
-        border: 1px solid var(--line);
-        background: var(--panel);
-        border-radius: 16px;
-        padding: 14px 16px;
-      }
-      .stat-label, .eyebrow, .card-title, .sub-meta {
-        font-family: "IBM Plex Mono", monospace;
-      }
-      .stat-label, .eyebrow { text-transform: uppercase; letter-spacing: 0.12em; font-size: 11px; color: var(--muted); }
-      .stat-value { margin-top: 10px; font-size: 24px; line-height: 1.2; font-weight: 500; }
-      .section { margin-top: 24px; }
-      .section-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 14px; }
-      .section-header h2 { margin: 6px 0 0; font-size: 20px; line-height: 1.2; }
-      .stack { display: grid; gap: 12px; }
-      .detail-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-      .badge {
-        display: inline-flex;
-        border-radius: 999px;
-        background: var(--accent-soft);
-        border: 1px solid rgba(29, 78, 216, 0.18);
-        color: var(--accent);
-        padding: 4px 8px;
-        font-size: 11px;
-        font-family: "IBM Plex Mono", monospace;
-        text-transform: uppercase;
-      }
-      .detail-title { margin-top: 10px; font-size: 15px; font-weight: 500; }
-      .detail-body, .callout-card p, .muted-copy { margin-top: 10px; font-size: 14px; line-height: 1.75; color: var(--muted); }
-      .detail-note, .sub-meta { margin-top: 10px; font-size: 12px; line-height: 1.6; color: var(--muted); }
-      .card-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); }
-      .ordered-list, ul { margin: 12px 0 0; padding-left: 18px; }
-      li { margin-bottom: 6px; font-size: 13px; line-height: 1.7; color: var(--muted); }
-      .meta-grid div { border: 1px solid var(--line); border-radius: 14px; padding: 10px 12px; background: white; }
-      .meta-grid span { display: block; font-family: "IBM Plex Mono", monospace; font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); }
-      .meta-grid strong { display: block; margin-top: 6px; font-size: 14px; font-weight: 500; color: var(--ink); }
-      pre {
-        margin: 12px 0 0;
-        white-space: pre-wrap;
-        word-break: break-word;
-        border: 1px solid var(--line);
-        background: #ffffff;
-        border-radius: 14px;
-        padding: 12px;
-        font-size: 12px;
-        line-height: 1.65;
-        font-family: "IBM Plex Mono", monospace;
-        color: #1f2937;
-      }
-      .conflict-card { background: #fef2f2; }
-      .footer-note {
-        margin-top: 24px;
-        border-top: 1px solid var(--line);
-        padding-top: 12px;
-        font-size: 11px;
-        color: var(--muted);
-        font-family: "IBM Plex Mono", monospace;
-      }
-      @media print {
-        body { background: white; }
-        .page { margin: 0; width: auto; min-height: auto; padding: 14mm; }
-      }
-      @page { size: A4; margin: 12mm; }
-    </style>
-  </head>
-  <body>
-    <div class="page">
-      <header class="report-header">
-        <div>
-          <div class="brand">Aegis Desk / Structured Analysis Report</div>
-          <h1>${escapeHtml(subject)}</h1>
-          <p class="lede">This export captures the full structured analytical flow from inbox triage through final synthesis, including scanner context, claims, evidence scoring, decisioning, and trace metadata.</p>
-        </div>
-        <div class="meta-pill">Generated ${escapeHtml(generatedAt)}</div>
-      </header>
+  pageHeader(state);
+  paragraph(
+    state,
+    "This export captures the structured analytical flow from inbox triage through final synthesis, including scanner context, claims, evidence scoring, decisioning, and execution trace.",
+    { size: 11, color: COLORS.muted }
+  );
+  metricCards(state, [
+    {
+      label: "Final Action",
+      value: payload.final.decision.final_action.replace(/_/g, " "),
+      tone: payload.final.decision.final_action === "human_review" ? "risk" : payload.final.decision.final_action === "escalate" ? "caution" : "clear",
+      sub: payload.final.decision.reason,
+    },
+    {
+      label: "Risk",
+      value: `${payload.final.risk_assessment.level} · ${payload.final.risk_assessment.score}`,
+      tone: payload.final.risk_assessment.level === "high" ? "risk" : payload.final.risk_assessment.level === "medium" ? "caution" : "clear",
+      sub: payload.final.risk_assessment.rationale,
+    },
+    {
+      label: "Uncertainty",
+      value: `${payload.final.uncertainty.level} · ${formatPercent(payload.final.uncertainty.score)}`,
+      tone: payload.final.uncertainty.level === "high" ? "risk" : payload.final.uncertainty.level === "medium" ? "caution" : "info",
+      sub: payload.final.uncertainty.summary,
+    },
+    {
+      label: "Evidence Quality",
+      value: formatPercent(payload.final.evidence_quality_score || 0),
+      tone: "info",
+      sub: `${payload.final.evidence.length} evidence items · ${payload.final.conflicts.length} conflicts`,
+    },
+    {
+      label: "Scanner Priority",
+      value: payload.scannerContext ? `${payload.scannerContext.priority} · ${payload.scannerContext.priorityScore}` : "Not escalated from scanner",
+      tone: payload.scannerContext?.priority === "high" ? "risk" : payload.scannerContext?.priority === "medium" ? "caution" : "clear",
+      sub: payload.scannerContext?.primaryCategory || "Manual agent workflow",
+    },
+    {
+      label: "Entities / Deadlines",
+      value: `${payload.final.summary.entities.length} / ${payload.final.summary.deadlines.length}`,
+      tone: "info",
+      sub: `Entities and deadlines extracted from the structured run.`,
+    },
+  ]);
 
-      <section class="section">
-        <div class="section-header">
-          <div>
-            <div class="eyebrow">Overview</div>
-            <h2>Executive Snapshot</h2>
-          </div>
-        </div>
-        <div class="overview-grid">
-          ${buildOverviewCards(payload)}
-        </div>
-        <div class="callout-grid two-up" style="margin-top: 14px;">
-          <div class="callout-card">
-            <div class="card-title">Summary</div>
-            <p>${escapeHtml(payload.final.summary.email || "No email summary generated.")}</p>
-            ${payload.final.summary.document ? `<p>${escapeHtml(payload.final.summary.document)}</p>` : ""}
-          </div>
-          <div class="callout-card">
-            <div class="card-title">Decision & Uncertainty</div>
-            <p>${escapeHtml(payload.final.decision.reason)}</p>
-            <div class="sub-meta">${escapeHtml(payload.final.uncertainty.summary)}</div>
-            ${(payload.final.summary.deadlines || []).length > 0 ? `<div class="sub-meta">Deadlines: ${escapeHtml(payload.final.summary.deadlines.join(", "))}</div>` : ""}
-            ${(payload.final.summary.entities || []).length > 0 ? `<div class="sub-meta">Entities: ${escapeHtml(payload.final.summary.entities.join(", "))}</div>` : ""}
-          </div>
-        </div>
-      </section>
+  sectionHeader(state, "Overview", "Executive Summary");
+  paragraph(state, payload.final.summary.email || "No email summary generated.", { size: 12, color: COLORS.ink });
+  if (payload.final.summary.document) {
+    paragraph(state, payload.final.summary.document, { size: 11, color: COLORS.muted });
+  }
+  if (payload.final.summary.deadlines.length > 0) {
+    paragraph(state, `Deadlines: ${payload.final.summary.deadlines.join(", ")}`, { size: 11, color: COLORS.muted, bold: true });
+  }
+  if (payload.final.summary.entities.length > 0) {
+    paragraph(state, `Entities: ${payload.final.summary.entities.join(", ")}`, { size: 11, color: COLORS.muted, bold: true });
+  }
 
-      ${buildScannerSection(payload.scannerContext)}
-      ${buildClaimsSection(payload.final)}
-      ${buildEvidenceSection(payload.final)}
-      ${buildEntitySection(payload.final)}
-      ${buildAnalysisSection(payload.final)}
-      ${buildTraceSection(payload)}
-      ${buildInputsSection(payload)}
+  if (payload.scannerContext) {
+    sectionHeader(state, "Inbox Scanner", "Initial Triage Context", "Structured context preserved from the inbox triage surface before escalation.");
+    keyValueGrid(state, [
+      { label: "Subject", value: payload.scannerContext.subject || "-" },
+      { label: "Sender", value: payload.scannerContext.from || payload.scannerContext.senderEmail || "-" },
+      { label: "Domain", value: payload.scannerContext.senderDomain || "-" },
+      { label: "Category", value: payload.scannerContext.primaryCategory },
+      { label: "Mail Class", value: payload.scannerContext.mailClass || "unknown" },
+      { label: "Threat Type", value: payload.scannerContext.threatType || "unknown" },
+      { label: "Priority", value: `${payload.scannerContext.priority} · ${payload.scannerContext.priorityScore}` },
+      { label: "Trusted Decision", value: payload.scannerContext.trustedDecision?.action || "n/a" },
+      { label: "Scanner Route", value: payload.scannerContext.decision?.final_action || "n/a" },
+      { label: "Confidence", value: `${payload.scannerContext.trustedDecision?.confidencePct ?? payload.scannerContext.consensusScore}%` },
+      { label: "Consensus", value: `${payload.scannerContext.consensusScore}%${typeof payload.scannerContext.consensusStrength === "number" ? ` · ${formatPercent(payload.scannerContext.consensusStrength)}` : ""}` },
+      { label: "Uncertainty", value: `${payload.scannerContext.uncertaintyPercent}%` },
+    ]);
+    paragraph(state, payload.scannerContext.explanation?.summary || payload.scannerContext.decision?.reason || payload.scannerContext.trustedDecision?.note || payload.scannerContext.consensusNote || "No scanner explanation available.", { size: 11, color: COLORS.muted });
+    bullets(state, (payload.scannerContext.explanation?.keyFactors || payload.scannerContext.riskTags || payload.scannerContext.signals).slice(0, 8));
+    if (payload.scannerContext.disagreementFlags.length > 0) {
+      paragraph(state, `Disagreement flags: ${payload.scannerContext.disagreementFlags.join(", ")}`, { size: 10, color: COLORS.caution, bold: true });
+    }
+    if (payload.scannerContext.signalGroups?.deterministic) {
+      preBlock(state, "Deterministic Signal Groups", stringifyUnknown(payload.scannerContext.signalGroups.deterministic));
+    }
+    if (payload.scannerContext.signalGroups?.learned) {
+      preBlock(state, "Learned Signal Groups", stringifyUnknown(payload.scannerContext.signalGroups.learned));
+    }
+  }
 
-      <div class="footer-note">Prepared from the structured Aegis Desk workflow. Save via the browser print dialog as PDF for distribution.</div>
-    </div>
-    <script>
-      window.addEventListener('load', () => {
-        setTimeout(() => {
-          window.focus();
-          window.print();
-        }, 180);
-      });
-      window.addEventListener('afterprint', () => {
-        window.close();
-      });
-    </script>
-  </body>
-</html>`;
+  sectionHeader(state, "Decision", "Risk, Uncertainty, and Operational Route");
+  detailCards(state, [
+    {
+      title: `Decision · ${payload.final.decision.final_action.replace(/_/g, " ")}`,
+      badges: [payload.final.decision.risk_level, `${formatPercent(payload.final.uncertainty.score)} uncertainty`],
+      body: payload.final.decision.reason,
+      note: payload.final.uncertainty.summary,
+    },
+  ]);
+  bullets(state, payload.final.uncertainty.drivers);
+  divider(state);
+  bullets(
+    state,
+    payload.final.risk_assessment.findings.map((finding) => `${finding.severity.toUpperCase()} · ${finding.source} · ${finding.item}`)
+  );
+
+  sectionHeader(state, "Claims", "Structured Claims and Verification Notes");
+  if (payload.final.claims.length > 0) {
+    detailCards(
+      state,
+      payload.final.claims.map((claim) => ({
+        title: claim.text,
+        badges: [claim.type.replace(/_/g, " "), `${formatPercent(claim.confidence)} extraction confidence`, claim.verification?.status || "unverified"],
+        body: claim.verification?.notes || "No verification notes recorded.",
+      }))
+    );
+  } else {
+    paragraph(state, "No claims were extracted.", { size: 11, color: COLORS.muted });
+  }
+
+  sectionHeader(state, "Research", "Evidence and Conflicts");
+  if (payload.final.evidence.length > 0) {
+    detailCards(
+      state,
+      payload.final.evidence.map((item) => ({
+        title: item.title || item.url || "Evidence item",
+        badges: [
+          `${formatPercent(item.relevance_score || 0)} relevance`,
+          `${formatPercent(item.source_quality_score || 0)} source quality`,
+          `${formatPercent(item.recency_score || 0)} recency`,
+        ],
+        body: item.snippet || "No excerpt captured.",
+        note: item.url,
+      }))
+    );
+  } else {
+    paragraph(state, "No external evidence was captured in this run.", { size: 11, color: COLORS.muted });
+  }
+  if (payload.final.conflicts.length > 0) {
+    paragraph(state, "Conflicts detected across retrieved evidence:", { size: 11, color: COLORS.danger, bold: true });
+    bullets(state, payload.final.conflicts.map((conflict) => `${conflict.type}: ${conflict.summary}`), { color: COLORS.muted });
+  }
+
+  sectionHeader(state, "Trust", "Entity Verification");
+  if (payload.final.entityVerdicts.length > 0) {
+    detailCards(
+      state,
+      payload.final.entityVerdicts.map((verdict) => ({
+        title: verdict.entity,
+        badges: [verdict.verdict, verdict.entityType, `${verdict.uncertaintyPct}% uncertainty`],
+        body: verdict.rationale,
+        note: verdict.redFlags.length > 0 ? `Red flags: ${verdict.redFlags.join(", ")}` : verdict.followUpChecks.join(", "),
+      }))
+    );
+  } else {
+    paragraph(state, "No entity verdicts were produced.", { size: 11, color: COLORS.muted });
+  }
+
+  sectionHeader(state, "Analysis", payload.final.analysisSection?.title || "Key Findings");
+  if ((payload.final.analysisSection?.findings || []).length > 0) {
+    detailCards(
+      state,
+      payload.final.analysisSection.findings.map((finding) => ({
+        title: finding.risk,
+        badges: [finding.severity],
+        body: finding.whyItMatters,
+        note: `Suggested edit: ${finding.suggestedEdit}`,
+      }))
+    );
+  } else {
+    paragraph(state, "No structured analysis findings were generated.", { size: 11, color: COLORS.muted });
+  }
+
+  sectionHeader(state, "Trace", "Plan, Ledger, and Research Events");
+  const planSteps = normalizePlanSteps(payload.plan);
+  if (planSteps.length > 0) {
+    paragraph(state, "Planned steps:", { size: 11, color: COLORS.ink, bold: true });
+    bullets(state, planSteps.map((step) => `${step.type || step.id || "step"} · ${step.description || step.desc || step.reason || step.title || "No description"}`));
+  }
+  paragraph(state, `Models used: ${joinOrFallback(payload.final.audit_trace.models_used, "Not recorded")}`, { size: 10, color: COLORS.muted, bold: true });
+  paragraph(state, `Audit flags: ${joinOrFallback(payload.final.audit_trace.flags, "None recorded")}`, { size: 10, color: COLORS.muted });
+  paragraph(state, `Audit timestamps: ${joinOrFallback(payload.final.audit_trace.timestamps, "Not recorded")}`, { size: 10, color: COLORS.muted });
+  if ((payload.ledger || []).length > 0) {
+    preBlock(state, "Ledger Events", stringifyUnknown(payload.ledger));
+  }
+  if ((payload.research || []).length > 0) {
+    preBlock(state, "Research Events", stringifyUnknown(payload.research));
+  }
+
+  sectionHeader(state, "Appendix", "Inputs and Generated Artifacts");
+  paragraph(state, `Command: ${payload.command || "No command recorded."}`, { size: 11, color: COLORS.ink, bold: true });
+  preBlock(state, "Reply Draft", `Subject: ${payload.final.replyDraft?.subject || ""}\n\n${payload.final.replyDraft?.body || "No reply draft generated."}`);
+  preBlock(state, "Meeting Invite", `Title: ${payload.final.meetingInvite?.title || "-"}\nTime: ${payload.final.meetingInvite?.datetimeISO || "-"}\n\n${payload.final.meetingInvite?.ics || "No ICS artifact recorded."}`);
+  preBlock(state, "Email Input", payload.emailText || "No email text recorded.");
+  preBlock(state, "Supporting Context", payload.docText || "No supporting context recorded.");
+
+  footer(state);
 }
 
-export function exportStructuredReportPdf(payload: AnalysisReportExportPayload) {
+export async function exportStructuredReportPdf(payload: AnalysisReportExportPayload) {
   if (typeof window === "undefined") return;
 
-  const popup = window.open("", "_blank", "noopener,noreferrer");
-  if (!popup) {
-    throw new Error("Popup blocked. Allow popups for this site to export the PDF report.");
-  }
-
-  popup.document.open();
-  popup.document.write(buildReportHtml(payload));
-  popup.document.close();
-  popup.document.title = `${subjectSlug(payload.scannerContext?.subject || payload.final.summary.email || "analysis-report")}.pdf`;
+  const { jsPDF } = await import("jspdf");
+  const doc = new jsPDF({ unit: "pt", format: "a4", compress: true });
+  buildPdf(payload, doc);
+  doc.save(`${subjectSlug(payload.scannerContext?.subject || payload.final.summary.email || "analysis-report")}.pdf`);
 }
