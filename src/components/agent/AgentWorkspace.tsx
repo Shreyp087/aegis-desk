@@ -9,10 +9,10 @@ import PanelFrame from "@/components/PanelFrame";
 import PlanPanel from "@/components/PlanPanel";
 import ResearchPanel from "@/components/ResearchPanel";
 import {
-  exportStructuredReportPdf,
+  AnalysisReportDownloadLink,
   type AnalysisReportExportPayload,
 } from "@/components/agent/reportExport";
-import { AegisButton, MetricCard, ProcessingBadge, StatusBadge } from "@/components/ui/AegisPrimitives";
+import { AegisButton, MetricCard, ProcessingBadge, StatusBadge, buttonClassName } from "@/components/ui/AegisPrimitives";
 import {
   clearAgentEscalationPrefill,
   readAgentEscalationPrefill,
@@ -168,26 +168,18 @@ export default function AgentWorkspace() {
     }
   }, [canRunAgent, command, docText, emailText, isRunning, linkupDepth, offlinePublicEnforced]);
 
-  const exportPdf = useCallback(async () => {
-    if (!outputs) {
-      setStream("Run the agent first so there is a structured report to export.");
-      return;
-    }
-
-    try {
-      await exportStructuredReportPdf({
-        final: outputs as AnalysisReportExportPayload["final"],
-        plan,
-        ledger,
-        research,
-        emailText,
-        docText,
-        command,
-        scannerContext,
-      });
-    } catch (error) {
-      setStream(error instanceof Error ? error.message : "Unable to export the PDF report.");
-    }
+  const reportPayload = useMemo<AnalysisReportExportPayload | null>(() => {
+    if (!outputs) return null;
+    return {
+      final: outputs as AnalysisReportExportPayload["final"],
+      plan,
+      ledger,
+      research,
+      emailText,
+      docText,
+      command,
+      scannerContext,
+    };
   }, [command, docText, emailText, ledger, outputs, plan, research, scannerContext]);
 
   useEffect(() => {
@@ -457,9 +449,15 @@ export default function AgentWorkspace() {
                 title="Output"
                 subtitle="Final structured report, evidence summary, and draft response."
                 actionButton={
-                  <AegisButton variant="secondary" onClick={exportPdf} disabled={!outputs}>
-                    Export PDF
-                  </AegisButton>
+                  reportPayload ? (
+                    <AnalysisReportDownloadLink payload={reportPayload} className={buttonClassName("secondary")}>
+                      Export PDF
+                    </AnalysisReportDownloadLink>
+                  ) : (
+                    <AegisButton variant="secondary" disabled={!outputs}>
+                      Export PDF
+                    </AegisButton>
+                  )
                 }
               >
                 <OutputPanel stream={stream} outputs={outputs} scannerContext={scannerContext} />

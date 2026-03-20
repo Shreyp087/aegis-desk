@@ -1461,11 +1461,11 @@ export default function InboxScannerPanel({
                     </div>
                   </div>
 
-                  <div className="flex flex-col gap-4 xl:flex-row">
-                    <div className="grid min-w-0 flex-1 gap-4">
-                      <div className="grid gap-2">
+                  <div className="grid gap-6 xl:grid-cols-[minmax(0,1.3fr)_minmax(320px,0.7fr)] xl:items-start">
+                    <div className="grid min-w-0 gap-6">
+                      <div className="grid gap-3 rounded-xl border border-aegis-border bg-aegis-base px-5 py-5">
                         <SectionLabel>Message Body</SectionLabel>
-                        <div className="max-h-96 overflow-auto rounded-lg border border-aegis-border bg-aegis-base px-4 py-4">
+                        <div className="max-h-96 overflow-auto rounded-lg border border-aegis-border bg-aegis-elevated/70 px-4 py-4">
                           <div className="grid gap-3 font-mono text-sm leading-7 text-aegis-text">
                             {selectedBlocks.map((block, index) => (
                               <div
@@ -1483,20 +1483,20 @@ export default function InboxScannerPanel({
                         </div>
                       </div>
 
-                      <div className="grid gap-2">
+                      <div className="grid gap-3 rounded-xl border border-aegis-border bg-aegis-base px-5 py-5">
                         <SectionLabel>Structured Explanation</SectionLabel>
-                        <div className="rounded-lg border border-aegis-border bg-aegis-elevated px-4 py-4">
-                          <div className="text-sm leading-6 text-aegis-text">
+                        <div className="grid gap-4 rounded-lg border border-aegis-border bg-aegis-elevated/70 px-4 py-4">
+                          <div className="text-sm leading-7 text-aegis-text">
                             {selected.explanation?.summary ||
                               selected.decisionTrace?.explanation ||
                               "No structured explanation was returned for this message."}
                           </div>
                           {selected.explanation?.keyFactors?.length ? (
-                            <ul className="mt-3 grid gap-2">
+                            <ul className="grid gap-2">
                               {selected.explanation.keyFactors.slice(0, 5).map((factor) => (
                                 <li
                                   key={factor}
-                                  className="rounded border border-aegis-border bg-aegis-base px-3 py-2 text-sm text-aegis-muted"
+                                  className="rounded-lg border border-aegis-border bg-aegis-base px-3 py-2 text-sm leading-6 text-aegis-muted"
                                 >
                                   {factor}
                                 </li>
@@ -1507,10 +1507,10 @@ export default function InboxScannerPanel({
                       </div>
                     </div>
 
-                    <div className="grid content-start gap-4 min-w-0">
-                      <div className="grid gap-2">
+                    <div className="grid content-start gap-5 min-w-0">
+                      <div className="grid gap-3 rounded-xl border border-aegis-border bg-aegis-base px-5 py-5">
                         <SectionLabel>Queue Metadata</SectionLabel>
-                        <div className="grid gap-3 rounded-lg border border-aegis-border bg-aegis-elevated px-4 py-4">
+                        <div className="grid gap-3 rounded-lg border border-aegis-border bg-aegis-elevated/70 px-4 py-4">
                           <MetaItem label="Primary Category" value={categoryLabel(selected.primaryCategory)} />
                           <MetaItem
                             label="Trusted Decision"
@@ -1523,9 +1523,9 @@ export default function InboxScannerPanel({
                         </div>
                       </div>
 
-                      <div className="grid gap-2">
+                      <div className="grid gap-3 rounded-xl border border-aegis-border bg-aegis-base px-5 py-5">
                         <SectionLabel>Signals</SectionLabel>
-                        <div className="grid gap-2 rounded-lg border border-aegis-border bg-aegis-elevated px-4 py-4">
+                        <div className="grid gap-2 rounded-lg border border-aegis-border bg-aegis-elevated/70 px-4 py-4">
                           {(selectedSignals.length > 0 ? selectedSignals : ["No deterministic signals captured."])
                             .slice(0, 5)
                             .map((signal: string) => (
@@ -1537,9 +1537,9 @@ export default function InboxScannerPanel({
                         </div>
                       </div>
 
-                      <div className="grid gap-2">
+                      <div className="grid gap-3 rounded-xl border border-aegis-border bg-aegis-base px-5 py-5">
                         <SectionLabel>Evidence Extracts</SectionLabel>
-                        <div className="grid gap-3 rounded-lg border border-aegis-border bg-aegis-elevated px-4 py-4">
+                        <div className="grid gap-3 rounded-lg border border-aegis-border bg-aegis-elevated/70 px-4 py-4">
                           <div className="grid gap-3 sm:grid-cols-2">
                             {selectedEvidenceItems.map((item) => (
                               <div
