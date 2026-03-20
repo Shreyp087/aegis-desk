@@ -1,6 +1,7 @@
 import { cookies } from "next/headers";
 
 import {
+  buildPublicRequestUrl,
   buildGmailAuthUrl,
   createOauthState,
   getGmailOAuthConfig,
@@ -8,7 +9,7 @@ import {
 } from "@/lib/inbox/gmail";
 
 export async function GET(req: Request) {
-  const url = new URL(req.url);
+  const url = buildPublicRequestUrl(req);
   const fallbackUrl = new URL("/", url.origin);
 
   try {

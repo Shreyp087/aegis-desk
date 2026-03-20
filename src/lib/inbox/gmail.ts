@@ -34,6 +34,54 @@ export type GmailTokenBundle = {
   emailAddress?: string;
 };
 
+export function buildPublicRequestUrl(req: Request): URL {
+  const direct = new URL(req.url);
+  const forwardedHost =
+    req.headers.get("x-forwarded-host") ||
+    req.headers.get("host") ||
+    direct.host;
+  const forwardedProto =
+    req.headers.get("x-forwarded-proto") ||
+    direct.protocol.replace(/:$/, "") ||
+    "https";
+
+  return new URL(`${forwardedProto}://${forwardedHost}${direct.pathname}${direct.search}`);
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  const normalized = hostname.trim().toLowerCase();
+  return (
+    normalized === "localhost" ||
+    normalized === "127.0.0.1" ||
+    normalized === "0.0.0.0" ||
+    normalized === "::1"
+  );
+}
+
+function resolveRedirectUri(requestUrl?: URL): string | undefined {
+  const configured = process.env.GOOGLE_REDIRECT_URI?.trim();
+  const requestBased = requestUrl ? `${requestUrl.origin}/api/inbox/gmail/callback` : undefined;
+
+  if (!configured) {
+    return requestBased;
+  }
+
+  try {
+    const configuredUrl = new URL(configured);
+    const requestHost = requestUrl?.hostname ? requestUrl.hostname.toLowerCase() : "";
+    const requestIsPublic = Boolean(requestHost) && !isLoopbackHost(requestHost);
+    const configuredIsLoopback = isLoopbackHost(configuredUrl.hostname);
+
+    if (requestIsPublic && configuredIsLoopback) {
+      return requestBased;
+    }
+
+    return configuredUrl.toString();
+  } catch {
+    return requestBased || configured;
+  }
+}
+
 type GmailTokenResponse = {
   access_token: string;
   expires_in: number;
@@ -112,13 +160,11 @@ function decodeToken(encoded: string): GmailTokenBundle | null {
 export function getGmailOAuthConfig(requestUrl?: URL): GmailOAuthConfig {
   const clientId = process.env.GOOGLE_CLIENT_ID;
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  const redirectUri =
-    process.env.GOOGLE_REDIRECT_URI ||
-    (requestUrl ? `${requestUrl.origin}/api/inbox/gmail/callback` : undefined);
+  const redirectUri = resolveRedirectUri(requestUrl);
 
   if (!clientId || !clientSecret || !redirectUri) {
     throw new Error(
-      "Missing Gmail OAuth config. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI."
+      "Missing Gmail OAuth config. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and configure a valid deployed Gmail callback URI."
     );
   }
 

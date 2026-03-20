@@ -1,6 +1,7 @@
 import { cookies } from "next/headers";
 
 import {
+  buildPublicRequestUrl,
   clearGmailOauthStateCookie,
   exchangeCodeForToken,
   getGmailOAuthConfig,
@@ -10,7 +11,7 @@ import {
 } from "@/lib/inbox/gmail";
 
 export async function GET(req: Request) {
-  const url = new URL(req.url);
+  const url = buildPublicRequestUrl(req);
   const appUrl = new URL("/", url.origin);
 
   const oauthError = url.searchParams.get("error");
