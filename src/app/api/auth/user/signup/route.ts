@@ -18,6 +18,10 @@ const SignupSchema = z.object({
 });
 
 export async function POST(req: Request) {
+  let step = "parse-request";
+  let emailForLog: string | null = null;
+  let repoProvider: string | null = null;
+
   try {
     const parsed = SignupSchema.safeParse(await req.json());
     if (!parsed.success) {
@@ -31,10 +35,16 @@ export async function POST(req: Request) {
       );
     }
 
+    step = "normalize-input";
     const email = parsed.data.email.trim().toLowerCase();
     const name = parsed.data.name.trim();
-    const repo = getAuthAccountRepository();
+    emailForLog = email;
 
+    step = "select-repository";
+    const repo = getAuthAccountRepository();
+    repoProvider = repo.provider;
+
+    step = "check-existing-accounts";
     const [existingUser, existingAdmin] = await Promise.all([
       repo.findByEmail("user", email),
       repo.findByEmail("admin", email),
@@ -46,14 +56,20 @@ export async function POST(req: Request) {
       );
     }
 
+    step = "hash-password";
     const passwordHash = await hashPassword(parsed.data.password);
+
+    step = "create-user";
     const created = await repo.createUser({
       name,
       email,
       passwordHash,
     });
+
+    step = "touch-last-login";
     await repo.touchLastLogin("user", created.id);
 
+    step = "sign-auth-token";
     const token = signAuthToken({
       id: created.id,
       email: created.email,
@@ -84,8 +100,18 @@ export async function POST(req: Request) {
       );
     }
     const detail = error instanceof Error ? error.message : String(error);
+    console.error("[auth:user-signup] failed", {
+      step,
+      provider: repoProvider,
+      email: emailForLog,
+      nodeEnv: process.env.NODE_ENV || "unknown",
+      hasMongoUri: Boolean(process.env.MONGODB_URI),
+      hasJwtSecret: Boolean(process.env.AUTH_JWT_SECRET),
+      mongoDbName: process.env.MONGODB_DB || "aegis_desk",
+      detail,
+    });
     return NextResponse.json(
-      { ok: false, error: "User signup failed", detail },
+      { ok: false, error: "User signup failed", detail: `${step}: ${detail}` },
       { status: 500 }
     );
   }

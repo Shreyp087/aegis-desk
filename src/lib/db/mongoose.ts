@@ -9,6 +9,19 @@ declare global {
   var __aegisMongooseCache__: MongooseCache | undefined;
 }
 
+function formatMongoError(error: unknown) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+    };
+  }
+
+  return {
+    message: String(error),
+  };
+}
+
 function getMongoUri(): string {
   const uri = process.env.MONGODB_URI;
   if (!uri) {
@@ -31,10 +44,21 @@ global.__aegisMongooseCache__ = cache;
 export async function connectMongo(): Promise<typeof mongoose> {
   if (cache.conn) return cache.conn;
   if (!cache.promise) {
-    cache.promise = mongoose.connect(getMongoUri(), {
-      dbName: getMongoDbName(),
-      autoIndex: true,
-    });
+    cache.promise = mongoose
+      .connect(getMongoUri(), {
+        dbName: getMongoDbName(),
+        autoIndex: true,
+      })
+      .catch((error) => {
+        cache.promise = null;
+        console.error("[mongo] connection failed", {
+          dbName: getMongoDbName(),
+          nodeEnv: process.env.NODE_ENV || "unknown",
+          hasMongoUri: Boolean(process.env.MONGODB_URI),
+          ...formatMongoError(error),
+        });
+        throw error;
+      });
   }
   cache.conn = await cache.promise;
   return cache.conn;

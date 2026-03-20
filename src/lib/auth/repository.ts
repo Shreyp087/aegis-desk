@@ -79,6 +79,28 @@ function normalizeEmail(email: string) {
   return email.trim().toLowerCase();
 }
 
+function maskEmail(email: string | null | undefined) {
+  if (!email) return null;
+  const normalized = normalizeEmail(email);
+  const [local, domain] = normalized.split("@");
+  if (!domain) return normalized;
+  if (local.length <= 2) return `${local[0] || "*"}*@${domain}`;
+  return `${local.slice(0, 2)}***@${domain}`;
+}
+
+function formatAuthRepoError(error: unknown) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+    };
+  }
+
+  return {
+    message: String(error),
+  };
+}
+
 function getLocalAuthDbPath() {
   return path.join(process.cwd(), LOCAL_AUTH_DB_RELATIVE_PATH);
 }
@@ -299,6 +321,13 @@ async function ensureMongoAuthSeed(): Promise<void> {
     await mongoSeedPromise;
   } catch (error) {
     mongoSeedPromise = null;
+    console.error("[auth:repo] mongo seed failed", {
+      provider: "mongo",
+      autoSeedEnabled: shouldAutoSeedMongoAuth(),
+      seedUserEmail: maskEmail(LOCAL_AUTH_SEED.user.email),
+      seedAdminEmail: maskEmail(LOCAL_AUTH_SEED.admin.email),
+      ...formatAuthRepoError(error),
+    });
     throw error;
   }
 }
@@ -463,6 +492,12 @@ async function createMongoUser(input: {
     if (isDuplicateMongoKeyError(error)) {
       throw new AuthEmailExistsError(normalizedEmail);
     }
+    console.error("[auth:repo] createMongoUser failed", {
+      provider: "mongo",
+      email: maskEmail(normalizedEmail),
+      nameLength: input.name.trim().length,
+      ...formatAuthRepoError(error),
+    });
     throw error;
   }
 }
