@@ -8,8 +8,16 @@ import OutputPanel from "@/components/OutputPanel";
 import PanelFrame from "@/components/PanelFrame";
 import PlanPanel from "@/components/PlanPanel";
 import ResearchPanel from "@/components/ResearchPanel";
+import {
+  exportStructuredReportPdf,
+  type AnalysisReportExportPayload,
+} from "@/components/agent/reportExport";
 import { AegisButton, MetricCard, ProcessingBadge, StatusBadge } from "@/components/ui/AegisPrimitives";
-import { clearAgentEscalationPrefill, readAgentEscalationPrefill } from "@/lib/agent/prefill";
+import {
+  clearAgentEscalationPrefill,
+  readAgentEscalationPrefill,
+  type AgentEscalationScannerContext,
+} from "@/lib/agent/prefill";
 import { OFFLINE_MODE_TEMPLATE_CONFIG } from "@/lib/offline";
 
 function cn(...values: Array<string | false | null | undefined>) {
@@ -65,6 +73,7 @@ export default function AgentWorkspace() {
   const [expandedResearch, setExpandedResearch] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   const [prefillNotice, setPrefillNotice] = useState<string | null>(null);
+  const [scannerContext, setScannerContext] = useState<AgentEscalationScannerContext | null>(null);
   const [isReady, setIsReady] = useState(false);
 
   const canRunAgent = emailText.trim().length > 0 && command.trim().length > 0;
@@ -90,6 +99,7 @@ export default function AgentWorkspace() {
     setResearch([]);
     setOutputs(null);
     setPrefillNotice(null);
+    setScannerContext(null);
   }, []);
 
   const runAgent = useCallback(async () => {
@@ -158,12 +168,35 @@ export default function AgentWorkspace() {
     }
   }, [canRunAgent, command, docText, emailText, isRunning, linkupDepth, offlinePublicEnforced]);
 
+  const exportPdf = useCallback(() => {
+    if (!outputs) {
+      setStream("Run the agent first so there is a structured report to export.");
+      return;
+    }
+
+    try {
+      exportStructuredReportPdf({
+        final: outputs as AnalysisReportExportPayload["final"],
+        plan,
+        ledger,
+        research,
+        emailText,
+        docText,
+        command,
+        scannerContext,
+      });
+    } catch (error) {
+      setStream(error instanceof Error ? error.message : "Unable to export the PDF report.");
+    }
+  }, [command, docText, emailText, ledger, outputs, plan, research, scannerContext]);
+
   useEffect(() => {
     const prefill = readAgentEscalationPrefill();
     if (!prefill) return undefined;
 
     if (prefill.rawEmail) setEmailText(prefill.rawEmail);
     if (prefill.command) setCommand(prefill.command);
+    if (prefill.scannerContext) setScannerContext(prefill.scannerContext);
     setPrefillNotice("Loaded email context from Inbox Scanner.");
 
     // Clear after the hydrated mount so development remounts do not lose the prefill.
@@ -420,8 +453,16 @@ export default function AgentWorkspace() {
             </div>
 
             <div className="min-w-0 transition-all duration-300" style={{ transitionDelay: "340ms" }}>
-              <PanelFrame title="Output" subtitle="Final structured report, evidence summary, and draft response.">
-                <OutputPanel stream={stream} outputs={outputs} />
+              <PanelFrame
+                title="Output"
+                subtitle="Final structured report, evidence summary, and draft response."
+                actionButton={
+                  <AegisButton variant="secondary" onClick={exportPdf} disabled={!outputs}>
+                    Export PDF
+                  </AegisButton>
+                }
+              >
+                <OutputPanel stream={stream} outputs={outputs} scannerContext={scannerContext} />
               </PanelFrame>
             </div>
           </div>

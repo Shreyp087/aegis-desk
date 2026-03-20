@@ -1,15 +1,83 @@
 export const AGENT_ESCALATION_PREFILL_KEY = "aegis:agent-escalation-prefill:v1";
 
+export type AgentEscalationScannerContext = {
+  subject: string;
+  from: string;
+  senderEmail: string;
+  senderDomain: string;
+  priority: "high" | "medium" | "low";
+  priorityScore: number;
+  primaryCategory: string;
+  mailClass?: "spam" | "harmful" | "actionable" | "informational";
+  threatType?: string;
+  trustScore: number;
+  reputationScore: number;
+  reputationFindings: string[];
+  riskTags: string[];
+  signals: string[];
+  signalGroups?: {
+    deterministic?: Record<string, unknown>;
+    learned?: Record<string, unknown>;
+  };
+  uncertaintyPercent: number;
+  uncertainty?: {
+    score: number;
+    type: string[];
+    sources: {
+      model_confidence: number;
+      signal_conflict: number;
+      missing_fields: number;
+    };
+  };
+  explanation?: {
+    summary: string;
+    keyFactors: string[];
+  };
+  decision?: {
+    final_action: string;
+    reason: string;
+    risk_level: string;
+  };
+  trustedDecision?: {
+    action: string;
+    confidencePct: number;
+    riskScore: number;
+    note: string;
+  };
+  consensusScore: number;
+  consensusStrength?: number;
+  consensusNote: string;
+  disagreementFlags: string[];
+  thread?: {
+    key: string;
+    depth: number;
+    riskDensity: number;
+  };
+  extracted?: {
+    deadlines: string[];
+    moneyMentions: string[];
+    urls: string[];
+    attachments: string[];
+    attachmentRiskScore: number;
+  };
+  capturedAt: number;
+};
+
 export type AgentEscalationPrefill = {
   rawEmail: string;
   command: string;
   source: "inbox-scanner";
   createdAt: number;
+  scannerContext?: AgentEscalationScannerContext;
 };
 
 const PREFILL_REMOUNT_GRACE_MS = 2_000;
 
-export function stashAgentEscalationPrefill(input: { rawEmail: string; command: string }) {
+export function stashAgentEscalationPrefill(input: {
+  rawEmail: string;
+  command: string;
+  scannerContext?: AgentEscalationScannerContext;
+}) {
   if (typeof window === "undefined") return;
 
   const payload: AgentEscalationPrefill = {
@@ -17,6 +85,7 @@ export function stashAgentEscalationPrefill(input: { rawEmail: string; command: 
     command: input.command,
     source: "inbox-scanner",
     createdAt: Date.now(),
+    scannerContext: input.scannerContext,
   };
 
   try {

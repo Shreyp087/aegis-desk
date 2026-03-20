@@ -8,6 +8,7 @@ import type {
   InboxSignalGroups,
   InboxUncertainty,
 } from "@/lib/inbox/compatibility";
+import type { AgentEscalationScannerContext } from "@/lib/agent/prefill";
 import type { InboxDecision } from "@/lib/inbox/decision";
 
 import PanelFrame from "@/components/PanelFrame";
@@ -311,6 +312,45 @@ function riskSummaryFromAlert(alert: InboxAlert) {
   };
 }
 
+function buildEscalationScannerContext(alert: InboxAlert): AgentEscalationScannerContext {
+  return {
+    subject: alert.subject,
+    from: alert.from,
+    senderEmail: alert.senderEmail,
+    senderDomain: alert.senderDomain,
+    priority: alert.priority,
+    priorityScore: alert.priorityScore,
+    primaryCategory: alert.primaryCategory,
+    mailClass: alert.mailClass,
+    threatType: alert.threatType,
+    trustScore: alert.trustScore,
+    reputationScore: alert.reputationScore,
+    reputationFindings: alert.reputationFindings,
+    riskTags: alert.riskTags,
+    signals: alert.signals,
+    signalGroups: alert.signalGroups,
+    uncertaintyPercent: alert.uncertaintyPercent,
+    uncertainty: alert.uncertainty,
+    explanation: alert.explanation,
+    decision: alert.decision,
+    trustedDecision: alert.trustedDecision
+      ? {
+          action: alert.trustedDecision.action,
+          confidencePct: alert.trustedDecision.confidencePct,
+          riskScore: alert.trustedDecision.riskScore,
+          note: alert.trustedDecision.note,
+        }
+      : undefined,
+    consensusScore: alert.consensusScore,
+    consensusStrength: alert.consensus_strength,
+    consensusNote: alert.consensusNote,
+    disagreementFlags: alert.disagreement_flags || [],
+    thread: alert.thread,
+    extracted: alert.extracted,
+    capturedAt: Date.now(),
+  };
+}
+
 function safeFeedbackLabel(alert: InboxAlert): FeedbackOutcome {
   if (alert.mailClass === "spam") return "spam_false_positive";
   if (alert.mailClass === "harmful") return "harmful_false_positive";
@@ -425,7 +465,11 @@ function CategoryFilterButton({
 export default function InboxScannerPanel({
   onEscalate,
 }: {
-  onEscalate: (rawEmail: string, escalatedCommand: string) => void;
+  onEscalate: (payload: {
+    rawEmail: string;
+    command: string;
+    scannerContext: AgentEscalationScannerContext;
+  }) => void;
 }) {
   const offlinePublicState = process.env.NEXT_PUBLIC_OFFLINE_MODE_STATE || "disabled";
   const offlinePublicEnabled = process.env.NEXT_PUBLIC_OFFLINE_MODE === "true";
@@ -1441,7 +1485,17 @@ export default function InboxScannerPanel({
                   </div>
 
                   <div className="grid gap-2">
-                    <button type="button" onClick={() => onEscalate(selected.rawEmail, escalationCommandWithNote(selected))} className={buttonClassName("primary", false, "justify-center")}>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onEscalate({
+                          rawEmail: selected.rawEmail,
+                          command: escalationCommandWithNote(selected),
+                          scannerContext: buildEscalationScannerContext(selected),
+                        })
+                      }
+                      className={buttonClassName("primary", false, "justify-center")}
+                    >
                       Escalate to Agent Desk
                     </button>
                     <button type="button" onClick={() => toggleReviewed(selected.id)} className={buttonClassName("secondary", false, "justify-center")}>

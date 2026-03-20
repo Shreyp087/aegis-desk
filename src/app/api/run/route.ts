@@ -134,7 +134,7 @@ const GeneratedFinalSchema = z.object({
     ics: z.string(),
   }),
 
-  claims: z.array(ExtractedClaimSchema).catch([]).default([]),
+  claims: z.array(ExtractedClaimSchema),
 
   notes: z.object({
     whatIDid: z.array(z.string()),

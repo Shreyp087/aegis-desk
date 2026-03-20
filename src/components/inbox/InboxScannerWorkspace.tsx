@@ -76,8 +76,8 @@ export default function InboxScannerWorkspace() {
       </section>
 
       <InboxScannerPanel
-        onEscalate={(rawEmail, escalatedCommand) => {
-          stashAgentEscalationPrefill({ rawEmail, command: escalatedCommand });
+        onEscalate={({ rawEmail, command, scannerContext }) => {
+          stashAgentEscalationPrefill({ rawEmail, command, scannerContext });
           router.push("/agent");
         }}
       />
