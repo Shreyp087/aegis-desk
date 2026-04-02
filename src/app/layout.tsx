@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { JetBrains_Mono, Sora } from "next/font/google";
+import { SpeedInsights } from "@vercel/speed-insights/next";
 
 import { AppShell } from "@/components/AppShell";
 import { ThemeProvider } from "@/components/ThemeProvider";
@@ -42,6 +43,7 @@ export default async function RootLayout({
             <AppShell>{children}</AppShell>
           </AuthProvider>
         </ThemeProvider>
+        <SpeedInsights />
       </body>
     </html>
   );
