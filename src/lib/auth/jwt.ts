@@ -6,12 +6,7 @@ export const AUTH_COOKIE_NAME = "aegis_auth_token";
 
 function getJwtSecret(): string {
   const secret = process.env.AUTH_JWT_SECRET;
-  if (!secret) {
-    if (process.env.NODE_ENV !== "production") {
-      return "aegis-dev-insecure-secret-change-me";
-    }
-    throw new Error("AUTH_JWT_SECRET is not configured");
-  }
+  if (!secret) throw new Error("AUTH_JWT_SECRET is not configured");
   return secret;
 }
 

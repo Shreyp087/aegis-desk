@@ -67,9 +67,9 @@ Planner/runner now supports dynamic LinkUp research count (2-6 searches) based o
 ## Auth + Database (User/Admin)
 
 Authentication now supports:
-- User sign up: `/login/user/signup`
-- User sign in: `/login/user`
-- Admin sign in: `/login/admin`
+- User sign up: `/sign-up`
+- User sign in: `/sign-in`
+- Admin sign in: `/sign-in` with the `Admin` role selected
 
 API routes:
 - `POST /api/auth/user/signup`
@@ -93,6 +93,14 @@ AUTH_MONGO_AUTO_SEED=true
 ```
 
 When Mongo auth auto-seed is enabled, one demo user and one demo admin are seeded from local-auth seed env values on first auth access (disabled by default in production unless explicitly enabled).
+
+If you want an explicit seeded admin identity, set:
+
+```bash
+LOCAL_AUTH_ADMIN_NAME=Admin Name
+LOCAL_AUTH_ADMIN_EMAIL=admin@example.com
+LOCAL_AUTH_ADMIN_PASSWORD=StrongPassword123!
+```
 
 ## Offline Enforced Mode (No External Model/Web Calls)
 

@@ -1,13 +1,27 @@
 import { openai } from "@ai-sdk/openai";
 import { generateText } from "ai";
 import { z } from "zod";
+import { getServerSession } from "@/lib/auth/session";
 import {
   extractEntityCandidatesFromContext,
   type EntityCandidate,
 } from "@/lib/inbox/entityProfiler";
 import { getOfflineRuntimeConfig, isOfflineEnforced } from "@/lib/offline";
+import {
+  addAegisSpanEvent,
+  annotateAegisCurrentSpan,
+  buildAegisRespanMetadata,
+  isRespanEnabled,
+  toRespanAssociationProperties,
+  withAegisTaskSpan,
+  withAegisWorkflowSpan,
+  type AegisRespanMetadataInput,
+} from "@/lib/observability/respan";
 
 console.log("OPENAI_API_KEY present:", !!process.env.OPENAI_API_KEY);
+
+const PLANNER_MODEL = "gpt-4o-mini";
+const PLAN_TRACE_VERSION = 1;
 
 // Hackathon-safe: compute tomorrow at 3pm New York (EST in Feb)
 function tomorrowAt3pmNYISO(): string {
@@ -54,6 +68,35 @@ type PlannerPlanStep = z.infer<typeof PlanStepSchema>;
 
 const SEARCH_STEP_MIN = 2;
 const SEARCH_STEP_MAX = 6;
+
+type PlanRouteRequestBody = {
+  emailText: string;
+  docText: string;
+  command: string;
+  threadId?: unknown;
+  emailThreadId?: unknown;
+  conversationId?: unknown;
+  thread_identifier?: unknown;
+};
+
+function asOptionalString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function extractThreadIdentifier(body: PlanRouteRequestBody): string | undefined {
+  return (
+    asOptionalString(body.thread_identifier) ||
+    asOptionalString(body.threadId) ||
+    asOptionalString(body.emailThreadId) ||
+    asOptionalString(body.conversationId)
+  );
+}
+
+function textLength(value: unknown): number {
+  return typeof value === "string" ? value.length : 0;
+}
 
 function buildSearchQueriesForEntity(entity: EntityCandidate): string[] {
   const name = entity.name.trim();
@@ -230,24 +273,106 @@ function normalizePlan(args: {
 
 export async function POST(req: Request) {
   try {
+    const session = await getServerSession().catch(() => null);
+    const requestBody = (await req.json()) as PlanRouteRequestBody;
+    const { emailText, docText, command } = requestBody;
+    const threadIdentifier = extractThreadIdentifier(requestBody);
     const offline = getOfflineRuntimeConfig();
-    if (isOfflineEnforced(offline)) {
-      return Response.json(
-        {
-          error: "Offline mode enforced",
-          detail:
-            "Plan generation is disabled in enforced offline mode because it relies on remote model calls.",
-          offlineState: offline.state,
-        },
-        { status: 503 }
-      );
-    }
+    const requestId =
+      req.headers.get("x-request-id") ||
+      req.headers.get("x-vercel-id") ||
+      undefined;
+    const baseTraceMetadata: AegisRespanMetadataInput = {
+      service: "aegis-desk",
+      surface: "plan",
+      endpoint: "/api/plan",
+      workflow_type: "plan",
+      tool_name: "planner",
+      search_provider: "none",
+      fallback_triggered: false,
+      offline_mode: offline.state,
+      customer_identifier: session?.id,
+      thread_identifier: threadIdentifier,
+      request_id: requestId,
+    };
+    const plannerTelemetryMetadata = toRespanAssociationProperties(
+      buildAegisRespanMetadata({
+        ...baseTraceMetadata,
+        selected_model: PLANNER_MODEL,
+      })
+    );
 
-    const { emailText, docText, command } = await req.json();
+    return await withAegisWorkflowSpan(
+      {
+        name: "plan.request",
+        version: PLAN_TRACE_VERSION,
+        metadata: baseTraceMetadata,
+      },
+      async () => {
+        const offlineResponse = await withAegisTaskSpan(
+          {
+            name: "plan.offline_guard",
+            version: PLAN_TRACE_VERSION,
+            metadata: baseTraceMetadata,
+          },
+          async () => {
+            if (!isOfflineEnforced(offline)) return null;
 
-    const fixedMeetingISO = tomorrowAt3pmNYISO();
+            addAegisSpanEvent("plan.offline_blocked", {
+              offline_mode: offline.state,
+            });
 
-    const plannerPrompt = `
+            return Response.json(
+              {
+                error: "Offline mode enforced",
+                detail:
+                  "Plan generation is disabled in enforced offline mode because it relies on remote model calls.",
+                offlineState: offline.state,
+              },
+              { status: 503 }
+            );
+          }
+        );
+
+        if (offlineResponse) {
+          return offlineResponse;
+        }
+
+        const normalizedInput = await withAegisTaskSpan(
+          {
+            name: "plan.input_normalization",
+            version: PLAN_TRACE_VERSION,
+            metadata: baseTraceMetadata,
+          },
+          async () => {
+            const fixedMeetingISO = tomorrowAt3pmNYISO();
+
+            addAegisSpanEvent("plan.inputs_normalized", {
+              email_chars: textLength(emailText),
+              doc_chars: textLength(docText),
+              command_chars: textLength(command),
+              has_thread_identifier: Boolean(threadIdentifier),
+            });
+
+            return {
+              emailText,
+              docText,
+              command,
+              fixedMeetingISO,
+            };
+          }
+        );
+
+        const plannerPrompt = await withAegisTaskSpan(
+          {
+            name: "plan.prompt_construction",
+            version: PLAN_TRACE_VERSION,
+            metadata: {
+              ...baseTraceMetadata,
+              selected_model: PLANNER_MODEL,
+            },
+          },
+          async () => `
 You are an AGI-inspired task planner for a desktop intelligence agent.
 
 Your job: convert the user's command into a STRICT JSON plan.
@@ -286,7 +411,7 @@ QUERY QUALITY RULES (IMPORTANT):
 - Avoid searching for phone numbers, emails, personal addresses.
 
 MEETING TIME:
-- Set datetimeISO EXACTLY to: ${fixedMeetingISO}
+- Set datetimeISO EXACTLY to: ${normalizedInput.fixedMeetingISO}
 
 Return ONLY valid JSON in this exact shape:
 {
@@ -304,52 +429,162 @@ Return ONLY valid JSON in this exact shape:
 
 Context:
 EMAIL:
-${emailText}
+${normalizedInput.emailText}
 
 DOC:
-${docText}
+${normalizedInput.docText}
 
 COMMAND:
-${command}
-`;
+${normalizedInput.command}
+`);
 
-    const result = await generateText({
-      model: openai("gpt-4o-mini"),
-      prompt: plannerPrompt,
-    });
+        const result = await withAegisTaskSpan(
+          {
+            name: "plan.llm_planner_call",
+            version: PLAN_TRACE_VERSION,
+            metadata: {
+              ...baseTraceMetadata,
+              selected_model: PLANNER_MODEL,
+              fallback_triggered: false,
+            },
+          },
+          async () => {
+            const plannerResult = await generateText({
+              model: openai(PLANNER_MODEL),
+              prompt: plannerPrompt,
+              experimental_telemetry: {
+                isEnabled: isRespanEnabled(),
+                functionId: "plan.llm_planner_call",
+                // Keep planner traces metadata-first until prompt review is complete.
+                recordInputs: false,
+                recordOutputs: false,
+                metadata: plannerTelemetryMetadata,
+              },
+            });
 
-    // Robust JSON extraction (handles accidental extra text)
-    const start = result.text.indexOf("{");
-    const end = result.text.lastIndexOf("}");
-    if (start === -1 || end === -1 || end <= start) {
-      throw new Error("Planner did not return valid JSON object.");
-    }
+            addAegisSpanEvent("plan.llm_call_completed", {
+              response_chars: plannerResult.text.length,
+            });
 
-    const jsonText = result.text.slice(start, end + 1);
-    const parsedPlan = PlannerPlanSchema.parse(JSON.parse(jsonText));
-    const plan = normalizePlan({
-      plan: parsedPlan,
-      emailText,
-      docText,
-      command,
-      fixedMeetingISO,
-    });
+            return plannerResult;
+          }
+        );
 
-    // Guardrails: enforce dynamic but bounded search count.
-    const searchSteps = plan.steps.filter((s) => s.type === "redact_and_search");
-    if (searchSteps.length < SEARCH_STEP_MIN || searchSteps.length > SEARCH_STEP_MAX) {
-      throw new Error(
-        `Plan must include between 2 and 6 redact_and_search steps. Got ${searchSteps.length}.`
-      );
-    }
+        annotateAegisCurrentSpan({
+          ...baseTraceMetadata,
+          selected_model: PLANNER_MODEL,
+          fallback_triggered: false,
+        });
 
-    // Ensure meeting datetimeISO is correct (override if model deviated)
-    const icsStep = plan.steps.find((s) => s.type === "create_ics");
-    if (icsStep) {
-      icsStep.datetimeISO = fixedMeetingISO;
-    }
+        const parsedPlan = await withAegisTaskSpan(
+          {
+            name: "plan.schema_validation",
+            version: PLAN_TRACE_VERSION,
+            metadata: {
+              ...baseTraceMetadata,
+              selected_model: PLANNER_MODEL,
+            },
+          },
+          async () => {
+            try {
+              // Robust JSON extraction handles accidental surrounding text.
+              const start = result.text.indexOf("{");
+              const end = result.text.lastIndexOf("}");
+              if (start === -1 || end === -1 || end <= start) {
+                throw new Error("Planner did not return valid JSON object.");
+              }
 
-    return Response.json({ ok: true, plan });
+              const jsonText = result.text.slice(start, end + 1);
+              const parsed = PlannerPlanSchema.parse(JSON.parse(jsonText));
+
+              addAegisSpanEvent("plan.schema_validated", {
+                parse_success: true,
+                step_count: parsed.steps.length,
+              });
+
+              annotateAegisCurrentSpan({
+                ...baseTraceMetadata,
+                selected_model: PLANNER_MODEL,
+                parse_success: true,
+                schema_validation_result: "passed",
+                fallback_triggered: false,
+              });
+
+              return parsed;
+            } catch (error) {
+              addAegisSpanEvent("plan.schema_validated", {
+                parse_success: false,
+                fallback_triggered: false,
+              });
+
+              annotateAegisCurrentSpan({
+                ...baseTraceMetadata,
+                selected_model: PLANNER_MODEL,
+                parse_success: false,
+                schema_validation_result: "failed",
+                fallback_triggered: false,
+              });
+
+              throw error;
+            }
+          }
+        );
+
+        annotateAegisCurrentSpan({
+          ...baseTraceMetadata,
+          selected_model: PLANNER_MODEL,
+          parse_success: true,
+          schema_validation_result: "passed",
+          fallback_triggered: false,
+        });
+
+        const responsePayload = await withAegisTaskSpan(
+          {
+            name: "plan.response_assembly",
+            version: PLAN_TRACE_VERSION,
+            metadata: {
+              ...baseTraceMetadata,
+              selected_model: PLANNER_MODEL,
+              parse_success: true,
+              schema_validation_result: "passed",
+              fallback_triggered: false,
+            },
+          },
+          async () => {
+            const plan = normalizePlan({
+              plan: parsedPlan,
+              emailText: normalizedInput.emailText,
+              docText: normalizedInput.docText,
+              command: normalizedInput.command,
+              fixedMeetingISO: normalizedInput.fixedMeetingISO,
+            });
+
+            // Guardrails: enforce dynamic but bounded search count.
+            const searchSteps = plan.steps.filter((s) => s.type === "redact_and_search");
+            if (searchSteps.length < SEARCH_STEP_MIN || searchSteps.length > SEARCH_STEP_MAX) {
+              throw new Error(
+                `Plan must include between 2 and 6 redact_and_search steps. Got ${searchSteps.length}.`
+              );
+            }
+
+            // Ensure meeting datetimeISO is correct (override if model deviated)
+            const icsStep = plan.steps.find((s) => s.type === "create_ics");
+            if (icsStep) {
+              icsStep.datetimeISO = normalizedInput.fixedMeetingISO;
+            }
+
+            addAegisSpanEvent("plan.response_ready", {
+              step_count: plan.steps.length,
+              search_step_count: searchSteps.length,
+            });
+
+            return { ok: true as const, plan };
+          }
+        );
+
+        return Response.json(responsePayload);
+      }
+    );
   } catch (err: unknown) {
     console.error("Plan error:", err);
     const detail = err instanceof Error ? err.message : String(err);
