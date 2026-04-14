@@ -4,47 +4,66 @@ import { RespanTelemetry } from "@respan/tracing";
 
 import { getRespanTracingOptions } from "./config";
 
-let telemetryClient: RespanTelemetry | null = null;
-let initializationPromise: Promise<RespanTelemetry | null> | null = null;
-let initializationFailed = false;
+type RespanClientState = {
+  telemetryClient: RespanTelemetry | null;
+  initializationPromise: Promise<RespanTelemetry | null> | null;
+  initializationFailed: boolean;
+};
+
+declare global {
+  var __aegisRespanClientState__: RespanClientState | undefined;
+}
+
+function getRespanClientState(): RespanClientState {
+  if (!globalThis.__aegisRespanClientState__) {
+    globalThis.__aegisRespanClientState__ = {
+      telemetryClient: null,
+      initializationPromise: null,
+      initializationFailed: false,
+    };
+  }
+
+  return globalThis.__aegisRespanClientState__;
+}
 
 export function getRespanTelemetry(): RespanTelemetry | null {
+  const state = getRespanClientState();
   const options = getRespanTracingOptions();
   if (!options) return null;
 
-  if (!telemetryClient) {
-    telemetryClient = new RespanTelemetry(options);
+  if (!state.telemetryClient) {
+    state.telemetryClient = new RespanTelemetry(options);
   }
 
-  return telemetryClient;
+  return state.telemetryClient;
 }
 
 export async function initializeRespanTelemetry(): Promise<RespanTelemetry | null> {
-  if (initializationFailed) return null;
+  const state = getRespanClientState();
+  if (state.initializationFailed) return null;
 
   const client = getRespanTelemetry();
   if (!client) return null;
   if (client.isInitialized()) return client;
-  if (initializationPromise) return initializationPromise;
+  if (state.initializationPromise) return state.initializationPromise;
 
-  initializationPromise = client
+  state.initializationPromise = client
     .initialize()
     .then(() => {
       if (!client.isInitialized()) {
-        initializationFailed = true;
+        state.initializationFailed = true;
         return null;
       }
 
       return client;
     })
     .catch(() => {
-      initializationFailed = true;
+      state.initializationFailed = true;
       return null;
     })
     .finally(() => {
-      initializationPromise = null;
+      state.initializationPromise = null;
     });
 
-  return initializationPromise;
+  return state.initializationPromise;
 }
-
