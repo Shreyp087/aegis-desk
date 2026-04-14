@@ -6,7 +6,7 @@ import { AEGIS_RESPAN_SERVICE } from "./types";
 
 const DEFAULT_RESPAN_BASE_URL = "https://api.respan.ai";
 
-function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean {
+export function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean {
   if (!value) return fallback;
 
   const normalized = value.trim().toLowerCase();
@@ -98,4 +98,3 @@ export function getRespanTracingOptions(
     },
   };
 }
-

@@ -9,10 +9,10 @@
   - task spans for normalization, prompt build, LLM call, schema validation, and response assembly
   - structured metadata plus AI SDK telemetry metadata
 - `/api/inbox` currently has a top-level workflow span only.
-- `/api/run` now has structured tracing-only coverage for validation, plan execution, search, evidence aggregation, entity profile generation, synthesis, and response assembly.
+- `/api/run` now has structured tracing for validation, plan execution, search, evidence aggregation, entity profile generation, synthesis, and response assembly.
+- `/api/run` final synthesis can optionally use a Respan-managed prompt over raw HTTP with prompt schema v2, and falls back to the existing inline AI SDK path if the prompt flag is off, the prompt ID is missing, or the prompt call fails schema validation.
 
 ### Not live yet
-- `/api/run` is not using Respan-managed prompts.
 - `/api/run` is not routing model calls through a Respan gateway-aware client.
 - `/api/inbox` does not yet have nested task spans around its AI-assisted branches.
 
@@ -71,7 +71,7 @@ Notes:
   - policy decisions
 
 ### `/api/run`
-- Status: structured tracing is live in code, but the route is not yet moved to Respan prompt-management or gateway use
+- Status: structured tracing is live in code; final synthesis supports optional Respan prompt-management with a safe inline fallback, and gateway use is still off
 - Spans:
   - `run.request`
   - `run.request_validation`
@@ -95,7 +95,7 @@ Notes:
   - request, customer, and thread identifiers when available
 - Safe future path:
   - tracing-only first
-  - prompt-managed synthesis lane second
+  - prompt-managed synthesis lane is available now for final synthesis only
   - gateway-aware synthesis lane last
 
 ## Demo Setup

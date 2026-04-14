@@ -9,17 +9,22 @@
 
 import { createOpenAI, openai } from "@ai-sdk/openai";
 
+import { parseBooleanEnv } from "./config";
+
 function normalizeRespanGatewayBaseUrl(value: string | undefined): string {
   const trimmed = value?.trim();
   if (!trimmed) return "";
 
   const withoutTrailingSlash = trimmed.replace(/\/+$/, "");
-  return withoutTrailingSlash.endsWith("/v1")
+  return withoutTrailingSlash.endsWith("/api")
     ? withoutTrailingSlash
-    : `${withoutTrailingSlash}/v1`;
+    : `${withoutTrailingSlash}/api`;
 }
 
-export const RESPAN_GATEWAY_ENABLED = process.env.RESPAN_GATEWAY_ENABLED === "1";
+export const RESPAN_GATEWAY_ENABLED = parseBooleanEnv(
+  process.env.RESPAN_GATEWAY_ENABLED,
+  false
+);
 export const RESPAN_BASE_URL = normalizeRespanGatewayBaseUrl(process.env.RESPAN_BASE_URL);
 export const RESPAN_API_KEY = process.env.RESPAN_API_KEY || "";
 
@@ -30,9 +35,6 @@ function getRespanGatewayProvider() {
     respanGatewayProvider = createOpenAI({
       baseURL: RESPAN_BASE_URL,
       apiKey: RESPAN_API_KEY,
-      headers: {
-        "Respan-Version": "v1",
-      },
     });
   }
 

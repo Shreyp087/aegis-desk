@@ -34,6 +34,12 @@ import {
   type ScoredResearchResult,
 } from "@/lib/agent/evidence";
 import { formatFinalOutput } from "@/lib/agent/finalFormatter";
+import {
+  callRespanPrompt,
+  RESPAN_PROMPT_ID_SYNTHESIS,
+  RESPAN_PROMPTS_ENABLED,
+  type PromptVariables,
+} from "@/lib/observability/respan/promptClient";
 
 import { extractEntityCandidatesFromContext } from "@/lib/inbox/entityProfiler";
 import { EntityProfileCacheModel } from "@/lib/models/EntityProfileCache";
@@ -250,6 +256,28 @@ function textLength(value: string | undefined): number {
   return typeof value === "string" ? value.length : 0;
 }
 
+function extractJsonObjectFromText(value: string): string {
+  const trimmed = value.trim();
+  const withoutFence = trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+
+  if (withoutFence.startsWith("{") && withoutFence.endsWith("}")) {
+    return withoutFence;
+  }
+
+  const firstBrace = withoutFence.indexOf("{");
+  const lastBrace = withoutFence.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    return withoutFence.slice(firstBrace, lastBrace + 1);
+  }
+
+  return withoutFence;
+}
+
+function parsePromptManagedFinalOutput(rawText: string) {
+  const normalizedJson = extractJsonObjectFromText(rawText);
+  return GeneratedFinalSchema.parse(JSON.parse(normalizedJson));
+}
+
 /** ---------- Convert research array into per-entity buckets ---------- */
 function groupResearchByEntity(plan: RunPlan, research: ResearchEvent[]) {
   const searchSteps = plan.steps.filter((s) => s.type === "redact_and_search");
@@ -324,6 +352,34 @@ function deriveAnalysisSectionHint(command: string, emailText: string, docText: 
     sectionType: "general",
     title: "Key Risks & Actions",
     reason: "No dominant contract/security/finance/ops/scheduling context detected.",
+  };
+}
+
+function buildFinalSynthesisPromptVariables(args: {
+  prompt: string;
+  command: string;
+  emailText: string;
+  docText: string;
+  entityCandidates: ReturnType<typeof extractEntityCandidatesFromContext>;
+  perEntityResearch: ReturnType<typeof groupResearchByEntity>;
+  profiles: Array<z.infer<typeof EntityProfileSchema>>;
+  analysisSectionHint: ReturnType<typeof deriveAnalysisSectionHint>;
+  meetingTitle: string;
+  meetingDatetimeISO: string;
+  meetingICS: string;
+}): PromptVariables {
+  return {
+    full_prompt: args.prompt,
+    user_command: args.command,
+    email_text: args.emailText,
+    document_text: args.docText,
+    entity_candidates_json: JSON.stringify(args.entityCandidates, null, 2),
+    linkup_evidence_json: JSON.stringify(args.perEntityResearch, null, 2),
+    entity_profiles_json: JSON.stringify(args.profiles, null, 2),
+    analysis_section_hint_json: JSON.stringify(args.analysisSectionHint, null, 2),
+    meeting_title: args.meetingTitle,
+    meeting_datetime_iso: args.meetingDatetimeISO,
+    meeting_ics: args.meetingICS,
   };
 }
 
@@ -835,6 +891,8 @@ Return STRICT JSON matching this schema exactly:
         const meetingICS = meetingStep?._ics || "";
 
         const analysisSectionHint = deriveAnalysisSectionHint(command, emailText, docText);
+        const promptManagedSynthesisEnabled =
+          RESPAN_PROMPTS_ENABLED && Boolean(RESPAN_PROMPT_ID_SYNTHESIS);
         const synthesisTelemetryMetadata = toRespanAssociationProperties(
           buildAegisRespanMetadata({
             ...traceMetadata,
@@ -915,6 +973,22 @@ ICS: ${meetingICS}
 
 Return STRICT JSON matching the schema exactly.
 `;
+        const promptVariables = buildFinalSynthesisPromptVariables({
+          prompt,
+          command,
+          emailText,
+          docText,
+          entityCandidates,
+          perEntityResearch,
+          profiles,
+          analysisSectionHint,
+          meetingTitle,
+          meetingDatetimeISO,
+          meetingICS,
+        });
+
+        let synthesisMode: "respan_prompt" | "inline_prompt" = "inline_prompt";
+        let synthesisFallbackTriggered = false;
 
         const finalObj = await withAegisTaskSpan(
           {
@@ -922,15 +996,71 @@ Return STRICT JSON matching the schema exactly.
             version: RUN_TRACE_VERSION,
             metadata: {
               ...traceMetadata,
-              selected_model: FINAL_SYNTHESIS_MODEL,
-              tool_name: "final_synthesis",
+              selected_model: promptManagedSynthesisEnabled ? undefined : FINAL_SYNTHESIS_MODEL,
+              tool_name: promptManagedSynthesisEnabled ? "respan_prompt" : "final_synthesis",
               search_provider: "linkup",
               evidence_count: evidenceSummary.evidence.length,
               fallback_triggered: false,
             },
           },
-          async () =>
-            generateObject({
+          async () => {
+            if (promptManagedSynthesisEnabled && RESPAN_PROMPT_ID_SYNTHESIS) {
+              try {
+                addAegisSpanEvent("run.final_synthesis_prompt_managed_attempt", {
+                  prompt_id: RESPAN_PROMPT_ID_SYNTHESIS,
+                });
+
+                log("synthesis_prompt", "Attempting Respan-managed synthesis prompt", {
+                  promptId: RESPAN_PROMPT_ID_SYNTHESIS,
+                });
+
+                const promptResponseText = await callRespanPrompt({
+                  promptId: RESPAN_PROMPT_ID_SYNTHESIS,
+                  variables: promptVariables,
+                });
+                const parsedPromptResponse = parsePromptManagedFinalOutput(promptResponseText);
+
+                synthesisMode = "respan_prompt";
+
+                annotateAegisCurrentSpan({
+                  ...traceMetadata,
+                  tool_name: "respan_prompt",
+                  evidence_count: evidenceSummary.evidence.length,
+                  parse_success: true,
+                  schema_validation_result: "passed",
+                  fallback_triggered: false,
+                });
+
+                addAegisSpanEvent("run.final_synthesis_prompt_managed_success", {
+                  prompt_id: RESPAN_PROMPT_ID_SYNTHESIS,
+                });
+
+                return { object: parsedPromptResponse };
+              } catch (error: unknown) {
+                synthesisFallbackTriggered = true;
+
+                if (error instanceof Error) {
+                  recordAegisSpanException(error);
+                }
+
+                const detail = error instanceof Error ? error.message : String(error);
+                addAegisSpanEvent("run.final_synthesis_prompt_managed_fallback", {
+                  prompt_id: RESPAN_PROMPT_ID_SYNTHESIS,
+                  detail: detail.slice(0, 240),
+                });
+
+                log(
+                  "synthesis_prompt_fallback",
+                  "Respan-managed synthesis failed; falling back to inline prompt",
+                  {
+                    promptId: RESPAN_PROMPT_ID_SYNTHESIS,
+                    detail,
+                  }
+                );
+              }
+            }
+
+            const inlineResult = await generateObject({
               model: openai(FINAL_SYNTHESIS_MODEL),
               schema: GeneratedFinalSchema,
               prompt,
@@ -941,7 +1071,28 @@ Return STRICT JSON matching the schema exactly.
                 recordOutputs: false,
                 metadata: synthesisTelemetryMetadata,
               },
-            })
+            });
+
+            synthesisMode = "inline_prompt";
+
+            annotateAegisCurrentSpan({
+              ...traceMetadata,
+              selected_model: FINAL_SYNTHESIS_MODEL,
+              tool_name: "final_synthesis",
+              evidence_count: evidenceSummary.evidence.length,
+              parse_success: true,
+              schema_validation_result: "passed",
+              fallback_triggered: synthesisFallbackTriggered,
+            });
+
+            if (synthesisFallbackTriggered) {
+              addAegisSpanEvent("run.final_synthesis_inline_fallback_used", {
+                selected_model: FINAL_SYNTHESIS_MODEL,
+              });
+            }
+
+            return inlineResult;
+          }
         );
 
         const responsePayload = await withAegisTaskSpan(
@@ -950,10 +1101,12 @@ Return STRICT JSON matching the schema exactly.
             version: RUN_TRACE_VERSION,
             metadata: {
               ...traceMetadata,
-              selected_model: FINAL_SYNTHESIS_MODEL,
+              selected_model:
+                synthesisMode === "inline_prompt" ? FINAL_SYNTHESIS_MODEL : undefined,
               tool_name: "final_formatter",
               search_provider: "linkup",
               evidence_count: evidenceSummary.evidence.length,
+              fallback_triggered: synthesisFallbackTriggered,
             },
           },
           async () => {
@@ -973,7 +1126,9 @@ Return STRICT JSON matching the schema exactly.
               ledger,
               modelsUsed: [
                 `openai:${ENTITY_PROFILE_MODEL}:entity_profile`,
-                `openai:${FINAL_SYNTHESIS_MODEL}:final_synthesis`,
+                synthesisMode === "respan_prompt" && RESPAN_PROMPT_ID_SYNTHESIS
+                  ? `respan_prompt:${RESPAN_PROMPT_ID_SYNTHESIS}:final_synthesis`
+                  : `openai:${FINAL_SYNTHESIS_MODEL}:final_synthesis${synthesisFallbackTriggered ? ":fallback" : ""}`,
               ],
             });
 
@@ -984,6 +1139,8 @@ Return STRICT JSON matching the schema exactly.
             });
 
             log("output", "Final output produced", {
+              synthesisMode,
+              synthesisFallbackTriggered,
               entityVerdicts: final.entityVerdicts?.length ?? 0,
               claimCount: final.claims?.length ?? 0,
               evidenceCount: final.evidence?.length ?? 0,
@@ -999,12 +1156,13 @@ Return STRICT JSON matching the schema exactly.
 
             annotateAegisCurrentSpan({
               ...traceMetadata,
-              selected_model: FINAL_SYNTHESIS_MODEL,
+              selected_model:
+                synthesisMode === "inline_prompt" ? FINAL_SYNTHESIS_MODEL : undefined,
               search_provider: "linkup",
               evidence_count: final.evidence?.length ?? evidenceSummary.evidence.length,
               parse_success: true,
               schema_validation_result: "passed",
-              fallback_triggered: false,
+              fallback_triggered: synthesisFallbackTriggered,
             });
 
             return {

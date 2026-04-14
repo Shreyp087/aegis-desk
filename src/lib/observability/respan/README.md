@@ -51,7 +51,7 @@ The root `instrumentation.ts` bootstrap will initialize the tracing client once 
   - `withAegisWorkflowSpan(...)`
   - `withAegisTaskSpan(...)`
 - Prompt-management later:
-  - `promptClient.ts` is available for explicit opt-in routes
+  - `promptClient.ts` uses Respan prompt schema v2 over raw HTTP for explicit opt-in routes
   - prompt IDs should remain unset until a route is deliberately moved to Respan-managed prompts
 - Gateway later:
   - `gatewayClient.ts` is available for explicit opt-in routes
