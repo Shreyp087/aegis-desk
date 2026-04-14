@@ -20,6 +20,9 @@ RESPAN_API_KEY=
 RESPAN_BASE_URL=https://api.respan.ai
 RESPAN_ENVIRONMENT=development
 RESPAN_GATEWAY_ENABLED=false
+RESPAN_PROMPTS_ENABLED=false
+RESPAN_PROMPT_ID_PLAN=
+RESPAN_PROMPT_ID_SYNTHESIS=
 ```
 
 Notes:
@@ -27,14 +30,16 @@ Notes:
 - `RESPAN_ENABLED=false` keeps the entire layer dormant.
 - Missing `RESPAN_API_KEY` also keeps runtime behavior in no-op mode.
 - `RESPAN_BASE_URL` is used by the tracing client and reserved for later prompt-management and gateway work.
-- `RESPAN_GATEWAY_ENABLED` is intentionally config-only right now. No route uses gateway behavior yet.
+- `RESPAN_GATEWAY_ENABLED` stays opt-in and should only be enabled on routes that have been explicitly switched to a gateway-aware model client.
+- `RESPAN_PROMPTS_ENABLED` and the prompt IDs are only needed when a route is intentionally moved to Respan-managed prompts.
 
 ## How To Enable It
 
 1. Set `RESPAN_ENABLED=true`
 2. Set a valid `RESPAN_API_KEY`
 3. Optionally set `RESPAN_BASE_URL` and `RESPAN_ENVIRONMENT`
-4. Restart the Next.js server
+4. Leave `RESPAN_GATEWAY_ENABLED=false` and `RESPAN_PROMPTS_ENABLED=false` until the target route is verified
+5. Restart the Next.js server
 
 The root `instrumentation.ts` bootstrap will initialize the tracing client once when the app starts, but only when the config is valid.
 
@@ -46,8 +51,10 @@ The root `instrumentation.ts` bootstrap will initialize the tracing client once 
   - `withAegisWorkflowSpan(...)`
   - `withAegisTaskSpan(...)`
 - Prompt-management later:
-  - a dedicated raw HTTP helper should live outside this folder so prompt rollout stays isolated from base tracing
+  - `promptClient.ts` is available for explicit opt-in routes
+  - prompt IDs should remain unset until a route is deliberately moved to Respan-managed prompts
 - Gateway later:
+  - `gatewayClient.ts` is available for explicit opt-in routes
   - route-scoped model clients can read `RESPAN_GATEWAY_ENABLED`, but they should stay opt-in and must not affect offline enforcement
 
 ## Guardrails

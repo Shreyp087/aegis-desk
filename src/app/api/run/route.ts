@@ -1,4 +1,17 @@
 import { LinkupClient } from "linkup-sdk";
+import { getServerSession } from "@/lib/auth/session";
+import {
+  addAegisSpanEvent,
+  annotateAegisCurrentSpan,
+  buildAegisRespanMetadata,
+  isRespanEnabled,
+  recordAegisSpanException,
+  toRespanAssociationProperties,
+  withAegisWorkflowSpan,
+  withAegisTaskSpan,
+  type AegisRespanMetadataInput,
+} from "@/lib/observability/respan";
+
 import { privacyFirewall } from "@/lib/tools/privacy";
 import { createICS } from "@/lib/tools/ics";
 
@@ -21,11 +34,15 @@ import {
   type ScoredResearchResult,
 } from "@/lib/agent/evidence";
 import { formatFinalOutput } from "@/lib/agent/finalFormatter";
+
 import { extractEntityCandidatesFromContext } from "@/lib/inbox/entityProfiler";
 import { EntityProfileCacheModel } from "@/lib/models/EntityProfileCache";
 import { getOfflineRuntimeConfig, isOfflineEnforced } from "@/lib/offline";
 
 const linkup = new LinkupClient({ apiKey: process.env.LINKUP_API_KEY! });
+const RUN_TRACE_VERSION = 1;
+const ENTITY_PROFILE_MODEL = "gpt-4o-mini";
+const FINAL_SYNTHESIS_MODEL = "gpt-4o-mini";
 
 const AnalysisSectionTypeEnum = z.enum([
   "contract",
@@ -170,6 +187,10 @@ const RunRequestSchema = z.object({
   emailText: z.string().optional().default(""),
   docText: z.string().optional().default(""),
   command: z.string().optional().default(""),
+  threadId: z.string().optional(),
+  emailThreadId: z.string().optional(),
+  conversationId: z.string().optional(),
+  thread_identifier: z.string().optional(),
   options: z
     .object({
       linkupDepth: z.enum(["standard", "deep"]).default("standard"),
@@ -208,6 +229,25 @@ function tomorrowAt3pmNYISO(): string {
   const d = String(t.getDate()).padStart(2, "0");
 
   return `${y}-${m}-${d}T15:00:00-05:00`;
+}
+
+function asOptionalString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function extractThreadIdentifier(payload: z.infer<typeof RunRequestSchema>): string | undefined {
+  return (
+    asOptionalString(payload.thread_identifier) ||
+    asOptionalString(payload.threadId) ||
+    asOptionalString(payload.emailThreadId) ||
+    asOptionalString(payload.conversationId)
+  );
+}
+
+function textLength(value: string | undefined): number {
+  return typeof value === "string" ? value.length : 0;
 }
 
 /** ---------- Convert research array into per-entity buckets ---------- */
@@ -366,145 +406,337 @@ async function saveCachedProfile(args: {
 }
 
 export async function POST(req: Request) {
-  try {
-    const offline = getOfflineRuntimeConfig();
-    if (isOfflineEnforced(offline)) {
-      return Response.json(
-        {
-          error: "Offline mode enforced",
-          detail:
-            "Run execution is disabled in enforced offline mode because it depends on remote web/model tools.",
-          offlineState: offline.state,
-        },
-        { status: 503 }
-      );
-    }
+  const session = await getServerSession().catch(() => null);
+  const offline = getOfflineRuntimeConfig();
+  const requestId =
+    req.headers.get("x-request-id") ||
+    req.headers.get("x-vercel-id") ||
+    undefined;
+  const baseTraceMetadata: AegisRespanMetadataInput = {
+    service: "aegis-desk",
+    surface: "run",
+    workflow_type: "run",
+    endpoint: "/api/run",
+    search_provider: "linkup",
+    fallback_triggered: false,
+    offline_mode: offline.state,
+    customer_identifier: session?.id,
+    request_id: requestId,
+  };
 
-    const payload = RunRequestSchema.parse(await req.json());
-    const plan: RunPlan = payload.plan as RunPlan;
-    const { emailText, docText, command } = payload;
-    const linkupDepth: LinkupDepth = payload.options?.linkupDepth ?? "standard";
+  return withAegisWorkflowSpan(
+    {
+      name: "run.request",
+      version: RUN_TRACE_VERSION,
+      metadata: baseTraceMetadata,
+    },
+    async () => {
+      try {
+        const validation = await withAegisTaskSpan(
+          {
+            name: "run.request_validation",
+            version: RUN_TRACE_VERSION,
+            metadata: {
+              tool_name: "zod",
+              ...baseTraceMetadata,
+            },
+          },
+          async () => {
+            if (isOfflineEnforced(offline)) {
+              addAegisSpanEvent("run.offline_blocked", {
+                offline_mode: offline.state,
+              });
 
-    const ledger: Array<Record<string, unknown>> = [];
-    const research: ResearchEvent[] = [];
-    const rawSearchBatches: Array<{ query: string; results: RawResearchResult[] }> = [];
-    const mongoCacheReady = await hasMongoCache();
+              return {
+                offlineResponse: Response.json(
+                  {
+                    error: "Offline mode enforced",
+                    detail:
+                      "Run execution is disabled in enforced offline mode because it depends on remote web/model tools.",
+                    offlineState: offline.state,
+                  },
+                  { status: 503 }
+                ),
+              };
+            }
 
-    const log = (type: string, message: string, data?: unknown) => {
-      ledger.push({ ts: new Date().toISOString(), type, message, data });
-    };
+            const payload = RunRequestSchema.parse(await req.json());
+            const threadIdentifier = extractThreadIdentifier(payload);
 
-    log("plan", "Plan received", plan);
-    log("command", "User command received", { command, linkupDepth });
+            addAegisSpanEvent("run.inputs_validated", {
+              plan_steps: payload.plan.steps.length,
+              email_chars: textLength(payload.emailText),
+              doc_chars: textLength(payload.docText),
+              command_chars: textLength(payload.command),
+              has_thread_identifier: Boolean(threadIdentifier),
+            });
 
-    // Execute steps (only redact_and_search + create_ics)
-    for (const step of plan.steps) {
-      log("step_start", `Starting step ${step.id}`, step);
+            return { payload, threadIdentifier };
+          }
+        );
 
-      if (step.type === "redact_and_search") {
-        const rawQuery = step.rawQuery || "";
-        const redacted = privacyFirewall(rawQuery);
-
-        research.push({
-          type: "redaction",
-          message: "Redacted query before Linkup search",
-          data: { rawQuery, safeQuery: redacted.safeQuery, removed: redacted.removed },
-        });
-
-        log("redaction", "Privacy firewall applied", {
-          removed: redacted.removed,
-          safeQuery: redacted.safeQuery,
-        });
-
-        const response = (await linkup.search({
-          query: redacted.safeQuery,
-          depth: linkupDepth,
-          outputType: "searchResults",
-          includeImages: false,
-        })) as { results?: Array<{ title?: string; name?: string; url?: string; snippet?: string; content?: string }> };
-
-        const rawResults: RawResearchResult[] = (response.results ?? [])
-          .slice(0, 8)
-          .map((r) => ({
-            title: r.title || r.name || "Untitled",
-            url: r.url || "",
-            snippet: (r.snippet || r.content || "").slice(0, 360),
-          }));
-        const results: NormalizedLinkupResult[] = scoreResultsForQuery(redacted.safeQuery, rawResults);
-        rawSearchBatches.push({ query: redacted.safeQuery, results: rawResults });
-
-        research.push({
-          type: "search",
-          message: step.desc || "Linkup search",
-          data: { query: redacted.safeQuery, depth: linkupDepth, results },
-        });
-
-        log("search", "Linkup search completed", {
-          query: redacted.safeQuery,
-          depth: linkupDepth,
-          resultsCount: results.length,
-        });
-      }
-
-      if (step.type === "create_ics") {
-        const title = step.title || "Follow-up Meeting";
-        const datetimeISO = tomorrowAt3pmNYISO();
-
-        const ics = createICS(title, datetimeISO);
-
-        step.datetimeISO = datetimeISO;
-        step._ics = ics.ics;
-
-        log("calendar", "ICS generated", { title, datetimeISO });
-      }
-
-      // semantic steps are logged for explainability
-      if (step.type === "verify_entity_authenticity") log("intent", "Entity authenticity verification planned", { desc: step.desc });
-      if (step.type === "analyze_contract_risks") log("intent", "Contract risk analysis planned", { desc: step.desc });
-      if (step.type === "extract") log("intent", "Extraction/summarization planned", { desc: step.desc });
-      if (step.type === "draft_reply") log("intent", "Reply drafting planned", { desc: step.desc });
-
-      log("step_done", `Completed step ${step.id}`);
-    }
-
-    const evidenceSummary = summarizeResearchEvidence(rawSearchBatches);
-    log("evidence", "Scored retrieval evidence and checked for conflicts", {
-      evidenceCount: evidenceSummary.evidence.length,
-      conflicts: evidenceSummary.conflicts.length,
-      evidenceQualityScore: evidenceSummary.evidence_quality_score,
-    });
-
-    // --- Prepare evidence for synthesis ---
-    const perEntityResearch = groupResearchByEntity(plan, research);
-    const entityCandidates = extractEntityCandidatesFromContext({
-      emailText,
-      docText,
-      searchQueries: perEntityResearch.map((e) => e.query),
-      maxEntities: 6,
-    });
-    const entities = entityCandidates.map((entry) => entry.name);
-
-    // --- Build Linkup-derived entity profiles (key upgrade) ---
-    const profiles: Array<z.infer<typeof EntityProfileSchema>> = [];
-    for (const e of perEntityResearch) {
-      if (mongoCacheReady) {
-        const cached = await getCachedProfile({
-          entity: e.entityHint,
-          query: e.query,
-          depth: linkupDepth,
-        });
-        if (cached) {
-          profiles.push(cached);
-          log("research_profile_cache_hit", "Loaded entity profile from cache", {
-            entity: e.entityHint,
-            query: e.query,
-            depth: linkupDepth,
-          });
-          continue;
+        if ("offlineResponse" in validation) {
+          return validation.offlineResponse;
         }
-      }
 
-      const profilePrompt = `
+        const { payload, threadIdentifier } = validation;
+        const traceMetadata: AegisRespanMetadataInput = {
+          ...baseTraceMetadata,
+          thread_identifier: threadIdentifier,
+        };
+        annotateAegisCurrentSpan(traceMetadata);
+
+        const plan: RunPlan = payload.plan as RunPlan;
+        const { emailText, docText, command } = payload;
+        const linkupDepth: LinkupDepth = payload.options?.linkupDepth ?? "standard";
+
+        const ledger: Array<Record<string, unknown>> = [];
+        const research: ResearchEvent[] = [];
+        const rawSearchBatches: Array<{ query: string; results: RawResearchResult[] }> = [];
+        const mongoCacheReady = await hasMongoCache();
+
+        const log = (type: string, message: string, data?: unknown) => {
+          ledger.push({ ts: new Date().toISOString(), type, message, data });
+        };
+
+        log("plan", "Plan received", plan);
+        log("command", "User command received", { command, linkupDepth });
+
+        addAegisSpanEvent("run.plan_received", {
+          plan_steps: plan.steps.length,
+          linkup_depth: linkupDepth,
+        });
+
+        await withAegisTaskSpan(
+          {
+            name: "run.plan_execution",
+            version: RUN_TRACE_VERSION,
+            metadata: {
+              ...traceMetadata,
+              tool_name: "plan_executor",
+              search_provider: "linkup",
+            },
+          },
+          async () => {
+            for (const step of plan.steps) {
+              log("step_start", `Starting step ${step.id}`, step);
+
+              if (step.type === "redact_and_search") {
+                await withAegisTaskSpan(
+                  {
+                    name: "run.redact_and_search",
+                    version: RUN_TRACE_VERSION,
+                    metadata: {
+                      ...traceMetadata,
+                      tool_name: "linkup",
+                      search_provider: "linkup",
+                    },
+                  },
+                  async () => {
+                    const rawQuery = step.rawQuery || "";
+                    const redacted = privacyFirewall(rawQuery);
+
+                    research.push({
+                      type: "redaction",
+                      message: "Redacted query before Linkup search",
+                      data: { rawQuery, safeQuery: redacted.safeQuery, removed: redacted.removed },
+                    });
+
+                    log("redaction", "Privacy firewall applied", {
+                      removed: redacted.removed,
+                      safeQuery: redacted.safeQuery,
+                    });
+
+                    const response = (await linkup.search({
+                      query: redacted.safeQuery,
+                      depth: linkupDepth,
+                      outputType: "searchResults",
+                      includeImages: false,
+                    })) as {
+                      results?: Array<{
+                        title?: string;
+                        name?: string;
+                        url?: string;
+                        snippet?: string;
+                        content?: string;
+                      }>;
+                    };
+
+                    const rawResults: RawResearchResult[] = (response.results ?? [])
+                      .slice(0, 8)
+                      .map((r) => ({
+                        title: r.title || r.name || "Untitled",
+                        url: r.url || "",
+                        snippet: (r.snippet || r.content || "").slice(0, 360),
+                      }));
+                    const results: NormalizedLinkupResult[] = scoreResultsForQuery(
+                      redacted.safeQuery,
+                      rawResults
+                    );
+                    rawSearchBatches.push({ query: redacted.safeQuery, results: rawResults });
+
+                    research.push({
+                      type: "search",
+                      message: step.desc || "Linkup search",
+                      data: { query: redacted.safeQuery, depth: linkupDepth, results },
+                    });
+
+                    addAegisSpanEvent("run.search_completed", {
+                      results_count: results.length,
+                      query_chars: redacted.safeQuery.length,
+                    });
+
+                    log("search", "Linkup search completed", {
+                      query: redacted.safeQuery,
+                      depth: linkupDepth,
+                      resultsCount: results.length,
+                    });
+                  }
+                );
+              }
+
+              if (step.type === "create_ics") {
+                await withAegisTaskSpan(
+                  {
+                    name: "run.create_ics",
+                    version: RUN_TRACE_VERSION,
+                    metadata: {
+                      ...traceMetadata,
+                      tool_name: "ics",
+                    },
+                  },
+                  async () => {
+                    const title = step.title || "Follow-up Meeting";
+                    const datetimeISO = tomorrowAt3pmNYISO();
+                    const ics = createICS(title, datetimeISO);
+
+                    step.datetimeISO = datetimeISO;
+                    step._ics = ics.ics;
+
+                    addAegisSpanEvent("run.ics_created", {
+                      title_chars: title.length,
+                    });
+
+                    log("calendar", "ICS generated", { title, datetimeISO });
+                  }
+                );
+              }
+
+              if (step.type === "verify_entity_authenticity") {
+                log("intent", "Entity authenticity verification planned", { desc: step.desc });
+              }
+              if (step.type === "analyze_contract_risks") {
+                log("intent", "Contract risk analysis planned", { desc: step.desc });
+              }
+              if (step.type === "extract") {
+                log("intent", "Extraction/summarization planned", { desc: step.desc });
+              }
+              if (step.type === "draft_reply") {
+                log("intent", "Reply drafting planned", { desc: step.desc });
+              }
+
+              log("step_done", `Completed step ${step.id}`);
+            }
+          }
+        );
+
+        const evidenceSummary = await withAegisTaskSpan(
+          {
+            name: "run.evidence_aggregation",
+            version: RUN_TRACE_VERSION,
+            metadata: {
+              ...traceMetadata,
+              tool_name: "evidence_summary",
+              search_provider: "linkup",
+            },
+          },
+          async () => {
+            const summary = summarizeResearchEvidence(rawSearchBatches);
+
+            addAegisSpanEvent("run.evidence_summarized", {
+              evidence_count: summary.evidence.length,
+              conflict_count: summary.conflicts.length,
+            });
+
+            log("evidence", "Scored retrieval evidence and checked for conflicts", {
+              evidenceCount: summary.evidence.length,
+              conflicts: summary.conflicts.length,
+              evidenceQualityScore: summary.evidence_quality_score,
+            });
+
+            annotateAegisCurrentSpan({
+              ...traceMetadata,
+              evidence_count: summary.evidence.length,
+            });
+
+            return summary;
+          }
+        );
+
+        const perEntityResearch = groupResearchByEntity(plan, research);
+        const entityCandidates = extractEntityCandidatesFromContext({
+          emailText,
+          docText,
+          searchQueries: perEntityResearch.map((e) => e.query),
+          maxEntities: 6,
+        });
+        const entities = entityCandidates.map((entry) => entry.name);
+
+        addAegisSpanEvent("run.entity_candidates_extracted", {
+          candidate_count: entityCandidates.length,
+          research_groups: perEntityResearch.length,
+        });
+
+        let profileCacheHits = 0;
+        let profileModelCalls = 0;
+        const profileTelemetryMetadata = toRespanAssociationProperties(
+          buildAegisRespanMetadata({
+            ...traceMetadata,
+            selected_model: ENTITY_PROFILE_MODEL,
+            tool_name: "entity_profile",
+            search_provider: "linkup",
+            evidence_count: evidenceSummary.evidence.length,
+            fallback_triggered: false,
+          })
+        );
+        const profiles = await withAegisTaskSpan(
+          {
+            name: "run.entity_profile_generation",
+            version: RUN_TRACE_VERSION,
+            metadata: {
+              ...traceMetadata,
+              selected_model: ENTITY_PROFILE_MODEL,
+              tool_name: "entity_profile",
+              search_provider: "linkup",
+              evidence_count: evidenceSummary.evidence.length,
+            },
+          },
+          async () => {
+            const collectedProfiles: Array<z.infer<typeof EntityProfileSchema>> = [];
+
+            for (const e of perEntityResearch) {
+              if (mongoCacheReady) {
+                const cached = await getCachedProfile({
+                  entity: e.entityHint,
+                  query: e.query,
+                  depth: linkupDepth,
+                });
+                if (cached) {
+                  profileCacheHits += 1;
+                  collectedProfiles.push(cached);
+                  addAegisSpanEvent("run.entity_profile_cache_hit", {
+                    cache_hits: profileCacheHits,
+                  });
+                  log("research_profile_cache_hit", "Loaded entity profile from cache", {
+                    entity: e.entityHint,
+                    query: e.query,
+                    depth: linkupDepth,
+                  });
+                  continue;
+                }
+              }
+
+              const profilePrompt = `
 You are a research analyst. Build a compact entity profile ONLY from the provided Linkup search results.
 
 Rules:
@@ -537,45 +769,90 @@ Return STRICT JSON matching this schema exactly:
 }
 `;
 
-      const profileObj = await generateObject({
-        model: openai("gpt-4o-mini"),
-        schema: EntityProfileSchema,
-        prompt: profilePrompt,
-      });
+              profileModelCalls += 1;
 
-      profiles.push(profileObj.object);
-      if (mongoCacheReady) {
-        await saveCachedProfile({
-          entity: e.entityHint,
-          query: e.query,
-          depth: linkupDepth,
-          profile: profileObj.object,
+              const profileObj = await withAegisTaskSpan(
+                {
+                  name: "run.entity_profile_model_call",
+                  version: RUN_TRACE_VERSION,
+                  metadata: {
+                    ...traceMetadata,
+                    selected_model: ENTITY_PROFILE_MODEL,
+                    tool_name: "entity_profile",
+                    search_provider: "linkup",
+                    cache_hit: false,
+                    evidence_count: evidenceSummary.evidence.length,
+                  },
+                },
+                async () =>
+                  generateObject({
+                    model: openai(ENTITY_PROFILE_MODEL),
+                    schema: EntityProfileSchema,
+                    prompt: profilePrompt,
+                    experimental_telemetry: {
+                      isEnabled: isRespanEnabled(),
+                      functionId: "run.entity_profile_model_call",
+                      recordInputs: false,
+                      recordOutputs: false,
+                      metadata: profileTelemetryMetadata,
+                    },
+                  })
+              );
+
+              collectedProfiles.push(profileObj.object);
+              if (mongoCacheReady) {
+                await saveCachedProfile({
+                  entity: e.entityHint,
+                  query: e.query,
+                  depth: linkupDepth,
+                  profile: profileObj.object,
+                });
+              }
+            }
+
+            return collectedProfiles;
+          }
+        );
+
+        addAegisSpanEvent("run.entity_profiles_ready", {
+          profile_count: profiles.length,
+          cache_hits: profileCacheHits,
+          model_calls: profileModelCalls,
         });
-      }
-    }
 
-    log("research_profile", "Entity profiles extracted from Linkup evidence", {
-      count: profiles.length,
-      entities: profiles.map((p) => p.entity),
-      entityCandidates,
-      cacheEnabled: mongoCacheReady,
-    });
+        log("research_profile", "Entity profiles extracted from Linkup evidence", {
+          count: profiles.length,
+          entities: profiles.map((p) => p.entity),
+          entityCandidates,
+          cacheEnabled: mongoCacheReady,
+          cacheHits: profileCacheHits,
+          modelCalls: profileModelCalls,
+        });
 
-    const meetingStep = plan.steps.find((s) => s.type === "create_ics");
-    const meetingTitle = meetingStep?.title || "Follow-up Meeting";
-    const meetingDatetimeISO = meetingStep?.datetimeISO || tomorrowAt3pmNYISO();
-    const meetingICS = meetingStep?._ics || "";
+        const meetingStep = plan.steps.find((s) => s.type === "create_ics");
+        const meetingTitle = meetingStep?.title || "Follow-up Meeting";
+        const meetingDatetimeISO = meetingStep?.datetimeISO || tomorrowAt3pmNYISO();
+        const meetingICS = meetingStep?._ics || "";
 
-    const analysisSectionHint = deriveAnalysisSectionHint(command, emailText, docText);
+        const analysisSectionHint = deriveAnalysisSectionHint(command, emailText, docText);
+        const synthesisTelemetryMetadata = toRespanAssociationProperties(
+          buildAegisRespanMetadata({
+            ...traceMetadata,
+            selected_model: FINAL_SYNTHESIS_MODEL,
+            tool_name: "final_synthesis",
+            search_provider: "linkup",
+            evidence_count: evidenceSummary.evidence.length,
+            fallback_triggered: false,
+          })
+        );
 
-    log("synthesis", "Generating user-facing final output using LLM", {
-      evidenceQueries: perEntityResearch.map((e) => e.query),
-      entities,
-      analysisSectionHint,
-    });
+        log("synthesis", "Generating user-facing final output using LLM", {
+          evidenceQueries: perEntityResearch.map((e) => e.query),
+          entities,
+          analysisSectionHint,
+        });
 
-    // --- Final synthesis: LLM decides genuineness/uncertainty based on extracted profiles ---
-    const prompt = `
+        const prompt = `
 You are an AGI-inspired desktop intelligence agent producing the FINAL user-facing deliverable.
 
 User asked: "${command}"
@@ -598,9 +875,9 @@ CRITICAL RULES:
   (b) consistency: at least 2 sources agree vs sources conflict
   (c) redFlags count/severity (name collision, fiction/franchise, mismatched entity)
 - Guidance for uncertaintyPct:
-  - If official domain is present AND whatItIs is clear AND redFlags are empty/low → uncertaintyPct should be 5–25.
-- If missing official domain OR only directories/aggregators OR identity conflicts → uncertaintyPct should be 55–85.
-- If strong franchise/fiction mismatch or strong spoof signals → verdict suspicious and uncertaintyPct should be 5–25 (high confidence it's suspicious).
+  - If official domain is present AND whatItIs is clear AND redFlags are empty/low → uncertaintyPct should be 5-25.
+- If missing official domain OR only directories/aggregators OR identity conflicts → uncertaintyPct should be 55-85.
+- If strong franchise/fiction mismatch or strong spoof signals → verdict suspicious and uncertaintyPct should be 5-25 (high confidence it's suspicious).
 - Proof must be brief (2-4 items) using profile.sourceEvidence (title/url/snippet). snippet can be "".
 - Ensure replyDraft is aligned to BOTH: analysisSection findings + entity verification outcome.
 - Claims are raw asserted statements, NOT verified facts.
@@ -639,61 +916,121 @@ ICS: ${meetingICS}
 Return STRICT JSON matching the schema exactly.
 `;
 
-    const finalObj = await generateObject({
-      model: openai("gpt-4o-mini"),
-      schema: GeneratedFinalSchema,
-      prompt,
-    });
+        const finalObj = await withAegisTaskSpan(
+          {
+            name: "run.final_synthesis",
+            version: RUN_TRACE_VERSION,
+            metadata: {
+              ...traceMetadata,
+              selected_model: FINAL_SYNTHESIS_MODEL,
+              tool_name: "final_synthesis",
+              search_provider: "linkup",
+              evidence_count: evidenceSummary.evidence.length,
+              fallback_triggered: false,
+            },
+          },
+          async () =>
+            generateObject({
+              model: openai(FINAL_SYNTHESIS_MODEL),
+              schema: GeneratedFinalSchema,
+              prompt,
+              experimental_telemetry: {
+                isEnabled: isRespanEnabled(),
+                functionId: "run.final_synthesis",
+                recordInputs: false,
+                recordOutputs: false,
+                metadata: synthesisTelemetryMetadata,
+              },
+            })
+        );
 
-    const parsedFinal = FinalSchema.parse({
-      ...finalObj.object,
-      claims: attachClaimVerification(finalObj.object.claims ?? [], {
-        emailText,
-        docText,
-      }),
-      evidence: evidenceSummary.evidence,
-      conflicts: evidenceSummary.conflicts,
-      evidence_quality_score: evidenceSummary.evidence_quality_score,
-    });
-    const final = formatFinalOutput({
-      final: parsedFinal,
-      plan,
-      ledger,
-      modelsUsed: ["openai:gpt-4o-mini:entity_profile", "openai:gpt-4o-mini:final_synthesis"],
-    });
+        const responsePayload = await withAegisTaskSpan(
+          {
+            name: "run.response_assembly",
+            version: RUN_TRACE_VERSION,
+            metadata: {
+              ...traceMetadata,
+              selected_model: FINAL_SYNTHESIS_MODEL,
+              tool_name: "final_formatter",
+              search_provider: "linkup",
+              evidence_count: evidenceSummary.evidence.length,
+            },
+          },
+          async () => {
+            const parsedFinal = FinalSchema.parse({
+              ...finalObj.object,
+              claims: attachClaimVerification(finalObj.object.claims ?? [], {
+                emailText,
+                docText,
+              }),
+              evidence: evidenceSummary.evidence,
+              conflicts: evidenceSummary.conflicts,
+              evidence_quality_score: evidenceSummary.evidence_quality_score,
+            });
+            const final = formatFinalOutput({
+              final: parsedFinal,
+              plan,
+              ledger,
+              modelsUsed: [
+                `openai:${ENTITY_PROFILE_MODEL}:entity_profile`,
+                `openai:${FINAL_SYNTHESIS_MODEL}:final_synthesis`,
+              ],
+            });
 
-    log("output", "Final output produced", {
-      entityVerdicts: final.entityVerdicts?.length ?? 0,
-      claimCount: final.claims?.length ?? 0,
-      evidenceCount: final.evidence?.length ?? 0,
-      conflictCount: final.conflicts?.length ?? 0,
-      evidenceQualityScore: final.evidence_quality_score ?? 0,
-      decisionAction: final.decision?.final_action ?? "",
-      uncertaintyLevel: final.uncertainty?.level ?? "",
-      auditFlags: final.audit_trace?.flags?.length ?? 0,
-      analysisTitle: final.analysisSection?.title ?? "",
-      analysisFindings: final.analysisSection?.findings?.length ?? 0,
-      hasICS: !!final.meetingInvite?.ics,
-    });
+            addAegisSpanEvent("run.response_ready", {
+              evidence_count: final.evidence?.length ?? 0,
+              profile_count: profiles.length,
+              entity_verdicts: final.entityVerdicts?.length ?? 0,
+            });
 
-    return Response.json({
-      ok: true,
-      final,
-      plan,
-      ledger,
-      research,
-      profiles,
-      evidence: final.evidence,
-      conflicts: final.conflicts,
-      evidence_quality_score: final.evidence_quality_score,
-      runConfig: { linkupDepth },
-    });
-  } catch (err: unknown) {
-    console.error("Run error:", err);
-    const detail = err instanceof Error ? err.message : String(err);
-    return Response.json(
-      { error: "Run failed", detail },
-      { status: 500 }
-    );
-  }
+            log("output", "Final output produced", {
+              entityVerdicts: final.entityVerdicts?.length ?? 0,
+              claimCount: final.claims?.length ?? 0,
+              evidenceCount: final.evidence?.length ?? 0,
+              conflictCount: final.conflicts?.length ?? 0,
+              evidenceQualityScore: final.evidence_quality_score ?? 0,
+              decisionAction: final.decision?.final_action ?? "",
+              uncertaintyLevel: final.uncertainty?.level ?? "",
+              auditFlags: final.audit_trace?.flags?.length ?? 0,
+              analysisTitle: final.analysisSection?.title ?? "",
+              analysisFindings: final.analysisSection?.findings?.length ?? 0,
+              hasICS: !!final.meetingInvite?.ics,
+            });
+
+            annotateAegisCurrentSpan({
+              ...traceMetadata,
+              selected_model: FINAL_SYNTHESIS_MODEL,
+              search_provider: "linkup",
+              evidence_count: final.evidence?.length ?? evidenceSummary.evidence.length,
+              parse_success: true,
+              schema_validation_result: "passed",
+              fallback_triggered: false,
+            });
+
+            return {
+              ok: true,
+              final,
+              plan,
+              ledger,
+              research,
+              profiles,
+              evidence: final.evidence,
+              conflicts: final.conflicts,
+              evidence_quality_score: final.evidence_quality_score,
+              runConfig: { linkupDepth },
+            };
+          }
+        );
+
+        return Response.json(responsePayload);
+      } catch (err: unknown) {
+        console.error("Run error:", err);
+        if (err instanceof Error) {
+          recordAegisSpanException(err);
+        }
+        const detail = err instanceof Error ? err.message : String(err);
+        return Response.json({ error: "Run failed", detail }, { status: 500 });
+      }
+    }
+  );
 }

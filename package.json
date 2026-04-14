@@ -15,6 +15,7 @@
     "@react-pdf/renderer": "^4.3.2",
     "@respan/tracing": "^1.1.5",
     "ai": "^6.0.77",
+    "autoprefixer": "^10.4.27",
     "bcryptjs": "^2.4.3",
     "framer-motion": "^12.38.0",
     "jsonwebtoken": "^9.0.2",
@@ -22,6 +23,7 @@
     "mongoose": "^8.19.2",
     "next": "16.1.6",
     "pdf-parse": "^2.4.5",
+    "postcss": "^8.5.9",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "zod": "^4.3.6"
@@ -35,7 +37,7 @@
     "babel-plugin-react-compiler": "1.0.0",
     "eslint": "^9",
     "eslint-config-next": "16.1.6",
-    "tailwindcss": "^4",
+    "tailwindcss": "^4.2.2",
     "typescript": "^5"
   }
 }

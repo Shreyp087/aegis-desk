@@ -1,4 +1,6 @@
 import { createHash } from "crypto";
+import { withAegisWorkflowSpan, withAegisTaskSpan } from "@/lib/observability/respan/spans";
+import type { AegisRespanMetadataInput } from "@/lib/observability/respan/types";
 
 import { anthropic } from "@ai-sdk/anthropic";
 import { google } from "@ai-sdk/google";
@@ -1929,7 +1931,17 @@ async function persistInboxEvaluationLog(args: {
 }
 
 export async function POST(req: Request) {
-  try {
+  return withAegisWorkflowSpan(
+    {
+      name: "api.inbox.workflow",
+      metadata: {
+        surface: "inbox" as const,
+        workflow_type: "inbox_scan" as const,
+        endpoint: "api/inbox"
+      }
+    },
+    async () => {
+      try {
     const offlineConfig = getOfflineRuntimeConfig();
     const offlineEnforced = isOfflineEnforced(offlineConfig);
 
@@ -2594,5 +2606,7 @@ export async function POST(req: Request) {
     console.error("Inbox error:", err);
     const detail = err instanceof Error ? err.message : String(err);
     return Response.json({ error: "Inbox scan failed", detail }, { status: 500 });
-  }
+      }
+    }
+  );
 }
