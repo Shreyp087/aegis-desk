@@ -64,6 +64,24 @@ The selected depth is persisted as a local user preference in the browser.
 
 Planner/runner now supports dynamic LinkUp research count (2-6 searches) based on detected entities.
 
+## Respan Prompt Management
+
+`/api/run` supports an optional Respan-managed final synthesis path.
+
+To enable it, set:
+
+```bash
+RESPAN_ENABLED=true
+RESPAN_API_KEY=your_respan_key
+RESPAN_PROMPTS_ENABLED=true
+RESPAN_PROMPT_ID_SYNTHESIS=your_respan_prompt_id
+```
+
+Notes:
+- The managed prompt is optional and the route will fall back to the inline synthesis path if the prompt call fails or returns invalid output.
+- The prompt output must match the final synthesis JSON schema exactly, including enum values and field names such as `entityVerdicts[].entityType`, `entityVerdicts[].verdict`, `analysisSection.sectionType`, and `claims[].type`.
+- Keep the prompt output JSON-only. Do not return markdown, code fences, or commentary.
+
 ## Auth + Database (User/Admin)
 
 Authentication now supports:
