@@ -91,7 +91,7 @@ Key capabilities:
 - priority routing into `high`, `medium`, and `low`
 - mail classification into `spam`, `harmful`, `actionable`, and `informational`
 - deterministic decision-importance scoring for urgency, threat, relevance, opportunity, and noise
-- optional multi-model consensus, but single-model mode by default for cost control
+- optional **LLM Council Consensus** for ambiguous or high-stakes cases, with single-model mode as the default for cost control
 - entity profiling and external research through LinkUp
 - optional Respan tracing and prompt-managed synthesis
 - reply draft and ICS generation
@@ -141,7 +141,33 @@ It is the combination of:
 - structured JSON outputs validated with Zod
 - entity extraction and profile caching
 - fallback routing when AI paths fail
-- optional consensus mode with future expansion room, but single-model mode by default
+- optional council-style multi-model review, but single-model mode by default
+
+### LLM Council Consensus
+
+One of the product ideas I want to highlight is **LLM Council Consensus**.
+
+Instead of trusting one model blindly for every ambiguous email, Aegis can run a council-style review where multiple models independently assess:
+
+- the likely class of the message
+- the safest next action
+- confidence and disagreement
+- whether a message should be escalated or treated as routine
+
+In practical terms, that means:
+
+- **default mode:** one model for speed and cost control
+- **council mode:** multiple models such as GPT, Gemini, and Claude can be compared when enabled
+- **important behavior:** disagreement is surfaced as part of the decision, not averaged away invisibly
+
+That matters because many of the hardest inbox problems are not straightforward phishing emails. They are borderline cases where:
+
+- a message looks relevant but lands in spam
+- a sender seems real but is unfamiliar
+- promotional language creates fake urgency
+- the right answer is "verify before acting," not just "safe" or "unsafe"
+
+The council pattern makes Aegis stronger than a simple single-pass classifier because it turns ambiguity into something inspectable and operationally useful.
 
 ### RAG, chaining, and reasoning
 
@@ -187,24 +213,26 @@ That gap is exactly why the system now leans on deterministic decision logic, fe
 
 ```mermaid
 flowchart LR
-  A[Manual Email Input / Gmail OAuth] --> B[/api/inbox]
-  B --> C[Deterministic parsing and signal extraction]
-  C --> D[Decision-importance scoring]
-  D --> E[Hybrid classifier + policy guardrails]
-  E --> F[Inbox Scanner UI]
+  A["Manual Email Input / Gmail OAuth"] --> B["/api/inbox"]
+  B --> C["Deterministic parsing and signal extraction"]
+  C --> D["Decision-importance scoring"]
+  D --> E["Hybrid classifier + policy guardrails"]
+  E --> P["Optional LLM Council Consensus<br/>for ambiguous or high-stakes cases"]
+  E --> F["Inbox Scanner UI"]
+  P --> F
 
-  F --> G[/api/plan]
-  G --> H[Planner model]
-  H --> I[/api/run]
-  I --> J[Privacy firewall + LinkUp research]
-  J --> K[Entity profiling + evidence synthesis]
-  K --> L[Reply draft / ICS / tickets]
+  F --> G["/api/plan"]
+  G --> H["Planner model"]
+  H --> I["/api/run"]
+  I --> J["Privacy firewall + LinkUp research"]
+  J --> K["Entity profiling + evidence synthesis"]
+  K --> L["Reply draft / ICS / tickets"]
 
-  M[Incident memory] --> E
-  N[Offline mode policy] --> B
+  M["Incident memory"] --> E
+  N["Offline mode policy"] --> B
   N --> G
   N --> I
-  O[Respan tracing] --> B
+  O["Respan tracing"] --> B
   O --> G
   O --> I
 ```
@@ -226,10 +254,10 @@ It tries to answer:
 - is this harmful, just noisy, or actually useful?
 - what action should the user take?
 
-#### 3. Single-model by default, consensus optional
+#### 3. Single-model by default, LLM Council Consensus optional
 
-Consensus can improve robustness, but it increases cost and complexity.
-The repo keeps the option available while defaulting to one model path.
+Council-style consensus improves robustness for uncertain cases, but it increases cost and latency.
+The repo keeps that path available while defaulting to one model for normal operation.
 
 #### 4. Standard research by default, deep research by choice
 
