@@ -1,4 +1,5 @@
 import type { InboxMailClass, InboxThreatType } from "./schemas";
+import type { DecisionImportanceProfile } from "./importance";
 
 export type IncidentHint = {
   mailClass: InboxMailClass;
@@ -22,6 +23,7 @@ export type MailClassifierInput = {
   moneyMentionsCount: number;
   deadlineCount: number;
   incidentHints: IncidentHint[];
+  decisionImportance: DecisionImportanceProfile;
 };
 
 export type MailClassifierResult = {
@@ -91,57 +93,93 @@ export function classifyInboxMail(input: MailClassifierInput): MailClassifierRes
     scoreOfCategory(input.categoryScores, "scam_impersonation")
   );
 
-  const memoryCount = input.incidentHints.length;
+  const learnedHints = input.incidentHints.filter((hint) => Boolean(hint.outcomeLabel));
+  const memoryCount = learnedHints.length;
   const spamHistory =
     memoryCount === 0
       ? 0
-      : input.incidentHints.filter((h) => h.mailClass === "spam").length / memoryCount;
+      : learnedHints.filter((h) => h.mailClass === "spam").length / memoryCount;
   const harmfulHistory =
     memoryCount === 0
       ? 0
-      : input.incidentHints.filter((h) => h.mailClass === "harmful").length / memoryCount;
+      : learnedHints.filter((h) => h.mailClass === "harmful").length / memoryCount;
   const falsePositivePressure =
     memoryCount === 0
       ? 0
-      : input.incidentHints.filter((h) => h.outcomeLabel === "spam_false_positive").length / memoryCount;
+      : learnedHints.filter((h) => h.outcomeLabel === "spam_false_positive").length / memoryCount;
+  const safeAffinity =
+    memoryCount === 0
+      ? 0
+      : learnedHints.filter(
+          (h) =>
+            h.outcomeLabel === "actionable_correct" ||
+            h.outcomeLabel === "informational_correct" ||
+            h.outcomeLabel === "spam_false_positive"
+        ).length / memoryCount;
+  const confirmedSpam =
+    memoryCount === 0
+      ? 0
+      : learnedHints.filter((h) => h.outcomeLabel === "spam_true_positive").length / memoryCount;
+  const confirmedHarmful =
+    memoryCount === 0
+      ? 0
+      : learnedHints.filter((h) => h.outcomeLabel === "harmful_true_positive").length / memoryCount;
 
   const spamLogit =
-    -0.3 +
+    -0.5 +
     newsletterScore * 0.045 +
-    salesScore * 0.015 -
+    salesScore * 0.012 -
     securityScore * 0.025 -
     financeScore * 0.018 -
     scamPeak * 0.02 +
-    spamHistory * 1.2 +
-    falsePositivePressure * 0.9;
+    input.decisionImportance.noiseScore * 0.018 -
+    input.decisionImportance.opportunityScore * 0.015 -
+    input.decisionImportance.relevanceScore * 0.01 +
+    spamHistory * 0.9 +
+    confirmedSpam * 0.95 -
+    falsePositivePressure * 1.25 -
+    safeAffinity * 1.05;
 
   const harmfulLogit =
     -1.0 +
     scamPeak * 0.046 +
     securityScore * 0.025 +
     financeScore * 0.021 +
+    input.decisionImportance.threatScore * 0.018 +
+    input.decisionImportance.trustGapScore * 0.012 +
     (input.attachmentRiskScore / 100) * 1.1 +
     Math.min(0.9, input.urlsCount * 0.1) +
     (input.trustScore <= 35 ? 0.45 : 0) +
     (input.reputationScore <= 40 ? 0.35 : 0) +
     input.threadRiskDensity * 0.55 +
-    harmfulHistory * 1.3;
+    harmfulHistory * 1.3 +
+    confirmedHarmful * 1.1 -
+    safeAffinity * 0.25;
 
   const actionableLogit =
-    -0.7 +
+    -0.85 +
     deadlineScore * 0.02 +
     supportScore * 0.02 +
     legalScore * 0.015 +
+    input.decisionImportance.urgencyScore * 0.02 +
+    input.decisionImportance.relevanceScore * 0.017 +
+    input.decisionImportance.opportunityScore * 0.008 +
     Math.min(0.8, input.deadlineCount * 0.15) +
     Math.min(0.6, input.moneyMentionsCount * 0.12) +
-    (input.threadDepth >= 2 ? 0.2 : 0);
+    (input.threadDepth >= 2 ? 0.2 : 0) +
+    safeAffinity * 0.35;
 
   const informationalLogit =
     -0.25 +
     (input.primaryCategory === "general" ? 0.45 : 0) +
     (input.signals.length <= 1 ? 0.35 : 0) +
     (input.riskTags.length === 0 ? 0.35 : 0) +
-    (input.threadDepth <= 1 ? 0.2 : 0);
+    (input.threadDepth <= 1 ? 0.2 : 0) +
+    input.decisionImportance.noiseScore * 0.014 +
+    input.decisionImportance.opportunityScore * 0.01 +
+    safeAffinity * 0.25 -
+    input.decisionImportance.threatScore * 0.01 -
+    input.decisionImportance.urgencyScore * 0.012;
 
   const normalized = normalizeProbabilities({
     spam: sigmoid(spamLogit),
@@ -173,6 +211,6 @@ export function classifyInboxMail(input: MailClassifierInput): MailClassifierRes
     predictedClass,
     memorySampleCount: memoryCount,
     rationale,
-    modelVersion: "inbox-hybrid-classifier-v1",
+    modelVersion: "inbox-hybrid-classifier-v2",
   };
 }

@@ -1,6 +1,5 @@
 import { createHash } from "crypto";
-import { withAegisWorkflowSpan, withAegisTaskSpan } from "@/lib/observability/respan/spans";
-import type { AegisRespanMetadataInput } from "@/lib/observability/respan/types";
+import { withAegisWorkflowSpan } from "@/lib/observability/respan/spans";
 
 import { anthropic } from "@ai-sdk/anthropic";
 import { google } from "@ai-sdk/google";
@@ -35,6 +34,7 @@ import {
   fetchLatestGmailRawEmails,
   getValidGmailToken,
 } from "@/lib/inbox/gmail";
+import { buildDecisionImportanceProfile } from "@/lib/inbox/importance";
 import {
   appendInboxEvaluationLogEntries,
   buildGroundTruthPlaceholder,
@@ -156,6 +156,7 @@ type ScoringSnapshot = {
   trustScore: number;
   reputation: ReputationProfile;
   thread: ThreadProfile;
+  decisionImportance: ReturnType<typeof buildDecisionImportanceProfile>;
 };
 
 type ScoredEmail = ParsedEmail & ScoringSnapshot & {
@@ -381,7 +382,21 @@ const PATTERNS = {
     /\bavailability\b/i,
   ],
   executive: [/\bceo\b/i, /\bcfo\b/i, /\bcto\b/i, /\bfounder\b/i, /\bboard\b/i, /\bexecutive\b/i],
-  sales: [/\bproposal\b/i, /\bquote\b/i, /\bdemo\b/i, /\bpricing\b/i, /\bdiscount\b/i, /\btrial\b/i],
+  sales: [
+    /\bproposal\b/i,
+    /\bquote\b/i,
+    /\bdemo\b/i,
+    /\bpricing\b/i,
+    /\bdiscount\b/i,
+    /\btrial\b/i,
+    /\bpromo code\b/i,
+    /\bcoupon\b/i,
+    /\bpercent off\b/i,
+    /\b\d{1,3}% off\b/i,
+    /\bbogo\b/i,
+    /\bbuy one get one\b/i,
+    /\bsale\b/i,
+  ],
   support: [/\bticket\b/i, /\bincident\b/i, /\boutage\b/i, /\bissue\b/i, /\bbug\b/i, /\bsupport\b/i],
   newsletter: [/\bunsubscribe\b/i, /\bnewsletter\b/i, /\bweekly digest\b/i, /\bmarketing\b/i, /\bpromotion\b/i],
   impersonation: [
@@ -397,6 +412,29 @@ const PATTERNS = {
   ],
   malware: [/\benabled macro\b/i, /\bmacro-enabled\b/i, /\bdownload attachment\b/i, /\bopen attachment\b/i],
 };
+
+const PROMOTIONAL_URGENCY_PATTERNS = [
+  /\btoday only\b/i,
+  /\bends tonight\b/i,
+  /\blast chance\b/i,
+  /\bfinal hours\b/i,
+  /\bending soon\b/i,
+  /\blimited time offer\b/i,
+  /\bshop now\b/i,
+  /\bclaim your deal\b/i,
+];
+
+const PROMOTIONAL_SENDER_HINT_PATTERNS = [
+  /\bdeal(s)?\b/i,
+  /\boffer(s)?\b/i,
+  /\bpromo\b/i,
+  /\bsale(s)?\b/i,
+  /\bmarketing\b/i,
+  /\bnewsletter\b/i,
+  /\bupdates\b/i,
+  /\bshop\b/i,
+  /\bno-?reply\b/i,
+];
 
 const CALIBRATION_PROFILES: Record<
   Category,
@@ -418,7 +456,8 @@ const CALIBRATION_PROFILES: Record<
   general: { slope: 0.96, offset: -3, reliabilityWeight: 0.45 },
 };
 
-const INBOX_POLICY_VERSION = process.env.INBOX_POLICY_VERSION || "inbox-policy-v3-phase2";
+const INBOX_POLICY_VERSION =
+  process.env.INBOX_POLICY_VERSION || "inbox-policy-v4-decision-importance";
 
 function inboxModelVersion(args: {
   offlineEnforced: boolean;
@@ -435,6 +474,54 @@ function clamp(value: number, min: number, max: number): number {
 
 function countHits(text: string, regexes: RegExp[]): number {
   return regexes.reduce((sum, re) => sum + (re.test(text) ? 1 : 0), 0);
+}
+
+function countSenderPromoHints(senderEmail: string, senderDomain: string): number {
+  const localPart = senderEmail.includes("@") ? senderEmail.split("@")[0] : senderEmail;
+  const senderText = `${localPart} ${senderDomain}`.trim();
+  if (!senderText) return 0;
+  return countHits(senderText, PROMOTIONAL_SENDER_HINT_PATTERNS);
+}
+
+function buildPromotionalContext(args: {
+  text: string;
+  senderEmail: string;
+  senderDomain: string;
+  attachmentRiskScore: number;
+  securityHits: number;
+  paymentHits: number;
+  legalHits: number;
+  impersonationHits: number;
+  malwareHits: number;
+  deadlineHits: number;
+}) {
+  const salesHits = countHits(args.text, PATTERNS.sales);
+  const newsletterHits = countHits(args.text, PATTERNS.newsletter);
+  const promoUrgencyHits = countHits(args.text, PROMOTIONAL_URGENCY_PATTERNS);
+  const senderPromoHits = countSenderPromoHints(args.senderEmail, args.senderDomain);
+  const promotionalConfidence =
+    salesHits * 0.7 + newsletterHits * 0.95 + promoUrgencyHits * 0.7 + senderPromoHits * 0.8;
+  const lowRiskPromotional =
+    promotionalConfidence >= 2.1 &&
+    args.securityHits === 0 &&
+    args.paymentHits === 0 &&
+    args.legalHits === 0 &&
+    args.impersonationHits === 0 &&
+    args.malwareHits === 0 &&
+    args.attachmentRiskScore < 25;
+  const effectiveDeadlineHits = lowRiskPromotional
+    ? Math.max(0, args.deadlineHits - promoUrgencyHits)
+    : args.deadlineHits;
+
+  return {
+    salesHits,
+    newsletterHits,
+    promoUrgencyHits,
+    senderPromoHits,
+    promotionalConfidence,
+    lowRiskPromotional,
+    effectiveDeadlineHits,
+  };
 }
 
 function extractHeader(raw: string, key: string): string {
@@ -783,7 +870,23 @@ function buildThreadProfiles(parsed: ParsedEmail[]): Record<string, ThreadProfil
   for (const email of parsed) {
     const text = `${email.subject}\n${email.body}`;
     const riskHits = countHits(text, [...PATTERNS.security, ...PATTERNS.payment, ...PATTERNS.legal]);
-    const urgencyHits = countHits(text, PATTERNS.deadline);
+    const urgencyHitsRaw = countHits(text, PATTERNS.deadline);
+    const promotionalContext = buildPromotionalContext({
+      text,
+      senderEmail: email.senderEmail,
+      senderDomain: email.senderDomain,
+      attachmentRiskScore: email.extracted.attachmentRiskScore,
+      securityHits: countHits(text, PATTERNS.security),
+      paymentHits: countHits(text, PATTERNS.payment),
+      legalHits: countHits(text, PATTERNS.legal),
+      impersonationHits: countHits(text, PATTERNS.impersonation),
+      malwareHits: countHits(text, PATTERNS.malware),
+      deadlineHits: urgencyHitsRaw,
+    });
+    const urgencyHits =
+      promotionalContext.lowRiskPromotional && riskHits === 0
+        ? promotionalContext.effectiveDeadlineHits
+        : urgencyHitsRaw;
     const cur = stats[email.threadKey] || { count: 0, riskHits: 0, urgencyHits: 0 };
     cur.count += 1;
     cur.riskHits += riskHits;
@@ -805,6 +908,8 @@ function buildThreadProfiles(parsed: ParsedEmail[]): Record<string, ThreadProfil
 
 function buildCategoryScores(args: {
   text: string;
+  senderEmail: string;
+  senderDomain: string;
   externalSender: boolean;
   suspiciousDomain: boolean;
   extracted: ParsedEmail["extracted"];
@@ -818,18 +923,37 @@ function buildCategoryScores(args: {
   const deadlineHits = countHits(args.text, PATTERNS.deadline);
   const scheduleHits = countHits(args.text, PATTERNS.scheduling);
   const execHits = countHits(args.text, PATTERNS.executive);
-  const salesHits = countHits(args.text, PATTERNS.sales);
   const supportHits = countHits(args.text, PATTERNS.support);
-  const newsletterHits = countHits(args.text, PATTERNS.newsletter);
   const impersonationHits = countHits(args.text, PATTERNS.impersonation);
   const malwareHits = countHits(args.text, PATTERNS.malware);
+  const promotionalContext = buildPromotionalContext({
+    text: args.text,
+    senderEmail: args.senderEmail,
+    senderDomain: args.senderDomain,
+    attachmentRiskScore: args.extracted.attachmentRiskScore,
+    securityHits,
+    paymentHits,
+    legalHits,
+    impersonationHits,
+    malwareHits,
+    deadlineHits,
+  });
+  const {
+    salesHits,
+    newsletterHits,
+    promoUrgencyHits,
+    senderPromoHits,
+    promotionalConfidence,
+    lowRiskPromotional,
+    effectiveDeadlineHits,
+  } = promotionalContext;
 
   const trustRisk = args.trustScore <= 35 ? 1 : 0;
   const reputationRisk = args.reputationScore <= 45 ? 1 : 0;
 
   const scamBecScore =
     execHits * 16 +
-    deadlineHits * 8 +
+    effectiveDeadlineHits * 8 +
     impersonationHits * 18 +
     paymentHits * 7 +
     (args.externalSender ? 12 : 0) +
@@ -840,7 +964,7 @@ function buildCategoryScores(args: {
 
   const scamInvoiceScore =
     paymentHits * 18 +
-    deadlineHits * 7 +
+    effectiveDeadlineHits * 7 +
     (args.extracted.moneyMentions.length > 0 ? 10 : 0) +
     impersonationHits * 6 +
     (args.externalSender ? 10 : 0) +
@@ -876,11 +1000,11 @@ function buildCategoryScores(args: {
     (args.suspiciousDomain ? 12 : 0) +
     trustRisk * 8 +
     reputationRisk * 8 +
-    deadlineHits * 6;
+    effectiveDeadlineHits * 6;
 
   const securityScore =
     securityHits * 17 +
-    deadlineHits * 5 +
+    effectiveDeadlineHits * 5 +
     (args.extracted.urls.length > 0 ? 7 : 0) +
     (args.extracted.attachmentRiskScore > 30 ? 12 : 0) +
     (args.externalSender ? 9 : 0) +
@@ -891,7 +1015,7 @@ function buildCategoryScores(args: {
 
   const financeScore =
     paymentHits * 16 +
-    deadlineHits * 6 +
+    effectiveDeadlineHits * 6 +
     (args.extracted.moneyMentions.length > 0 ? 8 : 0) +
     (args.externalSender ? 8 : 0) +
     trustRisk * 6 +
@@ -899,13 +1023,29 @@ function buildCategoryScores(args: {
     args.thread.riskDensity * 8;
 
   const legalScore = legalHits * 16 + (args.extracted.deadlines.length > 0 ? 6 : 0) + args.thread.depth * 1.5;
-  const deadlineScore = scheduleHits * 9 + deadlineHits * 12 + args.thread.depth * 1.8 + args.thread.riskDensity * 7;
-  const executiveScore = execHits * 14 + deadlineHits * 3 + (args.externalSender ? 3 : 0);
-  const salesScore = salesHits * 12 + (newsletterHits > 0 ? 4 : 0) - securityHits * 3;
+  const deadlineScore =
+    scheduleHits * 9 +
+    effectiveDeadlineHits * 12 +
+    args.thread.depth * 1.8 +
+    args.thread.riskDensity * 7 -
+    (lowRiskPromotional ? promotionalConfidence * 5 : 0);
+  const executiveScore = execHits * 14 + effectiveDeadlineHits * 3 + (args.externalSender ? 3 : 0);
+  const salesScore =
+    salesHits * 12 +
+    senderPromoHits * 10 +
+    (newsletterHits > 0 ? 4 : 0) +
+    (lowRiskPromotional ? promoUrgencyHits * 6 : 0) -
+    securityHits * 3;
   const supportScore = supportHits * 13 + scheduleHits * 5;
   const newsletterScore =
-    newsletterHits * 15 + (args.externalSender ? 2 : 0) - securityHits * 8 - paymentHits * 6 - deadlineHits * 4;
-  const generalScore = 14 + scheduleHits * 2 + (args.externalSender ? 1 : 0);
+    newsletterHits * 15 +
+    senderPromoHits * 8 +
+    (args.externalSender ? 2 : 0) +
+    (lowRiskPromotional ? promoUrgencyHits * 5 : 0) -
+    securityHits * 8 -
+    paymentHits * 6 -
+    effectiveDeadlineHits * 4;
+  const generalScore = 14 + scheduleHits * 2 + (args.externalSender ? 1 : 0) - (lowRiskPromotional ? promotionalConfidence * 4 : 0);
 
   const categories: CategoryScore[] = [
     {
@@ -1003,22 +1143,43 @@ function scoreEmail(args: {
   trustScore: number;
   reputation: ReputationProfile;
   thread: ThreadProfile;
+  incidentHints: IncidentHint[];
 }): ScoringSnapshot {
   const text = `${args.parsed.subject}\n${args.parsed.body}`;
   const securityHits = countHits(text, PATTERNS.security);
   const paymentHits = countHits(text, PATTERNS.payment);
   const legalHits = countHits(text, PATTERNS.legal);
   const deadlineHits = countHits(text, PATTERNS.deadline);
+  const scheduleHits = countHits(text, PATTERNS.scheduling);
   const execHits = countHits(text, PATTERNS.executive);
   const impersonationHits = countHits(text, PATTERNS.impersonation);
+  const supportHits = countHits(text, PATTERNS.support);
+  const malwareHits = countHits(text, PATTERNS.malware);
 
   const suspiciousDomain =
     !!args.parsed.senderDomain && SUSPICIOUS_TLDS.some((tld) => args.parsed.senderDomain.endsWith(tld));
   const externalSender =
     !!args.parsed.senderDomain && !args.orgDomains.some((domain) => domain.toLowerCase() === args.parsed.senderDomain);
+  const promotionalContext = buildPromotionalContext({
+    text,
+    senderEmail: args.parsed.senderEmail,
+    senderDomain: args.parsed.senderDomain,
+    attachmentRiskScore: args.parsed.extracted.attachmentRiskScore,
+    securityHits,
+    paymentHits,
+    legalHits,
+    impersonationHits,
+    malwareHits,
+    deadlineHits,
+  });
+  const effectiveDeadlineCount = promotionalContext.lowRiskPromotional
+    ? Math.max(0, args.parsed.extracted.deadlines.length - promotionalContext.promoUrgencyHits)
+    : args.parsed.extracted.deadlines.length;
 
   const categoryScores = buildCategoryScores({
     text,
+    senderEmail: args.parsed.senderEmail,
+    senderDomain: args.parsed.senderDomain,
     externalSender,
     suspiciousDomain,
     extracted: args.parsed.extracted,
@@ -1036,61 +1197,68 @@ function scoreEmail(args: {
   const securityScore = scoreOfCategory(categoryScores, "security_phishing");
   const financeScore = scoreOfCategory(categoryScores, "finance_payment");
   const legalScore = scoreOfCategory(categoryScores, "legal_contract");
-  const deadlineScore = scoreOfCategory(categoryScores, "deadline_scheduling");
-  const executiveScore = scoreOfCategory(categoryScores, "executive_escalation");
   const newsletterScore = scoreOfCategory(categoryScores, "newsletter");
 
+  const decisionImportance = buildDecisionImportanceProfile({
+    primaryCategory,
+    categoryScores: categoryScores.map((entry) => ({
+      category: entry.category,
+      score: entry.score,
+    })),
+    trustScore: args.trustScore,
+    reputationScore: args.reputation.score,
+    thread: args.thread,
+    externalSender,
+    suspiciousDomain,
+    attachmentRiskScore: args.parsed.extracted.attachmentRiskScore,
+    urlsCount: args.parsed.extracted.urls.length,
+    deadlineCount: effectiveDeadlineCount,
+    moneyMentionsCount: args.parsed.extracted.moneyMentions.length,
+    signalCount:
+      securityHits +
+      paymentHits +
+      legalHits +
+      promotionalContext.effectiveDeadlineHits +
+      execHits +
+      impersonationHits,
+    hitCounts: {
+      deadline: promotionalContext.effectiveDeadlineHits,
+      scheduling: scheduleHits,
+      executive: execHits,
+      support: supportHits,
+    },
+    text,
+    incidentHints: args.incidentHints,
+  });
+
   let priorityScore =
-    8 +
-    scamBecScore * 0.5 +
-    scamInvoiceScore * 0.48 +
-    scamCredentialScore * 0.5 +
-    scamMalwareScore * 0.46 +
-    scamImpersonationScore * 0.46 +
-    securityScore * 0.5 +
-    financeScore * 0.44 +
-    legalScore * 0.34 +
-    executiveScore * 0.2 +
-    deadlineScore * 0.18 +
-    (externalSender ? 10 : 0) +
-    (suspiciousDomain ? 10 : 0) +
-    (args.parsed.extracted.attachmentRiskScore > 40 ? 10 : 0) +
-    Math.min(10, Math.round((50 - args.trustScore) * 0.2)) +
-    Math.min(10, Math.round((50 - args.reputation.score) * 0.2)) +
-    Math.round(args.thread.riskDensity * 10);
+    6 +
+    decisionImportance.threatScore * 0.34 +
+    decisionImportance.urgencyScore * 0.33 +
+    decisionImportance.relevanceScore * 0.19 +
+    decisionImportance.opportunityScore * 0.15 -
+    decisionImportance.noiseScore * 0.3;
 
-  const criticalSecurityCombo =
-    securityScore >= 58 &&
-    externalSender &&
-    (args.parsed.extracted.urls.length > 0 || args.parsed.extracted.attachmentRiskScore >= 35);
+  const verifyNowCombo =
+    decisionImportance.threatScore >= 72 && decisionImportance.trustGapScore >= 55;
+  const actNowCombo =
+    decisionImportance.urgencyScore >= 70 && decisionImportance.relevanceScore >= 48;
+  const valuableOpportunityCombo =
+    decisionImportance.opportunityScore >= 62 &&
+    decisionImportance.affinityScore >= 28 &&
+    decisionImportance.threatScore < 58;
+  const routineNoiseCombo =
+    decisionImportance.noiseScore >= 74 &&
+    decisionImportance.urgencyScore < 45 &&
+    decisionImportance.threatScore < 50 &&
+    decisionImportance.opportunityScore < 60;
 
-  const criticalFinanceCombo =
-    financeScore >= 62 &&
-    externalSender &&
-    deadlineHits > 0;
-
-  const criticalScamCombo =
-    Math.max(
-      scamBecScore,
-      scamInvoiceScore,
-      scamCredentialScore,
-      scamMalwareScore,
-      scamImpersonationScore
-    ) >= 72;
-
-  if (criticalSecurityCombo) priorityScore += 16;
-  if (criticalFinanceCombo) priorityScore += 14;
-  if (criticalScamCombo) priorityScore += 18;
-  if (args.thread.depth >= 3 && args.thread.riskDensity >= 0.45) priorityScore += 6;
-
-  if (newsletterScore >= 50 && securityHits === 0 && paymentHits === 0 && legalHits === 0) {
-    priorityScore -= 16;
-  }
+  if (verifyNowCombo) priorityScore = Math.max(priorityScore, 84);
+  if (actNowCombo) priorityScore = Math.max(priorityScore, 80);
+  if (valuableOpportunityCombo) priorityScore = Math.max(priorityScore, 56);
+  if (routineNoiseCombo) priorityScore = Math.min(priorityScore, 36);
 
   priorityScore = clamp(Math.round(priorityScore), 0, 100);
-  if (criticalSecurityCombo || criticalFinanceCombo || criticalScamCombo) {
-    priorityScore = Math.max(priorityScore, criticalScamCombo ? 88 : 82);
-  }
 
   const priority: Priority = priorityScore >= 80 ? "high" : priorityScore >= 50 ? "medium" : "low";
 
@@ -1105,29 +1273,39 @@ function scoreEmail(args: {
   if (legalScore >= 35) riskTags.push("Legal");
   if (externalSender) riskTags.push("External Sender");
   if (suspiciousDomain) riskTags.push("Suspicious Domain");
-  if (deadlineHits > 0) riskTags.push("Deadline Pressure");
+  if (promotionalContext.effectiveDeadlineHits > 0) riskTags.push("Deadline Pressure");
   if (execHits > 0) riskTags.push("Executive Escalation");
   if (impersonationHits > 0) riskTags.push("Impersonation Language");
   if (args.parsed.extracted.attachmentRiskScore > 40) riskTags.push("Suspicious Attachment");
   if (args.reputation.score <= 45) riskTags.push("Weak Entity Reputation");
   if (args.trustScore <= 30) riskTags.push("Low Historical Trust");
+  if (decisionImportance.trustGapScore >= 58) riskTags.push("Trust Gap");
 
   const signals: string[] = [];
   if (securityHits > 0) signals.push(`${securityHits} credential/authentication signal(s)`);
   if (paymentHits > 0) signals.push(`${paymentHits} payment/transfer signal(s)`);
   if (legalHits > 0) signals.push(`${legalHits} legal/contract signal(s)`);
-  if (deadlineHits > 0) signals.push(`${deadlineHits} urgency/deadline signal(s)`);
+  if (promotionalContext.effectiveDeadlineHits > 0) {
+    signals.push(`${promotionalContext.effectiveDeadlineHits} urgency/deadline signal(s)`);
+  }
   if (args.parsed.extracted.attachmentRiskScore > 0) {
     signals.push(`attachment risk score ${args.parsed.extracted.attachmentRiskScore}/100`);
   }
   if (externalSender) signals.push("sender appears external to organization domains");
   if (suspiciousDomain) signals.push("sender domain uses suspicious TLD pattern");
-  if (criticalSecurityCombo) signals.push("critical combo: external + security + URL/attachment");
-  if (criticalFinanceCombo) signals.push("critical combo: external + finance + urgency");
-  if (criticalScamCombo) signals.push("critical scam score threshold exceeded");
+  if (verifyNowCombo) signals.push("verify-now pattern: high threat combined with trust gap");
+  if (actNowCombo) signals.push("act-now pattern: urgency and relevance both elevated");
+  if (valuableOpportunityCombo) signals.push("review-later pattern: likely valuable opportunity with prior affinity");
+  if (routineNoiseCombo) signals.push("ignore-routine pattern: noise dominates action value");
   if (impersonationHits > 0) signals.push(`${impersonationHits} impersonation signal(s)`);
   if (args.thread.depth > 1) signals.push(`thread depth ${args.thread.depth} with risk density ${args.thread.riskDensity}`);
   if (newsletterScore >= 45) signals.push("newsletter/marketing signature detected");
+  signals.push(
+    `decision profile threat/urgency/relevance/opportunity/noise ${decisionImportance.threatScore}/${decisionImportance.urgencyScore}/${decisionImportance.relevanceScore}/${decisionImportance.opportunityScore}/${decisionImportance.noiseScore}`
+  );
+  if (decisionImportance.affinityScore >= 25) {
+    signals.push(`historical affinity score ${decisionImportance.affinityScore}/100`);
+  }
 
   return {
     priorityScore,
@@ -1139,6 +1317,7 @@ function scoreEmail(args: {
     trustScore: args.trustScore,
     reputation: args.reputation,
     thread: args.thread,
+    decisionImportance,
   };
 }
 
@@ -1322,16 +1501,21 @@ function buildTrustedDecision(args: {
   uncertaintyPercent: number;
 }): TrustedDecision {
   let riskScore = Math.round(
-    args.email.priorityScore * 0.58 +
-      (100 - args.email.trustScore) * 0.21 +
-      (100 - args.email.reputation.score) * 0.21
+    args.email.decisionImportance.threatScore * 0.62 +
+      args.email.decisionImportance.trustGapScore * 0.2 +
+      (100 - args.email.trustScore) * 0.09 +
+      (100 - args.email.reputation.score) * 0.09
   );
 
   if (isScamCategory(args.email.primaryCategory)) riskScore += 12;
   if (args.email.riskTags.includes("External Sender")) {
     riskScore += OFFLINE_MODE_TEMPLATE_WEIGHTS.senderMismatch;
   }
-  if (args.email.riskTags.includes("Deadline Pressure")) {
+  if (
+    args.email.riskTags.includes("Deadline Pressure") &&
+    (args.email.decisionImportance.trustGapScore >= 45 ||
+      args.email.decisionImportance.threatScore >= 60)
+  ) {
     riskScore += OFFLINE_MODE_TEMPLATE_WEIGHTS.urgentLanguage;
   }
   if (args.email.riskTags.includes("Payment") || args.email.riskTags.includes("Invoice Scam")) {
@@ -1994,6 +2178,7 @@ export async function POST(req: Request) {
         trustScore,
       });
       const thread = threadProfiles[email.threadKey] || { key: email.threadKey, depth: 1, riskDensity: 0 };
+      const incidentHints = incidentHintsByEmail[email.id] || [];
 
       const s = scoreEmail({
         parsed: email,
@@ -2001,8 +2186,8 @@ export async function POST(req: Request) {
         trustScore,
         reputation,
         thread,
+        incidentHints,
       });
-      const incidentHints = incidentHintsByEmail[email.id] || [];
       const classifier = classifyInboxMail({
         primaryCategory: s.primaryCategory,
         categoryScores: s.categoryScores.map((entry) => ({
@@ -2020,6 +2205,7 @@ export async function POST(req: Request) {
         moneyMentionsCount: email.extracted.moneyMentions.length,
         deadlineCount: email.extracted.deadlines.length,
         incidentHints,
+        decisionImportance: s.decisionImportance,
       });
 
       const priorityGuardrail = applyPriorityGuardrails({
@@ -2029,12 +2215,14 @@ export async function POST(req: Request) {
           score: entry.score,
         })),
         priorityScore: s.priorityScore,
+        deadlineCount: email.extracted.deadlines.length,
         signals: s.signals,
         trustScore: s.trustScore,
         reputationScore: s.reputation.score,
         attachmentRiskScore: email.extracted.attachmentRiskScore,
         urlsCount: email.extracted.urls.length,
         classifier,
+        decisionImportance: s.decisionImportance,
       });
 
       const guardrailTags = priorityGuardrail.ruleHits.map((rule) => `Guardrail:${rule}`);
@@ -2199,6 +2387,8 @@ export async function POST(req: Request) {
           derivedMailClass,
           derivedThreatType,
           classifier: email.classifier,
+          priorityScore: email.priorityScore,
+          decisionImportance: email.decisionImportance,
         });
 
         const policyRuleHits = Array.from(
@@ -2234,6 +2424,7 @@ export async function POST(req: Request) {
             ruleHits: policyRuleHits,
             rationale: policyRationale,
           },
+          decisionImportance: email.decisionImportance,
           classifier: email.classifier,
           consensus: {
             score: finalAssist.consensusScore,
@@ -2397,6 +2588,8 @@ export async function POST(req: Request) {
         derivedMailClass,
         derivedThreatType,
         classifier: email.classifier,
+        priorityScore: email.priorityScore,
+        decisionImportance: email.decisionImportance,
       });
       const policyRuleHits = Array.from(
         new Set([
@@ -2430,6 +2623,7 @@ export async function POST(req: Request) {
             .filter(Boolean)
             .join(" "),
         },
+        decisionImportance: email.decisionImportance,
         classifier: email.classifier,
         consensus: {
           score: 50,

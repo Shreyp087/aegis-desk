@@ -1248,7 +1248,7 @@ export default function InboxScannerPanel({
               <div className="grid gap-3 md:grid-cols-2">
                 <MetricCard label="Scanned" value={meta?.scanned ?? 0} sub="Current queue size." />
                 <MetricCard
-                  label="High Risk"
+                  label="High Priority"
                   value={meta?.highCount ?? 0}
                   sub="Messages requiring fastest attention."
                   tone="risk"
@@ -1290,7 +1290,7 @@ export default function InboxScannerPanel({
                     <StatusBadge tone={mode === "manual" ? "info" : "muted"}>Manual</StatusBadge>
                     <StatusBadge tone={mode === "gmail" ? "info" : "muted"}>Gmail</StatusBadge>
                   </div>
-                  <StatusBadge tone={counts.high > 0 ? "risk" : "muted"}>{counts.high} high risk</StatusBadge>
+                  <StatusBadge tone={counts.high > 0 ? "risk" : "muted"}>{counts.high} high priority</StatusBadge>
                 </div>
 
                 <label className="relative block">
@@ -1315,7 +1315,7 @@ export default function InboxScannerPanel({
 
                 <div className="aegis-chip-row">
                   <PrimaryFilterButton active={activeFilter === "all"} label="All" count={counts.all} onClick={() => setActiveFilter("all")} />
-                  <PrimaryFilterButton active={activeFilter === "high"} label="High Risk" count={counts.high} onClick={() => setActiveFilter("high")} />
+                  <PrimaryFilterButton active={activeFilter === "high"} label="High Priority" count={counts.high} onClick={() => setActiveFilter("high")} />
                   <PrimaryFilterButton active={activeFilter === "pending"} label="Pending" count={counts.pending} onClick={() => setActiveFilter("pending")} />
                   <PrimaryFilterButton active={activeFilter === "reviewed"} label="Reviewed" count={counts.reviewed} onClick={() => setActiveFilter("reviewed")} />
                 </div>
@@ -1394,7 +1394,7 @@ export default function InboxScannerPanel({
                           </div>
                           <div className="flex shrink-0 flex-col items-end gap-1">
                             <div className="aegis-time">{alert.consensusScore}%</div>
-                            <div className="text-xs text-aegis-dim">{alert.priorityScore} risk</div>
+                            <div className="text-xs text-aegis-dim">{alert.priorityScore} priority</div>
                           </div>
                         </div>
                       </button>
@@ -1614,12 +1614,12 @@ export default function InboxScannerPanel({
                     </svg>
                   }
                   title="No active message"
-                  description="Pick a queue item to reveal risk routing, escalation actions, and follow-through controls."
+                  description="Pick a queue item to reveal decision routing, escalation actions, and follow-through controls."
                 />
               ) : (
                 <>
                   <div className="grid gap-4 rounded-lg border border-aegis-border bg-aegis-elevated px-4 py-4">
-                    <SectionLabel>Risk Assessment</SectionLabel>
+                    <SectionLabel>Decision Assessment</SectionLabel>
                     <div className="text-3xl leading-none text-aegis-text">
                       <span
                         className={

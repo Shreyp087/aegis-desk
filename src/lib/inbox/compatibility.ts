@@ -4,6 +4,7 @@ import {
   ConsensusAgreementScoresSchema,
   defaultAgreementScores,
 } from "./consensus";
+import type { InboxAttentionType } from "./importance";
 import { InboxMailClassEnum } from "./schemas";
 
 const ProbabilitySchema = z.object({
@@ -56,6 +57,22 @@ export const InboxSignalGroupsSchema = z.object({
     }),
     guardrails: z.object({
       ruleHits: z.array(z.string()),
+      rationale: z.string(),
+    }),
+    decisionImportance: z.object({
+      threatScore: z.number().min(0).max(100),
+      urgencyScore: z.number().min(0).max(100),
+      relevanceScore: z.number().min(0).max(100),
+      opportunityScore: z.number().min(0).max(100),
+      noiseScore: z.number().min(0).max(100),
+      trustGapScore: z.number().min(0).max(100),
+      affinityScore: z.number().min(0).max(100),
+      attentionType: z.enum([
+        "act_now",
+        "verify_now",
+        "review_later",
+        "ignore_routine",
+      ]),
       rationale: z.string(),
     }),
   }),
@@ -130,6 +147,17 @@ type DeterministicSignalArgs = {
   };
   guardrails: {
     ruleHits: string[];
+    rationale: string;
+  };
+  decisionImportance: {
+    threatScore: number;
+    urgencyScore: number;
+    relevanceScore: number;
+    opportunityScore: number;
+    noiseScore: number;
+    trustGapScore: number;
+    affinityScore: number;
+    attentionType: InboxAttentionType;
     rationale: string;
   };
   classifier: ClassifierSnapshot;
@@ -267,6 +295,7 @@ export function buildSignalGroups(args: DeterministicSignalArgs): InboxSignalGro
         ruleHits: args.guardrails.ruleHits,
         rationale: args.guardrails.rationale,
       },
+      decisionImportance: args.decisionImportance,
     },
     learned: {
       classifier: args.classifier,
@@ -338,6 +367,7 @@ export function buildExplanation(args: ExplanationArgs): InboxExplanation {
   const topRiskTags = args.signalGroups.deterministic.riskTags.slice(0, 2);
   const classifier = args.signalGroups.learned.classifier;
   const consensus = args.signalGroups.learned.consensus;
+  const importance = args.signalGroups.deterministic.decisionImportance;
   const topClassifierProb = Math.round(maxProbability(classifier.probabilities) * 100);
 
   const pushFactor = (value: string | null) => {
@@ -353,9 +383,24 @@ export function buildExplanation(args: ExplanationArgs): InboxExplanation {
       `${humanizeToken(topCategory.category)} scored ${Math.round(topCategory.score)}/100`
     );
   }
-  pushFactor(
-    `Trusted action ${args.trustedDecision.action.toUpperCase()} at ${args.trustedDecision.riskScore}/100 risk`
-  );
+  if (importance.attentionType === "act_now") {
+    pushFactor(
+      `Urgency ${importance.urgencyScore}/100 with relevance ${importance.relevanceScore}/100`
+    );
+  } else if (importance.attentionType === "verify_now") {
+    pushFactor(
+      `Threat ${importance.threatScore}/100 with trust gap ${importance.trustGapScore}/100`
+    );
+  } else if (importance.attentionType === "review_later") {
+    pushFactor(
+      `Opportunity ${importance.opportunityScore}/100 with relevance ${importance.relevanceScore}/100`
+    );
+  } else {
+    pushFactor(
+      `Noise ${importance.noiseScore}/100 outweighs urgency ${importance.urgencyScore}/100`
+    );
+  }
+  pushFactor(`Aegis action ${args.trustedDecision.action.toUpperCase()} at ${args.trustedDecision.riskScore}/100 risk`);
   if (topRiskTags.length > 0) {
     pushFactor(`Risk tags: ${topRiskTags.join(", ")}`);
   }
@@ -377,8 +422,11 @@ export function buildExplanation(args: ExplanationArgs): InboxExplanation {
     );
   }
   pushFactor(
-    `Classifier predicted ${classifier.predictedClass.toUpperCase()} (${topClassifierProb}% probability)`
+      `Classifier predicted ${classifier.predictedClass.toUpperCase()} (${topClassifierProb}% probability)`
   );
+  if (importance.affinityScore >= 35) {
+    pushFactor(`Historical affinity ${importance.affinityScore}/100 from past inbox outcomes`);
+  }
   if (
     consensus.disagreementFlags.length > 0 ||
     consensus.strength < 0.58
@@ -415,7 +463,28 @@ export function buildExplanation(args: ExplanationArgs): InboxExplanation {
   }
 
   const keyFactors = factors.slice(0, 5);
-  const summary = `${humanizeToken(args.primaryCategory)} triage recommends ${args.trustedDecision.action.toUpperCase()} at ${args.trustedDecision.riskScore}/100 risk. Drivers: ${keyFactors
+  let summaryLead = "Review later";
+  let summaryRationale = importance.rationale;
+  if (importance.attentionType === "act_now") {
+    summaryLead = "Act now";
+  } else if (importance.attentionType === "verify_now") {
+    summaryLead = "Verify before acting";
+  } else if (importance.attentionType === "ignore_routine") {
+    summaryLead = "Low-attention routine";
+  }
+  if (args.primaryCategory === "deadline_scheduling" && args.priorityScore >= 80) {
+    summaryLead = "Act now";
+    summaryRationale = "Time-sensitive message with a deadline or scheduling consequence if ignored.";
+  }
+  if (
+    (args.primaryCategory === "newsletter" || args.primaryCategory === "sales_marketing") &&
+    args.priorityScore < 40 &&
+    args.trustedDecision.action === "allow"
+  ) {
+    summaryLead = "Low-attention routine";
+    summaryRationale = "Promotional or routine noise signals outweigh any likely action value.";
+  }
+  const summary = `${summaryLead}: ${summaryRationale} Aegis recommends ${args.trustedDecision.action.toUpperCase()} with ${args.trustedDecision.riskScore}/100 risk. Drivers: ${keyFactors
     .slice(0, 3)
     .join("; ")}.`;
 

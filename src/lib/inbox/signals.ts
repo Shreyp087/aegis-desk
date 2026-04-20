@@ -46,7 +46,14 @@ export function deriveThreatType(args: {
   if (category === "legal_contract") {
     return "legal_risk";
   }
-  if (category === "newsletter" || category === "general") {
+  if (
+    category === "newsletter" ||
+    category === "general" ||
+    category === "deadline_scheduling" ||
+    category === "sales_marketing" ||
+    category === "ops_support" ||
+    category === "executive_escalation"
+  ) {
     return "none";
   }
   return "unknown";
@@ -59,8 +66,17 @@ export function deriveMailClass(args: {
   trustedAction: "allow" | "escalate" | "quarantine" | "block";
   riskTags: string[];
 }): InboxMailClass {
-  if (args.primaryCategory === "newsletter") return "spam";
-  if (hasAny(args.riskTags, ["newsletter/marketing signature detected"])) return "spam";
+  if (args.primaryCategory === "newsletter") {
+    return args.priorityScore >= 55 && args.trustedAction === "allow"
+      ? "informational"
+      : "spam";
+  }
+  if (
+    hasAny(args.riskTags, ["newsletter/marketing signature detected"]) &&
+    args.priorityScore < 55
+  ) {
+    return "spam";
+  }
 
   if (
     args.threatType !== "none" &&
@@ -75,7 +91,9 @@ export function deriveMailClass(args: {
     return "actionable";
   }
   if (args.primaryCategory === "sales_marketing") {
-    return args.priorityScore >= 55 ? "actionable" : "informational";
+    return args.priorityScore >= 68 || args.trustedAction === "escalate"
+      ? "actionable"
+      : "informational";
   }
   if (args.primaryCategory === "general" && args.priorityScore < 45) {
     return "informational";

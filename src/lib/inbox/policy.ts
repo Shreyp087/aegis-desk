@@ -1,4 +1,5 @@
 import type { MailClassifierResult } from "./classifier";
+import type { DecisionImportanceProfile } from "./importance";
 import type { InboxMailClass, InboxThreatType } from "./schemas";
 
 export type InboxPriority = "high" | "medium" | "low";
@@ -8,12 +9,14 @@ export type PriorityGuardrailInput = {
   primaryCategory: string;
   categoryScores: Array<{ category: string; score: number }>;
   priorityScore: number;
+  deadlineCount: number;
   signals: string[];
   trustScore: number;
   reputationScore: number;
   attachmentRiskScore: number;
   urlsCount: number;
   classifier: MailClassifierResult;
+  decisionImportance: DecisionImportanceProfile;
 };
 
 export type PriorityGuardrailResult = {
@@ -45,6 +48,8 @@ export type MailClassReconcileInput = {
   derivedMailClass: InboxMailClass;
   derivedThreatType: InboxThreatType;
   classifier: MailClassifierResult;
+  priorityScore: number;
+  decisionImportance: DecisionImportanceProfile;
 };
 
 export type MailClassReconcileResult = {
@@ -105,12 +110,25 @@ export function applyPriorityGuardrails(
     input.primaryCategory === "sales_marketing" ||
     newsletterScore >= 35 ||
     salesScore >= 45;
+  const valuablePromotionalOpportunity =
+    looksPromotional &&
+    input.decisionImportance.opportunityScore >= 62 &&
+    input.decisionImportance.affinityScore >= 45 &&
+    input.decisionImportance.threatScore < 58 &&
+    probs.harmful < 0.42 &&
+    input.decisionImportance.noiseScore <= 75;
+  const nonPreferredPromotionalNoise =
+    looksPromotional &&
+    input.decisionImportance.affinityScore < 40 &&
+    input.decisionImportance.threatScore < 58 &&
+    probs.harmful < 0.46;
 
   if (
     looksPromotional &&
     probs.spam >= 0.58 &&
     probs.harmful < 0.46 &&
-    !riskyEvidence
+    !riskyEvidence &&
+    !valuablePromotionalOpportunity
   ) {
     adjusted = Math.min(adjusted, 36);
     ruleHits.push("spam_promotional_low_cap");
@@ -120,10 +138,21 @@ export function applyPriorityGuardrails(
     probs.spam >= 0.66 &&
     probs.harmful < 0.45 &&
     !riskyEvidence &&
+    !valuablePromotionalOpportunity &&
     input.signals.length <= 2
   ) {
     adjusted = Math.min(adjusted, 46);
     ruleHits.push("spam_low_signal_cap");
+  }
+
+  if (valuablePromotionalOpportunity) {
+    adjusted = Math.max(adjusted, 54);
+    ruleHits.push("valuable_offer_medium_floor");
+  }
+
+  if (nonPreferredPromotionalNoise) {
+    adjusted = Math.min(adjusted, 38);
+    ruleHits.push("nonpreferred_promo_low_cap");
   }
 
   if (
@@ -132,6 +161,25 @@ export function applyPriorityGuardrails(
   ) {
     adjusted = Math.max(adjusted, 84);
     ruleHits.push("harmful_priority_floor");
+  }
+
+  if (
+    input.decisionImportance.urgencyScore >= 62 &&
+    input.decisionImportance.relevanceScore >= 50 &&
+    input.decisionImportance.noiseScore < 72
+  ) {
+    adjusted = Math.max(adjusted, 80);
+    ruleHits.push("urgent_decision_high_floor");
+  }
+
+  if (
+    input.primaryCategory === "deadline_scheduling" &&
+    input.deadlineCount > 0 &&
+    input.decisionImportance.relevanceScore >= 44 &&
+    probs.spam < 0.45
+  ) {
+    adjusted = Math.max(adjusted, 80);
+    ruleHits.push("deadline_high_floor");
   }
 
   if (input.classifier.memorySampleCount >= 3 && probs.spam >= 0.62 && !riskyEvidence) {
@@ -212,12 +260,24 @@ export function reconcileMailClass(
 
   if (
     (input.primaryCategory === "newsletter" || input.primaryCategory === "sales_marketing") &&
-    probs.spam >= 0.6 &&
-    probs.harmful < 0.5
+    input.decisionImportance.affinityScore < 40 &&
+    (probs.spam >= 0.45 || input.priorityScore < 25) &&
+    probs.harmful < 0.5 &&
+    input.priorityScore < 55
   ) {
     mailClass = "spam";
     threatType = "none";
     ruleHits.push("force_spam_promotional");
+  } else if (
+    (input.primaryCategory === "newsletter" || input.primaryCategory === "sales_marketing") &&
+    input.decisionImportance.affinityScore >= 40 &&
+    input.priorityScore >= 55 &&
+    probs.harmful < 0.5 &&
+    (probs.informational >= 0.38 || probs.actionable >= 0.38)
+  ) {
+    mailClass = "informational";
+    threatType = "none";
+    ruleHits.push("preserve_reviewable_promotional");
   } else if (probs.harmful >= 0.68) {
     mailClass = "harmful";
     if (threatType === "none") threatType = "unknown";
