@@ -1,209 +1,514 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Aegis Desk
 
-## Sample Input
+> An AI workspace for uncertain email: verify who is behind a message, decide what to do next, and respond with confidence.
 
-For testing and demonstration purposes, you can use the provided [sample input file](./samples/sample_input.txt) which contains example email data to simulate inbox scanning functionality.
+![Next.js](https://img.shields.io/badge/Next.js-16-black)
+![TypeScript](https://img.shields.io/badge/TypeScript-5-blue)
+![OpenAI](https://img.shields.io/badge/LLM-OpenAI%20gpt--4o--mini-412991)
+![Gmail](https://img.shields.io/badge/Input-Gmail%20%2B%20Manual-red)
+![Observability](https://img.shields.io/badge/Tracing-Respan-111827)
 
-## Gmail Inbox Connection
+## Video Walkthrough
 
-The Inbox Scanner now supports direct Gmail connection (OAuth) and server-side scan with:
-- deterministic risk/priority scoring
-- uncertainty percentage per email
-- suggested action + reply draft
+Video URL: _Add Loom or walkthrough link here_
 
-### Required environment variables
+## Problem Statement
 
-Add these to `.env.local`:
+Most inbox tools help you organize messages.
+Aegis Desk is built around a different question:
+
+**When an email looks important, but you are not fully sure you should trust it, how do you decide what to do next?**
+
+That uncertainty shows up in real workflows:
+
+- recruiter outreach that lands in spam
+- contract follow-ups from unfamiliar senders
+- vendor or payment emails with pressure to act quickly
+- legal or operational messages that look relevant but could still be risky
+- promotional noise mixed into genuinely important inbox traffic
+
+This project started from a very practical moment: finding a potentially real job-related message in spam and realizing that the real problem was not just filtering email, but deciding whether a message deserved trust, urgency, verification, or dismissal.
+
+The audience most affected is anyone whose inbox contains high-consequence ambiguity:
+
+- job seekers
+- freelancers and consultants
+- founders and operators
+- support or operations teams
+- people who receive unfamiliar but potentially important outreach
+
+If this problem is solved well, success looks like:
+
+- important messages surface quickly without being drowned out by promo noise
+- suspicious messages are treated as verification problems, not blindly obeyed
+- users get a clear next action, not just a label
+- email triage, reasoning, drafting, and escalation happen in one workflow
+
+## Why This Matters
+
+Email is still where some of the highest-stakes decisions happen, but current inbox products often collapse everything into a simple binary:
+
+- spam vs not spam
+- important vs not important
+- safe vs unsafe
+
+That misses the real-world middle ground.
+
+Some emails are legitimate but uncertain.
+Some emails are suspicious precisely because they look relevant.
+Some promotional messages create fake urgency and steal attention from things that actually matter.
+
+Aegis Desk is meant to be an **intelligence layer**, not just a sorting layer.
+The goal is to help a user answer:
+
+- Is this message real?
+- How urgent is it really?
+- What evidence supports that judgment?
+- What should I do next?
+
+## Solution Overview
+
+Aegis Desk is a Next.js App Router application with four connected surfaces:
+
+1. **Inbox Scanner**
+   Scans manual or Gmail-sourced email, classifies messages, scores priority, estimates uncertainty, and proposes a trusted next action.
+2. **Agent Desk**
+   Turns a selected email into a structured analysis workflow: planning, research, entity profiling, evidence synthesis, reply drafting, and calendar artifact generation.
+3. **Tickets / Admin Desk**
+   Escalates high-stakes messages into a helpdesk-style workflow with local-first persistence and optional Peppermint sync.
+4. **QueueGuard**
+   A separate trust-and-step-up demo for queue/session risk workflows.
+
+The core product idea is:
+
+- deterministic safety controls handle policy, risk caps, and offline mode
+- AI handles planning, synthesis, research interpretation, and structured drafting
+- the user sees a decision-oriented workspace instead of disconnected tools
+
+Key capabilities:
+
+- Gmail OAuth connection and manual email scanning
+- priority routing into `high`, `medium`, and `low`
+- mail classification into `spam`, `harmful`, `actionable`, and `informational`
+- deterministic decision-importance scoring for urgency, threat, relevance, opportunity, and noise
+- optional multi-model consensus, but single-model mode by default for cost control
+- entity profiling and external research through LinkUp
+- optional Respan tracing and prompt-managed synthesis
+- reply draft and ICS generation
+- local-first auth and ticketing with Mongo fallback support
+- offline-enforced mode that blocks external AI and research calls
+
+### What role does AI play?
+
+AI is **core**, but intentionally bounded.
+
+Without AI, the app could still score deterministic signals and enforce safety policy, but it would be much worse at:
+
+- turning messy inbox context into a structured plan
+- extracting and profiling entities
+- synthesizing external evidence into an explanation
+- drafting a useful reply
+- adapting analysis output to the actual email context instead of a fixed template
+
+The meaningful improvement over a non-AI approach is not "classification for classification's sake."
+It is the combination of:
+
+- evidence-backed reasoning
+- context-sensitive drafting
+- research-assisted profiling
+- decision support at the moment of uncertainty
+
+## AI Integration
+
+### Models and APIs used
+
+- **OpenAI via Vercel AI SDK**
+  Primary model path for planning, entity profiling, and final synthesis. Current cost-conscious default is `gpt-4o-mini`.
+- **Google Gemini and Anthropic Claude**
+  Optional consensus models when multi-model mode is enabled.
+- **LinkUp**
+  External research provider for company/person/entity background checks.
+- **Respan**
+  Observability and optional prompt-management infrastructure for structured tracing and synthesis experiments.
+- **Gmail API**
+  OAuth-based inbox ingestion.
+
+### Agentic patterns used
+
+- structured planning in `/api/plan`
+- multi-step execution in `/api/run`
+- tool use for research, privacy filtering, and ICS generation
+- structured JSON outputs validated with Zod
+- entity extraction and profile caching
+- fallback routing when AI paths fail
+- optional consensus mode with future expansion room, but single-model mode by default
+
+### RAG, chaining, and reasoning
+
+The system uses a practical hybrid of chaining and retrieval:
+
+- **retrieval**
+  LinkUp search and evidence collection
+- **chaining**
+  plan -> research -> profile -> synthesis -> reply/action
+- **deterministic + AI hybrid**
+  deterministic policy remains in control for risk caps, classification guardrails, and offline safety
+
+### Why these choices?
+
+- **cost**
+  Single-model mode is the default to keep the product usable and affordable.
+- **latency**
+  Standard LinkUp depth is default; deep search is user-controlled.
+- **reliability**
+  Deterministic guardrails stay deterministic. AI does not replace safety policy.
+- **accuracy**
+  Structured schemas, research evidence, incident memory, and fallback logic reduce brittle outputs.
+
+### Where AI exceeded expectations
+
+- turning messy email + document context into structured workflows
+- synthesizing evidence into readable, action-oriented output
+- making dynamic research plans for detected entities
+- adapting output sections to the context instead of forcing every email into a contract-only frame
+
+### Where AI fell short
+
+- legitimate high-stakes emails can still look scam-like
+- promo language can create misleading urgency if not actively suppressed
+- fallback conditions can still force extra human review even for low-value mail
+- personalized inbox preferences need more learning depth than a one-shot LLM call can provide
+
+That gap is exactly why the system now leans on deterministic decision logic, feedback memory, and explicit guardrails instead of handing classification entirely to the model.
+
+## Architecture / Design Decisions
+
+### High-level architecture
+
+```mermaid
+flowchart LR
+  A[Manual Email Input / Gmail OAuth] --> B[/api/inbox]
+  B --> C[Deterministic parsing and signal extraction]
+  C --> D[Decision-importance scoring]
+  D --> E[Hybrid classifier + policy guardrails]
+  E --> F[Inbox Scanner UI]
+
+  F --> G[/api/plan]
+  G --> H[Planner model]
+  H --> I[/api/run]
+  I --> J[Privacy firewall + LinkUp research]
+  J --> K[Entity profiling + evidence synthesis]
+  K --> L[Reply draft / ICS / tickets]
+
+  M[Incident memory] --> E
+  N[Offline mode policy] --> B
+  N --> G
+  N --> I
+  O[Respan tracing] --> B
+  O --> G
+  O --> I
+```
+
+### Core design choices
+
+#### 1. AI is additive, not sovereign
+
+Risk logic, spam caps, harmful floors, offline enforcement, and trusted decision thresholds remain deterministic.
+This keeps the system auditable and prevents model drift from silently changing security posture.
+
+#### 2. Decision support beats raw classification
+
+The system does not stop at "this looks risky."
+It tries to answer:
+
+- how urgent is this?
+- how trustworthy is the sender?
+- is this harmful, just noisy, or actually useful?
+- what action should the user take?
+
+#### 3. Single-model by default, consensus optional
+
+Consensus can improve robustness, but it increases cost and complexity.
+The repo keeps the option available while defaulting to one model path.
+
+#### 4. Standard research by default, deep research by choice
+
+Deep search is useful, but it should be a user decision for cost and latency reasons.
+
+#### 5. Privacy-first and offline-capable
+
+The app has explicit offline controls that can block:
+
+- external model calls
+- external research
+- Gmail-connected scanning when outbound blocking is enabled
+
+That matters because sensitive inbox workflows should not assume network trust.
+
+#### 6. Local-first persistence with graceful fallback
+
+Auth can use MongoDB or a local file DB.
+Ticketing stays local-first, with optional Peppermint sync later.
+
+### Third-party APIs / open-source systems used
+
+- Next.js
+- React
+- TypeScript
+- Zod
+- Vercel AI SDK
+- OpenAI API
+- Anthropic API
+- Google Generative AI API
+- Gmail API
+- LinkUp SDK
+- Respan tracing SDK
+- MongoDB / Mongoose
+- Peppermint helpdesk integration
+- `pdf-parse`
+
+## How AI Coding Tools Changed the Build
+
+AI coding tools were used as a force multiplier during development, especially for:
+
+- route scaffolding
+- schema iteration
+- refactoring long AI pipeline handlers
+- prompt tightening
+- tracing and metadata wiring
+- UI copy and workflow polishing
+
+They helped move quickly through:
+
+- repetitive TypeScript structure
+- Zod schema generation
+- API plumbing
+- documentation and summarization of architectural changes
+
+They were less helpful when:
+
+- the product needed deterministic security logic
+- classification errors came from subtle signal interactions
+- prompts sounded plausible but violated strict JSON contracts
+- repo-local constraints mattered more than generic best practices
+
+That changed the development approach in an important way:
+
+- AI coding tools accelerated generation
+- deterministic review, smoke tests, and policy tuning still had to be done manually
+- the final system improved most when AI was used for speed, not unchecked authority
+
+## Getting Started / Setup Instructions
+
+### Prerequisites
+
+- Node.js 20+
+- npm
+- optional: MongoDB
+- optional: Gmail OAuth credentials
+- optional: LinkUp API key
+- optional: Respan account / API key
+- optional: Peppermint instance
+
+### Clone and install
+
+```bash
+git clone https://github.com/Shreyp087/aegis-desk.git
+cd aegis-desk
+npm install
+```
+
+### Environment setup
+
+Create a `.env.local` file in the project root.
+
+Minimal local setup:
 
 ```bash
 OPENAI_API_KEY=your_openai_key
+AUTH_JWT_SECRET=replace_with_a_long_random_secret
+```
+
+Recommended setup for inbox + Gmail + research:
+
+```bash
+OPENAI_API_KEY=your_openai_key
+LINKUP_API_KEY=your_linkup_key
+AUTH_JWT_SECRET=replace_with_a_long_random_secret
+
 GOOGLE_CLIENT_ID=your_google_oauth_client_id
 GOOGLE_CLIENT_SECRET=your_google_oauth_client_secret
 GOOGLE_REDIRECT_URI=http://localhost:3000/api/inbox/gmail/callback
 ```
 
-Optional (enables broader LLM consensus in Inbox Scanner):
+Optional MongoDB:
+
+```bash
+MONGODB_URI=your_mongodb_connection_string
+AUTH_DB_PROVIDER=mongo
+```
+
+Optional consensus models:
 
 ```bash
 GOOGLE_GENERATIVE_AI_API_KEY=your_gemini_key
 ANTHROPIC_API_KEY=your_claude_key
-
-# inbox scanner model policy (cost control)
-# default behavior uses a single model
 INBOX_CONSENSUS_ENABLED=false
-# only used when INBOX_CONSENSUS_ENABLED=true
 INBOX_CONSENSUS_MAX_MODELS=3
-# optional scanner decision policy version label
-INBOX_POLICY_VERSION=inbox-policy-v3-phase2
 ```
 
-Also ensure your Google Cloud OAuth client has:
-- Authorized redirect URI: `http://localhost:3000/api/inbox/gmail/callback`
-- Gmail API enabled
-- Scope allowed: `https://www.googleapis.com/auth/gmail.readonly`
-
-### Flow
-
-1. Open the Inbox Scanner tab.
-2. Click `Connect Gmail`.
-3. Complete Google consent.
-4. Select `Gmail` mode and click `Scan Inbox`.
-
-Inbox consensus controls:
-- Scanner defaults to single-model mode (cost saver).
-- Admin users can change consensus mode and model count from the Inbox Scanner dashboard.
-- Admin changes are persisted server-side and override env defaults for that browser/session context.
-- Scanner now applies hybrid classifier + guardrail policy to reduce false high-priority spam/promotions.
-- Inbox Scanner includes in-UI feedback actions (`Confirm Spam`, `Confirm Harmful`, `Mark Safe`) that write learning labels to incident memory for future scans.
-
-## Agent Desk LinkUp Depth
-
-Agent Desk defaults LinkUp searches to `standard` depth for cost control.
-You can switch to `deep` depth manually from the Agent Dashboard before running.
-The selected depth is persisted as a local user preference in the browser.
-
-Planner/runner now supports dynamic LinkUp research count (2-6 searches) based on detected entities.
-
-## Respan Prompt Management
-
-`/api/run` supports an optional Respan-managed final synthesis path.
-
-To enable it, set:
+Optional Respan:
 
 ```bash
-RESPAN_ENABLED=true
+RESPAN_ENABLED=false
 RESPAN_API_KEY=your_respan_key
-RESPAN_PROMPTS_ENABLED=true
-RESPAN_PROMPT_ID_SYNTHESIS=your_respan_prompt_id
+RESPAN_BASE_URL=https://api.respan.ai
+RESPAN_ENVIRONMENT=development
+RESPAN_GATEWAY_ENABLED=false
+RESPAN_PROMPTS_ENABLED=false
+RESPAN_PROMPT_ID_SYNTHESIS=your_prompt_id
 ```
 
-Notes:
-- The managed prompt is optional and the route will fall back to the inline synthesis path if the prompt call fails or returns invalid output.
-- The prompt output must match the final synthesis JSON schema exactly, including enum values and field names such as `entityVerdicts[].entityType`, `entityVerdicts[].verdict`, `analysisSection.sectionType`, and `claims[].type`.
-- Keep the prompt output JSON-only. Do not return markdown, code fences, or commentary.
-
-## Auth + Database (User/Admin)
-
-Authentication now supports:
-- User sign up: `/sign-up`
-- User sign in: `/sign-in`
-- Admin sign in: `/sign-in` with the `Admin` role selected
-
-API routes:
-- `POST /api/auth/user/signup`
-- `POST /api/auth/user/login`
-- `POST /api/auth/admin/login`
-- `GET /api/auth/me`
-- `POST /api/auth/logout`
-
-Auth DB provider behavior:
-- If `MONGODB_URI` exists, auth uses MongoDB automatically.
-- If `MONGODB_URI` is absent, auth uses local file DB at `data/auth/accounts.local.json`.
-- You can override with `AUTH_DB_PROVIDER=local|mongo`.
-
-Optional auth env vars:
-
-```bash
-AUTH_JWT_SECRET=replace_with_long_random_secret
-AUTH_JWT_EXPIRES_IN=7d
-AUTH_BCRYPT_ROUNDS=12
-AUTH_MONGO_AUTO_SEED=true
-```
-
-When Mongo auth auto-seed is enabled, one demo user and one demo admin are seeded from local-auth seed env values on first auth access (disabled by default in production unless explicitly enabled).
-
-If you want an explicit seeded admin identity, set:
-
-```bash
-LOCAL_AUTH_ADMIN_NAME=Admin Name
-LOCAL_AUTH_ADMIN_EMAIL=admin@example.com
-LOCAL_AUTH_ADMIN_PASSWORD=StrongPassword123!
-```
-
-## Offline Enforced Mode (No External Model/Web Calls)
-
-To keep mail processing local-only and block external model/web calls, add:
-
-```bash
-OFFLINE_MODE=true
-OFFLINE_MODE_STATE=enforced
-OFFLINE_BLOCK_OUTBOUND=true
-OFFLINE_LOCAL_MODELS_ONLY=true
-OFFLINE_ALLOW_EXTERNAL_RESEARCH=false
-OFFLINE_ALLOW_REMOTE_DRAFTING=false
-
-# optional: show accurate mode in dashboard badge
-NEXT_PUBLIC_OFFLINE_MODE=true
-NEXT_PUBLIC_OFFLINE_MODE_STATE=enforced
-```
-
-Notes:
-- In enforced mode, `/api/plan`, `/api/run`, and `/api/agent` are blocked.
-- Inbox scanning uses deterministic local policy logic with scam categories + trusted decision output.
-- Gmail mode is disabled when outbound blocking is enabled in enforced mode.
-
-## Ticketing + Admin Desk (Peppermint Integration)
-
-Aegis Desk now includes local-first ticketing with optional Peppermint sync:
-
-- Create ticket from Inbox Scanner selected email (`Create Helpdesk Ticket`).
-- User self-service dashboard to raise tickets and track own tickets:
-  - `/tickets/user`
-- Local ticket store + audit trail in `data/tickets/`.
-- Sync states: `local_only`, `pending`, `synced`, `failed`.
-- Admin Desk to manage status, assignee, notes:
-  - `/tickets/admin`
-- Ticket list:
-  - `/tickets`
-- User ticket APIs:
-  - `POST /api/tickets/user/create`
-  - `GET /api/tickets/user/list?requesterEmail=...`
-
-### Optional Peppermint environment variables
+Optional Peppermint sync:
 
 ```bash
 PEPPERMINT_BASE_URL=http://localhost:5003
-PEPPERMINT_AUTH_MODE=login   # login | public
-PEPPERMINT_EMAIL=admin@admin.com
-PEPPERMINT_PASSWORD=1234
-
-# optional
-AEGIS_DATA_DIR=./data
+PEPPERMINT_AUTH_MODE=login
+PEPPERMINT_EMAIL=admin@example.com
+PEPPERMINT_PASSWORD=your_password
 ```
 
-If offline mode is enforced with outbound blocked, ticket creation remains local-only and sync is disabled until offline is lifted.
+Notes:
 
-## Getting Started
+- If `MONGODB_URI` is absent, auth falls back to local file storage.
+- `.env.peppermint.example` can be used as a reference for ticket-sync variables.
+- Do **not** commit live API keys or secrets.
 
-First, run the development server:
+### Run locally
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Then open:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+- `http://localhost:3000`
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+### Suggested local flow
 
-## Learn More
+1. Sign up or sign in.
+2. Open the Inbox Scanner.
+3. Paste sample input from [samples/sample_input.txt](samples/sample_input.txt) or connect Gmail.
+4. Scan and review priority, class, explanation, and trusted action.
+5. Escalate a message into Agent Desk.
+6. Run planning and analysis.
+7. Generate a draft reply, ICS artifact, or ticket.
 
-To learn more about Next.js, take a look at the following resources:
+## Demo
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+### Demo path 1: Manual inbox scan
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+1. Open `/inbox-scanner`.
+2. Use the manual input mode.
+3. Paste sample mail from [samples/sample_input.txt](samples/sample_input.txt).
+4. Run scan.
+5. Inspect:
+   - priority
+   - mail class
+   - uncertainty
+   - explanation
+   - trusted action
 
-## Deploy on Vercel
+### Demo path 2: Gmail-connected triage
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+1. Set Google OAuth credentials in `.env.local`.
+2. Ensure the Gmail API is enabled in Google Cloud.
+3. Add this redirect URI:
+   - `http://localhost:3000/api/inbox/gmail/callback`
+4. Connect Gmail from the scanner UI.
+5. Run a Gmail scan.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+### Demo path 3: End-to-end analysis
+
+1. Select a scanned email.
+2. Escalate it into Agent Desk.
+3. Let `/api/plan` generate a multi-step workflow.
+4. Let `/api/run` perform research and synthesis.
+5. Review the structured output:
+   - entity verdicts
+   - analysis section
+   - reply draft
+   - meeting invite
+   - claims and evidence
+
+## Testing / Error Handling
+
+### Validation and safeguards
+
+- Zod schemas validate planner, runner, and synthesis outputs.
+- Inbox scanning uses deterministic guardrails on top of model output.
+- Offline mode can fully block outbound AI/research activity.
+- Prompt-managed synthesis has a safe fallback to the inline synthesis path.
+- Gmail integration fails gracefully when tokens are missing or invalid.
+- Ticket sync remains local-first if Peppermint is unavailable.
+
+### Failure modes considered
+
+- legitimate emails being over-classified as scams
+- promotional urgency inflating priority
+- model failure or disagreement
+- invalid JSON from AI calls
+- missing Gmail credentials
+- offline enforcement with outbound blocking
+- absent MongoDB connection
+- noisy or sparse email context
+
+### Current validation used
+
+- `npm run build`
+- `npm run lint`
+- targeted inbox smoke tests for:
+  - recruiter deadline mail
+  - Temu-style promotion mail
+  - generic newsletter/promotional mail
+
+Known state:
+
+- the build passes
+- lint still has unrelated pre-existing issues in a few files outside the inbox work
+
+## Future Improvements / Stretch Goals
+
+- stronger personalized learning from user feedback and sender-level affinity
+- explicit low-risk auto-triage overrides when assist-model fallback happens
+- benchmark dataset for recruiter, vendor, legal, and operational email types
+- richer entity memory and sender reputation history
+- more nuanced promotional value detection for user-followed brands or recurring interests
+- evaluation dashboards for false positives / false negatives
+- public demo deployment with seeded sample workflows
+
+## Link to Website / Application
+
+Public deployment: _Not currently published as a public production app_
+
+Local development URL:
+
+- `http://localhost:3000`
+
+## Acknowledgments
+
+This project uses third-party libraries and APIs including:
+
+- Next.js / React / TypeScript
+- Vercel AI SDK
+- OpenAI
+- Anthropic
+- Google Generative AI
+- Gmail API
+- LinkUp
+- Respan
+- MongoDB / Mongoose
+- Peppermint
+- Zod
+
+All credentials in setup examples above are placeholders only.
