@@ -1,6 +1,6 @@
 # Aegis Desk
 
-> An AI workspace for uncertain email: verify who is behind a message, decide what to do next, and respond with confidence.
+> Aegis Desk turns inbox uncertainty into prioritized, verified action.
 
 ![Next.js](https://img.shields.io/badge/Next.js-16-black)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5-blue)
@@ -10,74 +10,80 @@
 
 ## Video Walkthrough
 
-Video URL: _Add Loom or walkthrough link here_
+Video URL: https://www.loom.com/share/ba94b6a455b84ab5bcd2375a7d6b9025
 
 ## Problem Statement
 
-I built Aegis Desk around a moment that felt small at first, but stuck with me.
+Inbox overload is usually described as a volume problem. In practice, it is often a **trust and prioritization problem**.
 
-While applying for jobs and internships, I found a message in my spam folder about a role I may actually have applied to. The sender looked real. The company looked real. The opportunity looked relevant. But the fact that it landed in spam immediately created doubt.
+I built Aegis Desk from a moment that felt small at first, but stayed with me. While applying for jobs and internships, I found a message in my spam folder about a role I may actually have applied to. The sender looked real. The company looked real. The opportunity looked relevant. But because it landed in spam, it immediately created doubt.
 
-I remember the exact tension: if I ignore this, I might miss something important. If I trust it too quickly, I might get fooled.
+I remember the exact tension: **if I ignore this, I might miss something important. If I trust it too quickly, I might get fooled.**
 
-That is the real problem Aegis Desk is trying to solve.
+That tension is not unique to job search. It shows up anytime an inbox contains messages that feel relevant, urgent, or consequential, but do not arrive with enough trust context to make the next step obvious. The hardest messages are rarely obvious spam. They are the ones in the middle:
 
-Most inbox tools focus on organization.
-Aegis Desk starts from a more human question:
+* recruiter outreach from an unfamiliar sender
+* contract or legal follow-ups without enough context
+* vendor or payment requests with pressure to act quickly
+* operational email that seems relevant but still feels off
+* promotional noise competing with genuinely time-sensitive communication
 
-**When an email looks important, but you are not fully sure you should trust it, how do you decide what to do next with confidence?**
+Most inbox tools help organize messages after they arrive. They do not do enough for the moment when a user has to decide whether a message deserves attention, skepticism, escalation, or a response.
 
-That feeling is easy to relate to, even outside job search:
+That is the workflow problem Aegis Desk focuses on:
 
-- a recruiter email that lands in spam
-- a contract follow-up from a sender you do not recognize immediately
-- a vendor or payment request with pressure to act quickly
-- a legal or operational message that seems relevant, but still feels off
-- a noisy inbox where promotions and fake urgency compete with messages that actually matter
+1. deciding which messages deserve deeper attention
+2. deciding whether the sender or entity is trustworthy enough to act on
+3. deciding when outside research is needed before responding
+4. preserving a reasoning trail so the recommendation can be inspected later
 
-The audience most affected is anyone whose inbox contains important but ambiguous decisions:
+Aegis Desk is built for people whose inbox contains real decisions, not just routine correspondence:
 
-- job seekers
-- freelancers and consultants
-- founders and operators
-- support or operations teams
-- people who receive unfamiliar but potentially important outreach
+* job seekers triaging recruiter or hiring-related email
+* founders, operators, and independent professionals handling legal, vendor, or payment-related communication
+* consultants and freelancers evaluating unfamiliar inbound requests
+* support or operations teams reviewing ambiguous external outreach
+* anyone dealing with a mix of routine noise and potentially important but unverified messages
 
-If this problem is solved well, the experience changes in a meaningful way:
+The common thread is not industry. It is **uncertainty**.
 
-- legitimate important messages surface quickly without being drowned out by promo noise
-- suspicious messages are treated as verification problems, not blindly trusted or blindly discarded
-- users get a clear next step, not just a label
-- email triage, reasoning, drafting, and escalation happen in one workflow
+### Why This Matters
 
-Success for Aegis Desk is not just "better spam filtering."
-It is helping someone look at an uncertain message and say:
-
-- I understand why this matters
-- I understand why it may or may not be trustworthy
-- I know what to do next
-
-## Why This Matters
-
-Email is still where some of the highest-stakes decisions happen, but current inbox products often collapse everything into a simple binary:
-
-- spam vs not spam
-- important vs not important
-- safe vs unsafe
-
-That misses the real-world middle ground.
+Email is still where some of the highest-stakes decisions begin, but most inbox products reduce the problem to simple binaries: spam or not spam, important or not important, safe or unsafe. That misses the real-world middle ground.
 
 Some emails are legitimate but uncertain.
-Some emails are suspicious precisely because they look relevant.
-Some promotional messages create fake urgency and steal attention from things that actually matter.
+Some are suspicious precisely because they look relevant.
+Some create fake urgency and steal attention from what actually matters.
 
-Aegis Desk is meant to be an **intelligence layer**, not just a sorting layer.
-The goal is to help a user answer:
+Aegis Desk is meant to be an **intelligence layer**, not just a sorting layer. Its goal is to help a user answer:
 
-- Is this message real?
-- How urgent is it really?
-- What evidence supports that judgment?
-- What should I do next?
+* Is this message real?
+* How urgent is it actually?
+* What evidence supports that judgment?
+* What should I do next?
+
+### What Success Looks Like
+
+Success here is not perfect classification. It is **better decisions at the point of uncertainty**.
+
+In practice, that means:
+
+* important messages are less likely to be buried under noise
+* suspicious messages are treated as verification problems, not automatically trusted or discarded
+* the user gets a recommendation with evidence, not just a label
+* follow-up drafting happens after trust evaluation, not before
+* ambiguous cases are pushed toward review instead of false certainty
+
+If measured in a production setting, success would look like:
+
+* fewer false high-priority promotions or newsletters
+* better recovery of legitimate messages that would otherwise be ignored
+* stronger calibration between confidence and actual uncertainty
+* better follow-through quality after a recommendation is made
+
+At its core, Aegis Desk is built around one simple question:
+
+**When an email looks important, but you are not fully sure you should trust it, how do you decide what to do next with confidence?**
 
 ## Solution Overview
 
