@@ -10,7 +10,7 @@
 
 ## Video Walkthrough
 
-Video URL: _Add Loom or walkthrough link here_
+Video URL: https://www.loom.com/share/ba94b6a455b84ab5bcd2375a7d6b9025
 
 ## Problem Statement
 
