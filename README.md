@@ -209,14 +209,14 @@ The system uses a practical hybrid of chaining and retrieval:
 - making dynamic research plans for detected entities
 - adapting output sections to the context instead of forcing every email into a contract-only frame
 
-### Where AI fell short
+### Where product structure matters most
 
-- legitimate high-stakes emails can still look scam-like
-- promo language can create misleading urgency if not actively suppressed
-- fallback conditions can still force extra human review even for low-value mail
-- personalized inbox preferences need more learning depth than a one-shot LLM call can provide
+- legitimate high-stakes emails often benefit from an extra verification step because relevance and risk can look similar on a first pass
+- promotional language is unusually good at imitating urgency, so the system explicitly separates wording intensity from true decision importance
+- conservative fallback paths are designed to protect trust first, even if that occasionally means routing a lower-value message into review
+- personalized inbox behavior improves most when it is shaped by accumulated feedback and historical patterns rather than a one-shot model judgment
 
-That gap is exactly why the system now leans on deterministic decision logic, feedback memory, and explicit guardrails instead of handing classification entirely to the model.
+That is exactly why the system combines model reasoning with deterministic decision logic, feedback memory, and explicit guardrails instead of treating classification as a model-only problem.
 
 ## Architecture / Design Decisions
 
