@@ -83,57 +83,59 @@ If measured in a production setting, success would look like:
 
 At its core, Aegis Desk is built around one simple question:
 
-**When an email looks important, but you are not fully sure you should trust it, how do you decide what to do next with confidence?**
+> **When an email looks important, but you are not fully sure you should trust it, how do you decide what to do next with confidence?**
 
 ## Solution Overview
 
-Aegis Desk is a Next.js App Router application with three connected surfaces:
+Aegis Desk is a trust-first inbox workflow system. It is designed less like a chatbot and more like a working desk for triage, verification, and action.
 
-1. **Inbox Scanner**
-   Scans manual or Gmail-sourced email, classifies messages, scores priority, estimates uncertainty, and proposes a trusted next action.
-2. **Agent Desk**
-   Turns a selected email into a structured analysis workflow: planning, research, entity profiling, evidence synthesis, reply drafting, and calendar artifact generation.
-3. **Tickets / Admin Desk**
-   Escalates high-stakes messages into a helpdesk-style workflow with local-first persistence and optional Peppermint sync.
 
-The core product idea is:
 
-- deterministic safety controls handle policy, risk caps, and offline mode
-- AI handles planning, synthesis, research interpretation, and structured drafting
-- the user sees a decision-oriented workspace instead of disconnected tools
+The current product flow is organized around a simple sequence:
 
-Key capabilities:
 
-- Gmail OAuth connection and manual email scanning
-- priority routing into `high`, `medium`, and `low`
-- mail classification into `spam`, `harmful`, `actionable`, and `informational`
-- deterministic decision-importance scoring for urgency, threat, relevance, opportunity, and noise
-- optional **LLM Council Consensus** for ambiguous or high-stakes cases, with single-model mode as the default for cost control
-- entity profiling and external research through LinkUp
-- optional Respan tracing and prompt-managed synthesis
-- reply draft and ICS generation
-- local-first auth and ticketing with Mongo fallback support
-- offline-enforced mode that blocks external AI and research calls
+1. scan and normalize inbound email
+2. score what deserves attention now versus later
+3. classify likely mail type and risk
+4. decide whether the thread needs deeper review
+5. research and profile relevant people, companies, or entities
+6. synthesize an evidence-backed recommendation
+7. draft a response or create follow-through artifacts
 
-### What role does AI play?
+### Product surfaces in the current build
 
-AI is **core**, but intentionally bounded.
+- **Inbox Scanner**  
+  The inbox intake surface. It supports manual input and optional Gmail-connected scans, then returns priority, class, uncertainty, and recommended action.
+- **Review Queue**  
+  The triage layer. Instead of forcing the user to read their inbox linearly, it surfaces what the system believes deserves attention first.
+- **Agent Desk**  
+  The deeper analysis workspace. This is where Aegis plans next steps, gathers evidence, profiles entities, and produces a final structured output.
+- **Tickets / Follow-through layer**  
+  A place to turn uncertain messages into owned work once they need a response, escalation, or tracking.
 
-Without AI, the app could still score deterministic signals and enforce safety policy, but it would be much worse at:
+### What Aegis Desk does differently
 
-- turning messy inbox context into a structured plan
-- extracting and profiling entities
-- synthesizing external evidence into an explanation
-- drafting a useful reply
-- adapting analysis output to the actual email context instead of a fixed template
 
-The meaningful improvement over a non-AI approach is not "classification for classification's sake."
-It is the combination of:
 
-- evidence-backed reasoning
-- context-sensitive drafting
-- research-assisted profiling
-- decision support at the moment of uncertainty
+
+
+
+Aegis Desk does not stop at labeling email. It tries to support the decision around the email.
+
+That means it is built to:
+
+
+
+- separate importance from mere urgency language
+- separate suspicion from certainty of harm
+- research sender and entity context before drafting a response
+- preserve uncertainty when the system does not have enough evidence
+- make the reasoning trail visible instead of hiding it behind a confident answer
+
+> This is why I do not frame it as a generic spam filter, a phishing-only tool, or a simple summarizer. The value is in the workflow: triage, verification, analysis, and action in one path.
+
+
+
 
 ## AI Integration
 
