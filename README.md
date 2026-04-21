@@ -81,7 +81,7 @@ The goal is to help a user answer:
 
 ## Solution Overview
 
-Aegis Desk is a Next.js App Router application with four connected surfaces:
+Aegis Desk is a Next.js App Router application with three connected surfaces:
 
 1. **Inbox Scanner**
    Scans manual or Gmail-sourced email, classifies messages, scores priority, estimates uncertainty, and proposes a trusted next action.
@@ -89,8 +89,6 @@ Aegis Desk is a Next.js App Router application with four connected surfaces:
    Turns a selected email into a structured analysis workflow: planning, research, entity profiling, evidence synthesis, reply drafting, and calendar artifact generation.
 3. **Tickets / Admin Desk**
    Escalates high-stakes messages into a helpdesk-style workflow with local-first persistence and optional Peppermint sync.
-4. **QueueGuard**
-   A separate trust-and-step-up demo for queue/session risk workflows.
 
 The core product idea is:
 
