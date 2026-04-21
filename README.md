@@ -528,7 +528,9 @@ Known state:
 
 ## Link to Website / Application
 
-Public deployment: _Not currently published as a public production app_
+Public deployment:
+
+- https://aegis-desk-kappa.vercel.app/
 
 Local development URL:
 
