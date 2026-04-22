@@ -55,6 +55,11 @@ type DecisionImportanceArgs = {
   };
   text: string;
   incidentHints: DecisionImportanceHint[];
+  temporalBoosts?: {
+    urgencyDelta: number;
+    threatDelta: number;
+    flags: string[];
+  };
 };
 
 const OPPORTUNITY_PATTERNS = [
@@ -154,6 +159,46 @@ function attentionTypeFromScores(args: {
   return "review_later";
 }
 
+/**
+ * Recomputes the attention type and rationale for a decision-importance profile after one or more score components change.
+ *
+ * Pipeline step: used when a later scoring layer adjusts urgency without rebuilding the full importance profile from scratch.
+ * False-positive scenario addressed: keeps downstream routing and guard layers aligned when predictive urgency changes the urgency/relevance balance.
+ */
+export function rebalanceDecisionImportanceProfile(
+  profile: DecisionImportanceProfile
+): DecisionImportanceProfile {
+  const attentionType = attentionTypeFromScores({
+    threatScore: profile.threatScore,
+    urgencyScore: profile.urgencyScore,
+    relevanceScore: profile.relevanceScore,
+    opportunityScore: profile.opportunityScore,
+    noiseScore: profile.noiseScore,
+    trustGapScore: profile.trustGapScore,
+  });
+
+  let rationale = "Balanced review recommended.";
+  if (attentionType === "verify_now") {
+    rationale =
+      "Potentially important message, but sender trust or identity confidence is weak.";
+  } else if (attentionType === "act_now") {
+    rationale =
+      "Time-sensitive message with meaningful consequence if ignored.";
+  } else if (attentionType === "review_later") {
+    rationale =
+      "Relevant or useful message, but not urgent enough to interrupt the queue.";
+  } else if (attentionType === "ignore_routine") {
+    rationale =
+      "Promotional or routine noise signals outweigh any likely action value.";
+  }
+
+  return {
+    ...profile,
+    attentionType,
+    rationale,
+  };
+}
+
 export function buildDecisionImportanceProfile(
   args: DecisionImportanceArgs
 ): DecisionImportanceProfile {
@@ -190,7 +235,7 @@ export function buildDecisionImportanceProfile(
     100
   );
 
-  const threatScore = clamp(
+  let threatScore = clamp(
     Math.round(
       scamPeak * 0.58 +
         securityScore * 0.52 +
@@ -204,7 +249,7 @@ export function buildDecisionImportanceProfile(
     100
   );
 
-  const urgencyScore = clamp(
+  let urgencyScore = clamp(
     Math.round(
       deadlineScore * 0.62 +
         legalScore * 0.28 +
@@ -220,6 +265,11 @@ export function buildDecisionImportanceProfile(
     0,
     100
   );
+
+  if (args.temporalBoosts) {
+    urgencyScore = clamp(urgencyScore + args.temporalBoosts.urgencyDelta, 0, 100);
+    threatScore = clamp(threatScore + args.temporalBoosts.threatDelta, 0, 100);
+  }
 
   const relevanceScore = clamp(
     Math.round(

@@ -15,6 +15,14 @@ import {
   type MailClassifierResult,
 } from "@/lib/inbox/classifier";
 import {
+  computeAdaptiveThresholds,
+  loadAdaptiveThresholds,
+  saveAdaptiveThresholds,
+  type AdaptiveThresholdInput,
+  type AdaptiveThresholdRecommendation,
+  type AdaptiveThresholdResult,
+} from "@/lib/inbox/adaptiveThresholds";
+import {
   buildExplanation,
   buildSignalGroups,
   buildStructuredUncertainty,
@@ -34,17 +42,26 @@ import {
   fetchLatestGmailRawEmails,
   getValidGmailToken,
 } from "@/lib/inbox/gmail";
-import { buildDecisionImportanceProfile } from "@/lib/inbox/importance";
 import {
   appendInboxEvaluationLogEntries,
   buildGroundTruthPlaceholder,
   buildInboxEvaluationLogEntry,
 } from "@/lib/inbox/evaluation";
 import {
+  applyFalsePositiveGuard,
+  type FalsePositiveGuardResult,
+} from "@/lib/inbox/falsePositiveGuard";
+import {
+  applyRoutingOverride,
   buildEnvDecisionPolicyConfig,
   InboxDecisionSchema,
   routeInboxDecision,
+  type InboxDecisionPolicyConfig,
 } from "@/lib/inbox/decision";
+import {
+  buildDecisionImportanceProfile,
+  rebalanceDecisionImportanceProfile,
+} from "@/lib/inbox/importance";
 import {
   applyActionGuardrails,
   applyPriorityGuardrails,
@@ -63,12 +80,25 @@ import {
   deriveThreatType,
 } from "@/lib/inbox/signals";
 import {
+  predictUrgency,
+  type UrgencyPredictorResult,
+} from "@/lib/inbox/urgencyPredictor";
+import {
+  buildSessionStore,
+  deriveClusterKey,
+  hashSignal,
+  updateRecord,
+} from "@/lib/inbox/sessionStore";
+import { buildTemporalContext } from "@/lib/inbox/temporalContext";
+import type { TemporalContextResult } from "@/lib/inbox/temporalContext.types";
+import {
   OFFLINE_MODE_TEMPLATE_THRESHOLDS,
   OFFLINE_MODE_TEMPLATE_WEIGHTS,
   getOfflineRuntimeConfig,
   isOfflineEnforced,
 } from "@/lib/offline";
 import { IncidentMemoryModel } from "@/lib/models/IncidentMemory";
+import { InboxEvaluationLogModel } from "@/lib/models/InboxEvaluationLog";
 import { SenderReputationSnapshotModel } from "@/lib/models/SenderReputationSnapshot";
 import {
   buildEnvConsensusPolicy,
@@ -130,6 +160,7 @@ type ThreadProfile = {
 type ParsedEmail = {
   id: string;
   raw: string;
+  receivedAt: Date | null;
   from: string;
   subject: string;
   senderEmail: string;
@@ -146,6 +177,21 @@ type ParsedEmail = {
   };
 };
 
+type PromotionalSummary = {
+  lowRiskPromotional: boolean;
+  promotionalConfidence: number;
+  promoUrgencyHits: number;
+  senderPromoHints: number;
+};
+
+type PredictiveSenderHistory = {
+  subjectHashes: string[];
+  priorPriorityScores: number[];
+  outcomeLabels: string[];
+  avgResponseGapHours: number | null;
+  lastEmailFromSender: Date | null;
+};
+
 type ScoringSnapshot = {
   priorityScore: number;
   priority: Priority;
@@ -157,11 +203,14 @@ type ScoringSnapshot = {
   reputation: ReputationProfile;
   thread: ThreadProfile;
   decisionImportance: ReturnType<typeof buildDecisionImportanceProfile>;
+  promotional: PromotionalSummary;
 };
 
 type ScoredEmail = ParsedEmail & ScoringSnapshot & {
   classifier: MailClassifierResult;
   incidentHints: IncidentHint[];
+  temporalContext: TemporalContextResult;
+  urgencyPrediction: UrgencyPredictorResult;
   priorityGuardrail: {
     adjusted: boolean;
     ruleHits: string[];
@@ -169,6 +218,15 @@ type ScoredEmail = ParsedEmail & ScoringSnapshot & {
   };
   baseUncertaintyPercent: number;
   evidenceStrength: number;
+  falsePositiveGuard: FalsePositiveGuardResult;
+};
+
+type SessionRecordMeta = {
+  senderDomainHash: string;
+  threadKeyHash: string;
+  clusterKey: string;
+  receivedAtMs: number;
+  preScorePrimaryCategory: string;
 };
 
 const CategoryEnum = z.enum([
@@ -317,6 +375,15 @@ const InboxResponseSchema = z.object({
     consensusMode: z.enum(["single", "multi"]),
     consensusMaxModels: z.number().int().min(1).max(8),
     consensusSource: z.enum(["env_default", "admin_override"]),
+    adaptiveDiagnostics: z.object({
+      sampleSize: z.number().int().min(0),
+      falsePositiveRate: z.number().min(0).max(1),
+      falseNegativeRate: z.number().min(0).max(1),
+      fpGuardEffectiveness: z.number().min(0),
+      avgUncertaintyAtFP: z.number().min(0),
+      dominantFPCategory: z.string(),
+      recommendedFocus: z.string(),
+    }),
   }),
 });
 
@@ -459,6 +526,510 @@ const CALIBRATION_PROFILES: Record<
 const INBOX_POLICY_VERSION =
   process.env.INBOX_POLICY_VERSION || "inbox-policy-v4-decision-importance";
 
+/**
+ * Builds the full threshold set currently active in the inbox pipeline before adaptive overrides are applied.
+ *
+ * This plugs into adaptive threshold startup loading so the scanner can merge learned values with env-backed defaults.
+ */
+function buildAdaptiveThresholdDefaults(
+  decisionPolicyConfig: InboxDecisionPolicyConfig
+): AdaptiveThresholdRecommendation {
+  return {
+    autoTriageConfidenceMin: decisionPolicyConfig.autoTriageConfidenceMinPct,
+    autoTriageUncertaintyMax: decisionPolicyConfig.autoTriageUncertaintyMaxPct,
+    escalateConfidenceMin: decisionPolicyConfig.escalateConfidenceMinPct,
+    escalateUncertaintyMax: decisionPolicyConfig.escalateUncertaintyMaxPct,
+    riskMediumMin: decisionPolicyConfig.riskMediumMinScore,
+    riskHighMin: decisionPolicyConfig.riskHighMinScore,
+    harmfulPriorityFloor: 84,
+    urgentDecisionFloor: 80,
+    deadlineHighFloor: 80,
+    routineNoiseCap: 36,
+  };
+}
+
+/**
+ * Merges cached adaptive threshold recommendations over the current default threshold set.
+ *
+ * This plugs into scanner startup before any email is processed so learned calibration wins only where a cache exists.
+ */
+function mergeAdaptiveThresholds(args: {
+  defaults: AdaptiveThresholdRecommendation;
+  cached?: AdaptiveThresholdResult | null;
+}): AdaptiveThresholdRecommendation {
+  return {
+    ...args.defaults,
+    ...(args.cached?.recommended ?? {}),
+  };
+}
+
+/**
+ * Maps the broader adaptive threshold set back into the routing-policy config shape used by routeInboxDecision().
+ *
+ * This plugs into decision routing after adaptive thresholds are loaded so auto-triage and escalation reuse learned calibration.
+ */
+function buildEffectiveDecisionPolicyConfig(
+  thresholds: AdaptiveThresholdRecommendation,
+  fallback: InboxDecisionPolicyConfig
+): InboxDecisionPolicyConfig {
+  return {
+    ...fallback,
+    autoTriageConfidenceMinPct: thresholds.autoTriageConfidenceMin,
+    autoTriageUncertaintyMaxPct: thresholds.autoTriageUncertaintyMax,
+    escalateConfidenceMinPct: thresholds.escalateConfidenceMin,
+    escalateUncertaintyMaxPct: thresholds.escalateUncertaintyMax,
+    riskMediumMinScore: thresholds.riskMediumMin,
+    riskHighMinScore: thresholds.riskHighMin,
+  };
+}
+
+/**
+ * Converts a numeric priority score into the standard inbox priority band.
+ *
+ * This plugs into predictive urgency and adaptive threshold rewrites when the route recomputes score bands outside scoreEmail().
+ */
+function priorityFromScore(score: number): Priority {
+  if (score >= 80) return "high";
+  if (score >= 50) return "medium";
+  return "low";
+}
+
+/**
+ * Recomputes the raw priority score from the current decision profile, allowing adaptive thresholds to replace the routine-noise cap.
+ *
+ * This plugs into the route right after predictive urgency adjusts the decision profile and before classifier/guardrail stages run.
+ */
+function recomputePriorityFromDecisionProfile(args: {
+  decisionImportance: ReturnType<typeof buildDecisionImportanceProfile>;
+  routineNoiseCap: number;
+}): { priorityScore: number; priority: Priority; routineNoiseApplied: boolean } {
+  let priorityScore =
+    6 +
+    args.decisionImportance.threatScore * 0.34 +
+    args.decisionImportance.urgencyScore * 0.33 +
+    args.decisionImportance.relevanceScore * 0.19 +
+    args.decisionImportance.opportunityScore * 0.15 -
+    args.decisionImportance.noiseScore * 0.3;
+
+  const verifyNowCombo =
+    args.decisionImportance.threatScore >= 72 &&
+    args.decisionImportance.trustGapScore >= 55;
+  const actNowCombo =
+    args.decisionImportance.urgencyScore >= 70 &&
+    args.decisionImportance.relevanceScore >= 48;
+  const valuableOpportunityCombo =
+    args.decisionImportance.opportunityScore >= 62 &&
+    args.decisionImportance.affinityScore >= 28 &&
+    args.decisionImportance.threatScore < 58;
+  const routineNoiseCombo =
+    args.decisionImportance.noiseScore >= 74 &&
+    args.decisionImportance.urgencyScore < 45 &&
+    args.decisionImportance.threatScore < 50 &&
+    args.decisionImportance.opportunityScore < 60;
+
+  if (verifyNowCombo) priorityScore = Math.max(priorityScore, 84);
+  if (actNowCombo) priorityScore = Math.max(priorityScore, 80);
+  if (valuableOpportunityCombo) priorityScore = Math.max(priorityScore, 56);
+  if (routineNoiseCombo) {
+    priorityScore = Math.min(priorityScore, args.routineNoiseCap);
+  }
+
+  const rounded = clamp(Math.round(priorityScore), 0, 100);
+  return {
+    priorityScore: rounded,
+    priority: priorityFromScore(rounded),
+    routineNoiseApplied: routineNoiseCombo,
+  };
+}
+
+/**
+ * Applies adaptive replacements for the hardcoded priority floors and caps inside the existing guardrail stage.
+ *
+ * This plugs into the route immediately after applyPriorityGuardrails() so learned thresholds can take effect without modifying policy.ts.
+ */
+function applyAdaptivePriorityCalibration(args: {
+  baseScore: number;
+  primaryCategory: Category;
+  categoryScores: CategoryScore[];
+  classifier: MailClassifierResult;
+  decisionImportance: ReturnType<typeof buildDecisionImportanceProfile>;
+  deadlineCount: number;
+  attachmentRiskScore: number;
+  urlsCount: number;
+  trustScore: number;
+  reputationScore: number;
+  thresholds: AdaptiveThresholdRecommendation;
+}): {
+  priorityScore: number;
+  priority: Priority;
+  adjusted: boolean;
+  ruleHits: string[];
+  rationale: string;
+} {
+  const securityScore = scoreOfCategory(args.categoryScores, "security_phishing");
+  const financeScore = scoreOfCategory(args.categoryScores, "finance_payment");
+  const scamPeak = Math.max(
+    scoreOfCategory(args.categoryScores, "scam_bec"),
+    scoreOfCategory(args.categoryScores, "scam_invoice_fraud"),
+    scoreOfCategory(args.categoryScores, "scam_credential_phishing"),
+    scoreOfCategory(args.categoryScores, "scam_malware_attachment"),
+    scoreOfCategory(args.categoryScores, "scam_impersonation")
+  );
+  const riskyEvidence =
+    scamPeak >= 58 ||
+    securityScore >= 58 ||
+    financeScore >= 62 ||
+    args.attachmentRiskScore >= 40 ||
+    args.urlsCount >= 5 ||
+    args.trustScore <= 30 ||
+    args.reputationScore <= 35;
+  let priorityScore = args.baseScore;
+  const ruleHits: string[] = [];
+
+  if (
+    args.classifier.probabilities.harmful >= 0.74 &&
+    (riskyEvidence || scamPeak >= 65 || args.attachmentRiskScore >= 48)
+  ) {
+    const nextScore = Math.max(priorityScore, args.thresholds.harmfulPriorityFloor);
+    if (nextScore !== priorityScore) {
+      priorityScore = nextScore;
+      ruleHits.push("adaptive_harmful_priority_floor");
+    }
+  }
+
+  if (
+    args.decisionImportance.urgencyScore >= 62 &&
+    args.decisionImportance.relevanceScore >= 50 &&
+    args.decisionImportance.noiseScore < 72
+  ) {
+    const nextScore = Math.max(priorityScore, args.thresholds.urgentDecisionFloor);
+    if (nextScore !== priorityScore) {
+      priorityScore = nextScore;
+      ruleHits.push("adaptive_urgent_decision_floor");
+    }
+  }
+
+  if (
+    args.primaryCategory === "deadline_scheduling" &&
+    args.deadlineCount > 0 &&
+    args.decisionImportance.relevanceScore >= 44 &&
+    args.classifier.probabilities.spam < 0.45
+  ) {
+    const nextScore = Math.max(priorityScore, args.thresholds.deadlineHighFloor);
+    if (nextScore !== priorityScore) {
+      priorityScore = nextScore;
+      ruleHits.push("adaptive_deadline_high_floor");
+    }
+  }
+
+  if (
+    args.decisionImportance.noiseScore >= 74 &&
+    args.decisionImportance.urgencyScore < 45 &&
+    args.decisionImportance.threatScore < 50 &&
+    args.decisionImportance.opportunityScore < 60
+  ) {
+    const nextScore = Math.min(priorityScore, args.thresholds.routineNoiseCap);
+    if (nextScore !== priorityScore) {
+      priorityScore = nextScore;
+      ruleHits.push("adaptive_routine_noise_cap");
+    }
+  }
+
+  const rounded = clamp(Math.round(priorityScore), 0, 100);
+  return {
+    priorityScore: rounded,
+    priority: priorityFromScore(rounded),
+    adjusted: rounded !== args.baseScore,
+    ruleHits,
+    rationale:
+      ruleHits.length > 0
+        ? `Adaptive thresholds applied: ${ruleHits.join(", ")}.`
+        : "No adaptive priority threshold adjustments applied.",
+  };
+}
+
+/**
+ * Estimates the sender's historical actionable cadence from incident-memory timestamps.
+ *
+ * This plugs into predictive urgency history loading so sender velocity can be inferred even before explicit reply telemetry exists.
+ */
+function computeAvgResponseGapHoursFromDocs(
+  docs: Array<{
+    createdAt?: Date;
+    priorityScore?: number;
+    outcomeLabel?: string;
+  }>
+): number | null {
+  if (docs.length < 2) return null;
+  const sorted = [...docs]
+    .filter((doc): doc is { createdAt: Date; priorityScore?: number; outcomeLabel?: string } =>
+      doc.createdAt instanceof Date && Number.isFinite(doc.createdAt.getTime())
+    )
+    .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  if (sorted.length < 2) return null;
+
+  const actionableGaps: number[] = [];
+  for (let index = 1; index < sorted.length; index += 1) {
+    const current = sorted[index];
+    const previous = sorted[index - 1];
+    const looksActionable =
+      current.outcomeLabel === "actionable_correct" ||
+      current.priorityScore !== undefined && current.priorityScore >= 50;
+    if (!looksActionable) continue;
+
+    const gapHours =
+      (current.createdAt.getTime() - previous.createdAt.getTime()) / 3600000;
+    if (Number.isFinite(gapHours) && gapHours > 0) {
+      actionableGaps.push(gapHours);
+    }
+  }
+
+  return actionableGaps.length > 0
+    ? Number(
+        (
+          actionableGaps.reduce((sum, gap) => sum + gap, 0) /
+          actionableGaps.length
+        ).toFixed(2)
+      )
+    : null;
+}
+
+/**
+ * Loads predictive sender history used by urgencyPredictor() from incident memory.
+ *
+ * This plugs into scanner startup before per-email scoring begins so urgency prediction can incorporate subject novelty and cadence data.
+ */
+async function loadPredictiveSenderHistory(
+  parsedEmails: ParsedEmail[]
+): Promise<Record<string, PredictiveSenderHistory>> {
+  const empty: Record<string, PredictiveSenderHistory> = {};
+  for (const email of parsedEmails) {
+    empty[email.id] = {
+      subjectHashes: [],
+      priorPriorityScores: [],
+      outcomeLabels: [],
+      avgResponseGapHours: null,
+      lastEmailFromSender: null,
+    };
+  }
+
+  if (!process.env.MONGODB_URI || parsedEmails.length === 0) {
+    return empty;
+  }
+
+  try {
+    await connectMongo();
+
+    const senderDomains = Array.from(
+      new Set(parsedEmails.map((email) => email.senderDomain).filter(Boolean))
+    );
+    const senderEmailHashes = Array.from(
+      new Set(
+        parsedEmails
+          .map((email) =>
+            email.senderEmail ? createHashKey(`sender:${email.senderEmail}`) : ""
+          )
+          .filter(Boolean)
+      )
+    );
+
+    if (senderDomains.length === 0 && senderEmailHashes.length === 0) {
+      return empty;
+    }
+
+    const docs = (await IncidentMemoryModel.find({
+      $or: [
+        ...(senderDomains.length > 0
+          ? [{ senderDomain: { $in: senderDomains } }]
+          : []),
+        ...(senderEmailHashes.length > 0
+          ? [{ senderEmailHash: { $in: senderEmailHashes } }]
+          : []),
+      ],
+    })
+      .sort({ createdAt: -1 })
+      .limit(1200)
+      .lean()
+      .exec()) as Array<{
+      senderDomain?: string;
+      senderEmailHash?: string;
+      subjectHash?: string;
+      priorityScore?: number;
+      outcomeLabel?: string;
+      createdAt?: Date;
+    }>;
+
+    for (const email of parsedEmails) {
+      const senderEmailHash = email.senderEmail
+        ? createHashKey(`sender:${email.senderEmail}`)
+        : "";
+      const matchingDocs = docs.filter(
+        (doc) =>
+          (senderEmailHash && doc.senderEmailHash === senderEmailHash) ||
+          (email.senderDomain && doc.senderDomain === email.senderDomain)
+      );
+      const receivedAtMs = email.receivedAt?.getTime() ?? Number.POSITIVE_INFINITY;
+      const lastEmailFromSender = matchingDocs
+        .map((doc) => (doc.createdAt instanceof Date ? doc.createdAt : null))
+        .filter((value): value is Date => Boolean(value))
+        .find((createdAt) => createdAt.getTime() < receivedAtMs) ?? null;
+
+      empty[email.id] = {
+        subjectHashes: matchingDocs
+          .map((doc) => (typeof doc.subjectHash === "string" ? doc.subjectHash : ""))
+          .filter(Boolean)
+          .slice(0, 40),
+        priorPriorityScores: matchingDocs
+          .map((doc) =>
+            typeof doc.priorityScore === "number"
+              ? clamp(Math.round(doc.priorityScore), 0, 100)
+              : 0
+          )
+          .slice(0, 40),
+        outcomeLabels: matchingDocs
+          .map((doc) => (typeof doc.outcomeLabel === "string" ? doc.outcomeLabel : ""))
+          .filter(Boolean)
+          .slice(0, 40),
+        avgResponseGapHours: computeAvgResponseGapHoursFromDocs(matchingDocs),
+        lastEmailFromSender,
+      };
+    }
+  } catch (error) {
+    console.warn("Predictive sender history loading skipped:", error);
+  }
+
+  return empty;
+}
+
+/**
+ * Extracts the cumulative false-positive guard score reduction from persisted guardrail traces.
+ *
+ * This plugs into adaptive-threshold history loading so calibration can measure whether the shipped FP Guard is materially reducing noise.
+ */
+function parseFalsePositiveGuardDeltaFromSignals(signals: string[]): number {
+  return signals.reduce((sum, signal) => {
+    const match = signal.match(/^false-positive guard [\w-]+\s+(-?\d+):/i);
+    if (!match) return sum;
+    const delta = Number(match[1]);
+    return Number.isFinite(delta) ? sum + Math.abs(delta) : sum;
+  }, 0);
+}
+
+/**
+ * Loads the recent labeled outcome history required by adaptive threshold calibration.
+ *
+ * This plugs into the end-of-scan adaptation step after alerts are persisted so the next scan can tighten or relax thresholds from real feedback.
+ */
+async function loadRecentAdaptiveOutcomeHistory(
+  limit: number
+): Promise<AdaptiveThresholdInput["outcomeHistory"]> {
+  if (!process.env.MONGODB_URI) {
+    return [];
+  }
+
+  try {
+    await connectMongo();
+
+    const incidents = (await IncidentMemoryModel.find({
+      outcomeLabel: { $ne: "" },
+    })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean()
+      .exec()) as Array<{
+      sourceEmailId?: string;
+      priorityScore?: number;
+      outcomeLabel?: string;
+      mailClass?: string;
+      primaryCategory?: string;
+      consensusScore?: number;
+      uncertaintyScore?: number;
+      deterministicSignals?: {
+        guardrails?: { ruleHits?: string[] };
+        signals?: string[];
+      };
+      signals?: string[];
+      createdAt?: Date;
+    }>;
+
+    const messageIds = incidents
+      .map((incident) =>
+        typeof incident.sourceEmailId === "string" ? incident.sourceEmailId : ""
+      )
+      .filter(Boolean);
+    const evaluationLogs = messageIds.length
+      ? ((await InboxEvaluationLogModel.find({
+          messageId: { $in: messageIds },
+        })
+          .sort({ loggedAt: -1 })
+          .lean()
+          .exec()) as Array<{
+          messageId?: string;
+          routingAction?: string;
+        }>)
+      : [];
+    const routingByMessageId = new Map<string, string>();
+    for (const log of evaluationLogs) {
+      if (
+        typeof log.messageId === "string" &&
+        typeof log.routingAction === "string" &&
+        !routingByMessageId.has(log.messageId)
+      ) {
+        routingByMessageId.set(log.messageId, log.routingAction);
+      }
+    }
+
+    return incidents.map((incident) => {
+      const priorityScore =
+        typeof incident.priorityScore === "number"
+          ? clamp(Math.round(incident.priorityScore), 0, 100)
+          : 0;
+      const guardRuleHits = incident.deterministicSignals?.guardrails?.ruleHits ?? [];
+      const signalSource = [
+        ...(incident.deterministicSignals?.signals ?? []),
+        ...(incident.signals ?? []),
+      ];
+      return {
+        priorityScore,
+        priorityBand: priorityFromScore(priorityScore),
+        outcomeLabel:
+          typeof incident.outcomeLabel === "string" ? incident.outcomeLabel : "",
+        mailClass: typeof incident.mailClass === "string" ? incident.mailClass : "",
+        primaryCategory:
+          typeof incident.primaryCategory === "string"
+            ? incident.primaryCategory
+            : "general",
+        fpGuardActivated: guardRuleHits.some((rule) =>
+          rule.startsWith("stale_urgency_decay") ||
+          rule.startsWith("habit_open_sender_discount") ||
+          rule.startsWith("thread_fatigue_") ||
+          rule.startsWith("trusted_bulk_bleed_correction") ||
+          rule.startsWith("single_signal_confidence_floor") ||
+          rule.startsWith("feedback_memory_")
+        ),
+        fpGuardDelta: parseFalsePositiveGuardDeltaFromSignals(signalSource),
+        consensusScore:
+          typeof incident.consensusScore === "number"
+            ? clamp(Math.round(incident.consensusScore), 0, 100)
+            : 0,
+        uncertainty:
+          typeof incident.uncertaintyScore === "number"
+            ? clamp(Math.round(incident.uncertaintyScore * 100), 0, 100)
+            : 0,
+        timestamp:
+          incident.createdAt instanceof Date ? incident.createdAt : new Date(0),
+        routingAction:
+          typeof incident.sourceEmailId === "string"
+            ? routingByMessageId.get(incident.sourceEmailId)
+            : undefined,
+      };
+    });
+  } catch (error) {
+    console.warn("Adaptive outcome history loading skipped:", error);
+    return [];
+  }
+}
+
 function inboxModelVersion(args: {
   offlineEnforced: boolean;
   consensusPolicy: InboxConsensusPolicy;
@@ -538,6 +1109,19 @@ function extractFrom(raw: string): string {
   return extractHeader(raw, "From") || "(Unknown sender)";
 }
 
+/**
+ * Parses the Date header into a stable received timestamp when the raw email provides one.
+ *
+ * This plugs into the post-scoring false-positive guard so stale deadline language can be anchored
+ * to when the message actually arrived instead of to scan time alone.
+ */
+function extractReceivedAt(raw: string): Date | null {
+  const dateHeader = extractHeader(raw, "Date");
+  if (!dateHeader) return null;
+  const parsed = new Date(dateHeader);
+  return Number.isFinite(parsed.getTime()) ? parsed : null;
+}
+
 function extractBody(raw: string): string {
   const lines = raw.split(/\r?\n/);
   const bodyStart = lines.findIndex((line) => /^body:\s*$/i.test(line) || /^body:/i.test(line));
@@ -592,6 +1176,8 @@ function extractDeadlines(raw: string): string[] {
     /\bwithin\s+\d+\s+(hours|days|weeks)\b/gi,
     /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s+\d{4}\b/gi,
     /\b\d{4}-\d{2}-\d{2}\b/g,
+    /\b(?:by|this|next)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/gi,
+    /\btonight\b/gi,
     /\btomorrow\b/gi,
     /\btoday\b/gi,
   ];
@@ -1144,6 +1730,11 @@ function scoreEmail(args: {
   reputation: ReputationProfile;
   thread: ThreadProfile;
   incidentHints: IncidentHint[];
+  temporalBoosts?: {
+    urgencyDelta: number;
+    threatDelta: number;
+    flags: string[];
+  };
 }): ScoringSnapshot {
   const text = `${args.parsed.subject}\n${args.parsed.body}`;
   const securityHits = countHits(text, PATTERNS.security);
@@ -1229,6 +1820,7 @@ function scoreEmail(args: {
     },
     text,
     incidentHints: args.incidentHints,
+    temporalBoosts: args.temporalBoosts,
   });
 
   let priorityScore =
@@ -1318,6 +1910,12 @@ function scoreEmail(args: {
     reputation: args.reputation,
     thread: args.thread,
     decisionImportance,
+    promotional: {
+      lowRiskPromotional: promotionalContext.lowRiskPromotional,
+      promotionalConfidence: promotionalContext.promotionalConfidence,
+      promoUrgencyHits: promotionalContext.promoUrgencyHits,
+      senderPromoHints: promotionalContext.senderPromoHits,
+    },
   };
 }
 
@@ -1799,6 +2397,7 @@ async function getEmails(
 }
 
 function parseRawEmail(raw: string, id: string): ParsedEmail {
+  const receivedAt = extractReceivedAt(raw);
   const from = extractFrom(raw);
   const subject = extractSubject(raw);
   const senderEmail = senderEmailFromFromHeader(from);
@@ -1815,6 +2414,7 @@ function parseRawEmail(raw: string, id: string): ParsedEmail {
   return {
     id,
     raw,
+    receivedAt,
     from,
     subject,
     senderEmail,
@@ -2141,6 +2741,17 @@ export async function POST(req: Request) {
       adminSettings,
     });
     const decisionPolicyConfig = buildEnvDecisionPolicyConfig();
+    const adaptiveThresholdCache = await loadAdaptiveThresholds(
+      process.env.AEGIS_DATA_DIR ?? "./data"
+    );
+    const effectiveThresholds = mergeAdaptiveThresholds({
+      defaults: buildAdaptiveThresholdDefaults(decisionPolicyConfig),
+      cached: adaptiveThresholdCache,
+    });
+    const effectiveDecisionPolicyConfig = buildEffectiveDecisionPolicyConfig(
+      effectiveThresholds,
+      decisionPolicyConfig
+    );
     const selectedConsensusModels = buildConsensusModelPool(consensusPolicy).map(
       (spec) => `${spec.provider}:${spec.model}`
     );
@@ -2165,11 +2776,77 @@ export async function POST(req: Request) {
     const emails = await getEmails(parsed, buildPublicRequestUrl(req), cookieStore);
 
     const parsedEmails = emails.map((raw, idx) => parseRawEmail(raw, `email-${idx + 1}`));
-    const threadProfiles = buildThreadProfiles(parsedEmails);
+    const sortedEmails = [...parsedEmails].sort(
+      (a, b) => (a.receivedAt?.getTime() ?? 0) - (b.receivedAt?.getTime() ?? 0)
+    );
+    const threadProfiles = buildThreadProfiles(sortedEmails);
     const trustGraph = readTrustGraphCookie(cookieStore.get(TRUST_COOKIE)?.value);
-    const incidentHintsByEmail = await loadIncidentHints(parsedEmails);
+    const incidentHintsByEmail = await loadIncidentHints(sortedEmails);
+    const predictiveHistoryByEmail = await loadPredictiveSenderHistory(sortedEmails);
 
-    const scored: ScoredEmail[] = parsedEmails.map((email) => {
+    const sessionMetaByEmailId: Record<string, SessionRecordMeta> = {};
+    const sessionStore = buildSessionStore(
+      sortedEmails.map((email) => {
+        const trustScore = getTrustScore(trustGraph, email.senderEmail, email.senderDomain);
+        const reputation = buildReputationProfile({
+          senderDomain: email.senderDomain,
+          urlDomains: email.extracted.urlDomains,
+          orgDomains,
+          trustScore,
+        });
+        const thread =
+          threadProfiles[email.threadKey] || { key: email.threadKey, depth: 1, riskDensity: 0 };
+        const preScoreText = `${email.subject}\n${email.body}`;
+        const preScoreSuspiciousDomain =
+          !!email.senderDomain &&
+          SUSPICIOUS_TLDS.some((tld) => email.senderDomain.endsWith(tld));
+        const preScoreExternalSender =
+          !!email.senderDomain &&
+          !orgDomains.some((domain) => domain.toLowerCase() === email.senderDomain);
+        const preScoreCategoryScores = buildCategoryScores({
+          text: preScoreText,
+          senderEmail: email.senderEmail,
+          senderDomain: email.senderDomain,
+          externalSender: preScoreExternalSender,
+          suspiciousDomain: preScoreSuspiciousDomain,
+          extracted: email.extracted,
+          trustScore,
+          reputationScore: reputation.score,
+          thread,
+        });
+        const topPreScoreCategory = preScoreCategoryScores[0];
+        const preScorePrimaryCategory =
+          topPreScoreCategory && topPreScoreCategory.score >= 18
+            ? topPreScoreCategory.category
+            : "general";
+
+        sessionMetaByEmailId[email.id] = {
+          senderDomainHash: hashSignal(email.senderDomain || ""),
+          threadKeyHash: hashSignal(email.threadKey || ""),
+          clusterKey: deriveClusterKey(
+            email.extracted.moneyMentions,
+            email.extracted.deadlines,
+            preScorePrimaryCategory,
+            email.body
+          ),
+          receivedAtMs: email.receivedAt?.getTime() ?? 0,
+          preScorePrimaryCategory,
+        };
+
+        return {
+          senderDomain: email.senderDomain,
+          threadKey: email.threadKey,
+          receivedAt: email.receivedAt,
+          moneyMentions: email.extracted.moneyMentions,
+          deadlines: email.extracted.deadlines,
+          primaryCategory: preScorePrimaryCategory,
+          body: email.body,
+        };
+      })
+    );
+
+    const scored: ScoredEmail[] = [];
+    for (const email of sortedEmails) {
       const trustScore = getTrustScore(trustGraph, email.senderEmail, email.senderDomain);
       const reputation = buildReputationProfile({
         senderDomain: email.senderDomain,
@@ -2179,6 +2856,14 @@ export async function POST(req: Request) {
       });
       const thread = threadProfiles[email.threadKey] || { key: email.threadKey, depth: 1, riskDensity: 0 };
       const incidentHints = incidentHintsByEmail[email.id] || [];
+      const receivedAt = email.receivedAt ?? new Date();
+      const senderNode = email.senderEmail
+        ? trustGraph.senders[createHashKey(`sender:${email.senderEmail}`)] || null
+        : null;
+      const domainNode = email.senderDomain
+        ? trustGraph.domains[createHashKey(`domain:${email.senderDomain}`)] || null
+        : null;
+      const trustNodeForHistory = senderNode || domainNode;
 
       const s = scoreEmail({
         parsed: email,
@@ -2188,6 +2873,120 @@ export async function POST(req: Request) {
         thread,
         incidentHints,
       });
+      const predictiveHistory = predictiveHistoryByEmail[email.id] || {
+        subjectHashes: [],
+        priorPriorityScores: [],
+        outcomeLabels: [],
+        avgResponseGapHours: null,
+        lastEmailFromSender: null,
+      };
+      const urgencyPrediction = predictUrgency({
+        email: {
+          receivedAt,
+          senderEmail: email.senderEmail,
+          senderDomain: email.senderDomain,
+          subject: email.subject,
+          deadlines: email.extracted.deadlines,
+          body: email.body,
+        },
+        trust: {
+          senderScore: trustScoreFromNode(senderNode),
+          seen: trustNodeForHistory?.seen ?? 0,
+          lastSeen: trustNodeForHistory
+            ? new Date(trustNodeForHistory.lastSeen)
+            : null,
+        },
+        history: predictiveHistory,
+        currentDecisionProfile: {
+          urgency: s.decisionImportance.urgencyScore,
+          relevance: s.decisionImportance.relevanceScore,
+          threat: s.decisionImportance.threatScore,
+        },
+      });
+      const decisionImportanceFromUrgency =
+        urgencyPrediction.urgencyDelta !== 0
+          ? rebalanceDecisionImportanceProfile({
+              ...s.decisionImportance,
+              urgencyScore: clamp(
+                s.decisionImportance.urgencyScore + urgencyPrediction.urgencyDelta,
+                0,
+                100
+              ),
+            })
+          : s.decisionImportance;
+      const sessionMeta = sessionMetaByEmailId[email.id] ?? {
+        senderDomainHash: hashSignal(email.senderDomain || ""),
+        threadKeyHash: hashSignal(email.threadKey || ""),
+        clusterKey: deriveClusterKey(
+          email.extracted.moneyMentions,
+          email.extracted.deadlines,
+          s.primaryCategory,
+          email.body
+        ),
+        receivedAtMs: receivedAt.getTime(),
+        preScorePrimaryCategory: s.primaryCategory,
+      };
+      const preTemporalPriority = recomputePriorityFromDecisionProfile({
+        decisionImportance: decisionImportanceFromUrgency,
+        routineNoiseCap: effectiveThresholds.routineNoiseCap,
+      });
+      const temporalContext = buildTemporalContext({
+        senderDomainHash: sessionMeta.senderDomainHash,
+        threadKeyHash: sessionMeta.threadKeyHash,
+        clusterKey: sessionMeta.clusterKey,
+        receivedAt: sessionMeta.receivedAtMs,
+        decisionProfile: {
+          threat: decisionImportanceFromUrgency.threatScore,
+          urgency: decisionImportanceFromUrgency.urgencyScore,
+          primaryCategory: s.primaryCategory,
+          attentionType: decisionImportanceFromUrgency.attentionType,
+        },
+        trust: {
+          senderScore: trustScoreFromNode(senderNode),
+          seen: trustNodeForHistory?.seen ?? 0,
+        },
+        store: sessionStore,
+      });
+      const antiLaunderedUrgencyDelta =
+        preTemporalPriority.priority === "low" &&
+        preTemporalPriority.priorityScore + temporalContext.totalUrgencyDelta > 74
+          ? Math.max(0, 74 - preTemporalPriority.priorityScore)
+          : temporalContext.totalUrgencyDelta;
+      const decisionImportance =
+        antiLaunderedUrgencyDelta !== 0 || temporalContext.totalThreatDelta !== 0
+          ? rebalanceDecisionImportanceProfile({
+              ...decisionImportanceFromUrgency,
+              urgencyScore: clamp(
+                decisionImportanceFromUrgency.urgencyScore + antiLaunderedUrgencyDelta,
+                0,
+                100
+              ),
+              threatScore: clamp(
+                decisionImportanceFromUrgency.threatScore + temporalContext.totalThreatDelta,
+                0,
+                100
+              ),
+            })
+          : decisionImportanceFromUrgency;
+      const rescoredPriority = recomputePriorityFromDecisionProfile({
+        decisionImportance,
+        routineNoiseCap: effectiveThresholds.routineNoiseCap,
+      });
+      const urgencySignals = [
+        ...temporalContext.temporalFlags,
+        ...(antiLaunderedUrgencyDelta !== temporalContext.totalUrgencyDelta
+          ? ["temporal:urgency_cap:74"]
+          : []),
+        `temporal_context:${urgencyPrediction.temporalContext}`,
+        `urgency_prediction:${urgencyPrediction.predictedUrgencyScore}/100 delta=${urgencyPrediction.urgencyDelta} confidence=${urgencyPrediction.predictionConfidence}/100`,
+        ...urgencyPrediction.predictionFactors.map(
+          (factor) =>
+            `urgency_factor:${factor.factor}:${factor.direction}:${factor.magnitude}:${factor.rationale}`
+        ),
+        ...(rescoredPriority.routineNoiseApplied
+          ? [`adaptive routine-noise cap ${effectiveThresholds.routineNoiseCap}`]
+          : []),
+      ];
       const classifier = classifyInboxMail({
         primaryCategory: s.primaryCategory,
         categoryScores: s.categoryScores.map((entry) => ({
@@ -2195,7 +2994,7 @@ export async function POST(req: Request) {
           score: entry.score,
         })),
         riskTags: s.riskTags,
-        signals: s.signals,
+        signals: Array.from(new Set([...s.signals, ...urgencySignals])),
         trustScore: s.trustScore,
         reputationScore: s.reputation.score,
         threadDepth: s.thread.depth,
@@ -2205,7 +3004,7 @@ export async function POST(req: Request) {
         moneyMentionsCount: email.extracted.moneyMentions.length,
         deadlineCount: email.extracted.deadlines.length,
         incidentHints,
-        decisionImportance: s.decisionImportance,
+        decisionImportance,
       });
 
       const priorityGuardrail = applyPriorityGuardrails({
@@ -2214,22 +3013,42 @@ export async function POST(req: Request) {
           category: entry.category,
           score: entry.score,
         })),
-        priorityScore: s.priorityScore,
+        priorityScore: rescoredPriority.priorityScore,
         deadlineCount: email.extracted.deadlines.length,
-        signals: s.signals,
+        signals: Array.from(new Set([...s.signals, ...urgencySignals])),
         trustScore: s.trustScore,
         reputationScore: s.reputation.score,
         attachmentRiskScore: email.extracted.attachmentRiskScore,
         urlsCount: email.extracted.urls.length,
         classifier,
-        decisionImportance: s.decisionImportance,
+        decisionImportance,
       });
+      const adaptivePriority = applyAdaptivePriorityCalibration({
+        baseScore: priorityGuardrail.priorityScore,
+        primaryCategory: s.primaryCategory,
+        categoryScores: s.categoryScores,
+        classifier,
+        decisionImportance,
+        deadlineCount: email.extracted.deadlines.length,
+        attachmentRiskScore: email.extracted.attachmentRiskScore,
+        urlsCount: email.extracted.urls.length,
+        trustScore: s.trustScore,
+        reputationScore: s.reputation.score,
+        thresholds: effectiveThresholds,
+      });
+      const categoryScores = Object.fromEntries(
+        s.categoryScores.map((entry) => [entry.category, entry.score])
+      );
 
-      const guardrailTags = priorityGuardrail.ruleHits.map((rule) => `Guardrail:${rule}`);
+      const guardrailTags = [
+        ...priorityGuardrail.ruleHits.map((rule) => `Guardrail:${rule}`),
+        ...adaptivePriority.ruleHits.map((rule) => `Guardrail:${rule}`),
+      ];
       const riskTags = Array.from(new Set([...s.riskTags, ...guardrailTags]));
       const signals = Array.from(
         new Set([
           ...s.signals,
+          ...urgencySignals,
           `classifier predicted ${classifier.predictedClass}`,
           `classifier probs spam/harmful/actionable/info ${Math.round(
             classifier.probabilities.spam * 100
@@ -2237,6 +3056,7 @@ export async function POST(req: Request) {
             classifier.probabilities.actionable * 100
           )}/${Math.round(classifier.probabilities.informational * 100)}`,
           ...(priorityGuardrail.adjusted ? [priorityGuardrail.rationale] : []),
+          ...(adaptivePriority.adjusted ? [adaptivePriority.rationale] : []),
         ])
       );
 
@@ -2250,7 +3070,7 @@ export async function POST(req: Request) {
       );
       const baseUncertaintyPercent = computeBaseUncertainty({
         rawEmail: email.raw,
-        priorityScore: priorityGuardrail.priorityScore,
+        priorityScore: adaptivePriority.priorityScore,
         riskTags,
         signals,
         extracted: email.extracted,
@@ -2259,25 +3079,144 @@ export async function POST(req: Request) {
         reputationScore: s.reputation.score,
         thread: s.thread,
       });
-
-      return {
-        ...email,
-        ...s,
-        priorityScore: priorityGuardrail.priorityScore,
-        priority: priorityGuardrail.priority,
+      const falsePositiveGuard = applyFalsePositiveGuard({
+        rawPriorityScore: adaptivePriority.priorityScore,
+        priorityBand: adaptivePriority.priority,
+        primaryCategory: s.primaryCategory,
+        categoryScores,
         riskTags,
         signals,
+        decisionProfile: {
+          threat: decisionImportance.threatScore,
+          urgency: decisionImportance.urgencyScore,
+          relevance: decisionImportance.relevanceScore,
+          opportunity: decisionImportance.opportunityScore,
+          noise: decisionImportance.noiseScore,
+          trustGap: decisionImportance.trustGapScore,
+          affinity: decisionImportance.affinityScore,
+          attentionType: decisionImportance.attentionType,
+        },
+        email: {
+          receivedAt: email.receivedAt,
+          senderEmail: email.senderEmail,
+          senderDomain: email.senderDomain,
+          deadlines: email.extracted.deadlines,
+          moneyMentions: email.extracted.moneyMentions,
+          attachmentRiskScore: email.extracted.attachmentRiskScore,
+          urlCount: email.extracted.urls.length,
+          threadDepth: thread.depth,
+          body: email.body,
+        },
+        trust: {
+          senderScore: trustScoreFromNode(senderNode),
+          domainScore: trustScoreFromNode(domainNode),
+          seen: trustNodeForHistory?.seen ?? 0,
+          highCount: trustNodeForHistory?.high ?? 0,
+          mediumCount: trustNodeForHistory?.medium ?? 0,
+          lastSeen: trustNodeForHistory ? new Date(trustNodeForHistory.lastSeen) : null,
+        },
+        history: {
+          outcomeLabels: incidentHints
+            .map((hint) => hint.outcomeLabel)
+            .filter(Boolean),
+          priorPriorityScores: incidentHints.map((hint) => hint.priorityScore),
+          memorySampleCount: incidentHints.length,
+        },
+        promotional: s.promotional,
+        classifier: {
+          spamProbability: classifier.probabilities.spam,
+          harmfulProbability: classifier.probabilities.harmful,
+          actionableProbability: classifier.probabilities.actionable,
+          informationalProbability: classifier.probabilities.informational,
+        },
+      });
+      const falsePositiveGuardSignals = falsePositiveGuard.corrections.map(
+        (correction) =>
+          `false-positive guard ${correction.rule} ${correction.delta}: ${correction.reason}`
+      );
+      const falsePositiveGuardTags = falsePositiveGuard.corrections.map(
+        (correction) => `FPGuard:${correction.rule}`
+      );
+      const finalRiskTags = Array.from(
+        new Set([...riskTags, ...falsePositiveGuardTags])
+      );
+      const finalSignals = Array.from(
+        new Set([...signals, ...falsePositiveGuardSignals])
+      );
+      const scoredEmail: ScoredEmail = {
+        ...email,
+        ...s,
+        priorityScore: falsePositiveGuard.correctedScore,
+        priority: falsePositiveGuard.correctedBand,
+        riskTags: finalRiskTags,
+        signals: finalSignals,
+        decisionImportance,
         classifier,
         incidentHints,
+        temporalContext,
+        urgencyPrediction,
         priorityGuardrail: {
-          adjusted: priorityGuardrail.adjusted,
-          ruleHits: priorityGuardrail.ruleHits,
-          rationale: priorityGuardrail.rationale,
+          adjusted: priorityGuardrail.adjusted || adaptivePriority.adjusted,
+          ruleHits: [...priorityGuardrail.ruleHits, ...adaptivePriority.ruleHits],
+          rationale: [
+            priorityGuardrail.rationale,
+            ...(adaptivePriority.adjusted ? [adaptivePriority.rationale] : []),
+          ]
+            .filter(Boolean)
+            .join(" "),
         },
         baseUncertaintyPercent,
         evidenceStrength,
+        falsePositiveGuard,
       };
-    });
+      const sessionGuardedBaseUncertaintyPercent = clamp(
+        baseUncertaintyPercent + falsePositiveGuard.confidenceAdjustment,
+        0,
+        100
+      );
+      const sessionTrustedDecision = buildTrustedDecision({
+        email: scoredEmail,
+        uncertaintyPercent: sessionGuardedBaseUncertaintyPercent,
+      });
+      const sessionRoutingDecision = applyRoutingOverride({
+        decision: routeInboxDecision({
+          confidencePct: sessionTrustedDecision.confidencePct,
+          uncertaintyPercent: sessionGuardedBaseUncertaintyPercent,
+          riskScore: sessionTrustedDecision.riskScore,
+          disagreementFlags: [],
+          config: effectiveDecisionPolicyConfig,
+        }),
+        override: temporalContext.routingOverride,
+        reason: temporalContext.unresolvedThread.routingOverride
+          ? `Temporal context override: ${temporalContext.unresolvedThread.rationale}`
+          : temporalContext.routingOverride
+            ? `Temporal context override: ${temporalContext.convergingSignal.rationale}`
+            : "",
+      });
+      updateRecord(
+        sessionStore,
+        sessionMeta.senderDomainHash,
+        sessionMeta.threadKeyHash,
+        sessionMeta.receivedAtMs,
+        {
+          priorityScore: scoredEmail.priorityScore,
+          priorityBand: scoredEmail.priority,
+          primaryCategory: scoredEmail.primaryCategory,
+          threatScore: decisionImportance.threatScore,
+          urgencyScore: decisionImportance.urgencyScore,
+          attentionType: decisionImportance.attentionType,
+          trustedAction: sessionTrustedDecision.action,
+          routingAction: sessionRoutingDecision.final_action,
+          fpGuardActivated: falsePositiveGuard.guardActivated,
+          fpGuardDelta: falsePositiveGuard.corrections.reduce(
+            (sum, correction) => sum + correction.delta,
+            0
+          ),
+        }
+      );
+
+      scored.push(scoredEmail);
+    }
 
     scored.sort((a, b) => b.priorityScore - a.priorityScore);
     const TOP_N = offlineEnforced ? scored.length : Math.min(8, scored.length);
@@ -2329,9 +3268,14 @@ export async function POST(req: Request) {
               consensusPolicy,
             });
 
+        const guardedBaseUncertaintyPercent = clamp(
+          email.baseUncertaintyPercent + email.falsePositiveGuard.confidenceAdjustment,
+          0,
+          100
+        );
         const uncertaintyPercentBase = calibrateUncertainty({
           category: email.primaryCategory,
-          baseUncertaintyPercent: email.baseUncertaintyPercent,
+          baseUncertaintyPercent: guardedBaseUncertaintyPercent,
           evidenceStrength: email.evidenceStrength,
           trustScore: email.trustScore,
           reputationScore: email.reputation.score,
@@ -2394,12 +3338,14 @@ export async function POST(req: Request) {
         const policyRuleHits = Array.from(
           new Set([
             ...email.priorityGuardrail.ruleHits,
+            ...email.falsePositiveGuard.corrections.map((correction) => correction.rule),
             ...actionGuardrail.ruleHits,
             ...classReconcile.ruleHits,
           ])
         );
         const policyRationale = [
           email.priorityGuardrail.rationale,
+          ...email.falsePositiveGuard.corrections.map((correction) => correction.reason),
           actionGuardrail.note,
           classReconcile.rationale,
         ]
@@ -2453,12 +3399,21 @@ export async function POST(req: Request) {
           signalGroups,
           uncertainty,
         });
-        const decision = routeInboxDecision({
+        const routedDecision = routeInboxDecision({
           confidencePct: trustedDecision.confidencePct,
           uncertaintyPercent,
           riskScore: trustedDecision.riskScore,
           disagreementFlags: finalAssist.disagreement_flags,
-          config: decisionPolicyConfig,
+          config: effectiveDecisionPolicyConfig,
+        });
+        const decision = applyRoutingOverride({
+          decision: routedDecision,
+          override: email.temporalContext.routingOverride,
+          reason: email.temporalContext.unresolvedThread.routingOverride
+            ? `Temporal context override: ${email.temporalContext.unresolvedThread.rationale}`
+            : email.temporalContext.routingOverride
+              ? `Temporal context override: ${email.temporalContext.convergingSignal.rationale}`
+              : routedDecision.reason,
         });
         const decisionTrace = {
           ...buildDecisionTrace({
@@ -2519,7 +3474,8 @@ export async function POST(req: Request) {
             policyVersion: INBOX_POLICY_VERSION,
             ruleHits: policyRuleHits,
             rationale: policyRationale,
-            priorityAdjusted: email.priorityGuardrail.adjusted,
+            priorityAdjusted:
+              email.priorityGuardrail.adjusted || email.falsePositiveGuard.guardActivated,
             actionAdjusted: actionGuardrail.adjusted,
             classificationAdjusted: classReconcile.adjusted,
           },
@@ -2529,7 +3485,7 @@ export async function POST(req: Request) {
           reputationFindings: email.reputation.findings,
           thread: email.thread,
           uncertaintyPercent,
-          baseUncertaintyPercent: email.baseUncertaintyPercent,
+          baseUncertaintyPercent: guardedBaseUncertaintyPercent,
           rawEmail: email.raw,
           extracted: {
             deadlines: email.extracted.deadlines,
@@ -2544,9 +3500,14 @@ export async function POST(req: Request) {
 
     for (let i = TOP_N; i < scored.length; i++) {
       const email = scored[i];
+      const guardedBaseUncertaintyPercent = clamp(
+        email.baseUncertaintyPercent + email.falsePositiveGuard.confidenceAdjustment,
+        0,
+        100
+      );
       const uncertaintyPercent = calibrateUncertainty({
         category: email.primaryCategory,
-        baseUncertaintyPercent: email.baseUncertaintyPercent,
+        baseUncertaintyPercent: guardedBaseUncertaintyPercent,
         evidenceStrength: email.evidenceStrength,
         trustScore: email.trustScore,
         reputationScore: email.reputation.score,
@@ -2594,6 +3555,7 @@ export async function POST(req: Request) {
       const policyRuleHits = Array.from(
         new Set([
           ...email.priorityGuardrail.ruleHits,
+          ...email.falsePositiveGuard.corrections.map((correction) => correction.rule),
           ...actionGuardrail.ruleHits,
           ...classReconcile.ruleHits,
         ])
@@ -2617,6 +3579,7 @@ export async function POST(req: Request) {
           ruleHits: policyRuleHits,
           rationale: [
             email.priorityGuardrail.rationale,
+            ...email.falsePositiveGuard.corrections.map((correction) => correction.reason),
             actionGuardrail.note,
             classReconcile.rationale,
           ]
@@ -2652,12 +3615,21 @@ export async function POST(req: Request) {
         signalGroups,
         uncertainty,
       });
-      const decision = routeInboxDecision({
+      const routedDecision = routeInboxDecision({
         confidencePct: trustedDecision.confidencePct,
         uncertaintyPercent,
         riskScore: trustedDecision.riskScore,
         disagreementFlags: ["not_analyzed_budget_capped"],
-        config: decisionPolicyConfig,
+        config: effectiveDecisionPolicyConfig,
+      });
+      const decision = applyRoutingOverride({
+        decision: routedDecision,
+        override: email.temporalContext.routingOverride,
+        reason: email.temporalContext.unresolvedThread.routingOverride
+          ? `Temporal context override: ${email.temporalContext.unresolvedThread.rationale}`
+          : email.temporalContext.routingOverride
+            ? `Temporal context override: ${email.temporalContext.convergingSignal.rationale}`
+            : routedDecision.reason,
       });
       const decisionTrace = {
         ...buildDecisionTrace({
@@ -2718,12 +3690,14 @@ export async function POST(req: Request) {
           ruleHits: policyRuleHits,
           rationale: [
             email.priorityGuardrail.rationale,
+            ...email.falsePositiveGuard.corrections.map((correction) => correction.reason),
             actionGuardrail.note,
             classReconcile.rationale,
           ]
             .filter(Boolean)
             .join(" "),
-          priorityAdjusted: email.priorityGuardrail.adjusted,
+          priorityAdjusted:
+            email.priorityGuardrail.adjusted || email.falsePositiveGuard.guardActivated,
           actionAdjusted: actionGuardrail.adjusted,
           classificationAdjusted: classReconcile.adjusted,
         },
@@ -2733,7 +3707,7 @@ export async function POST(req: Request) {
         reputationFindings: email.reputation.findings,
         thread: email.thread,
         uncertaintyPercent,
-        baseUncertaintyPercent: email.baseUncertaintyPercent,
+        baseUncertaintyPercent: guardedBaseUncertaintyPercent,
         rawEmail: email.raw,
         extracted: {
           deadlines: email.extracted.deadlines,
@@ -2758,23 +3732,8 @@ export async function POST(req: Request) {
       ? "offline_enforced"
       : "hybrid_remote_llm";
     const consensusMode: "single" | "multi" = consensusPolicy.enabled ? "multi" : "single";
-    const meta = {
-      mode: parsed.mode,
-      processingMode,
-      offlineState: offlineConfig.state,
-      scanned: scored.length,
-      highCount: alerts.filter((a) => a.priority === "high").length,
-      mediumCount: alerts.filter((a) => a.priority === "medium").length,
-      lowCount: alerts.filter((a) => a.priority === "low").length,
-      policyVersion: INBOX_POLICY_VERSION,
-      modelVersion,
-      classifierVersion: alerts[0]?.classifier.modelVersion || "inbox-hybrid-classifier-v1",
-      guardrailVersion: INBOX_POLICY_VERSION,
-      learningSamplesUsed,
-      consensusMode,
-      consensusMaxModels: consensusPolicy.enabled ? consensusPolicy.maxModels : 1,
-      consensusSource: consensusPolicy.source,
-    };
+    const classifierVersion =
+      alerts[0]?.classifier.modelVersion || "inbox-hybrid-classifier-v1";
 
     await persistInboxMemory({
       alerts,
@@ -2787,13 +3746,43 @@ export async function POST(req: Request) {
       sourceMode: parsed.mode,
       processingMode,
       modelVersion,
-      classifierVersion: meta.classifierVersion,
+      classifierVersion,
       policyVersion: INBOX_POLICY_VERSION,
-      consensusMode: meta.consensusMode,
-      consensusSource: meta.consensusSource,
-      consensusMaxModels: meta.consensusMaxModels,
+      consensusMode,
+      consensusSource: consensusPolicy.source,
+      consensusMaxModels: consensusPolicy.enabled ? consensusPolicy.maxModels : 1,
       consensusModels: selectedConsensusModels,
     });
+
+    const recentOutcomeHistory = await loadRecentAdaptiveOutcomeHistory(200);
+    const adaptiveResult = computeAdaptiveThresholds({
+      outcomeHistory: recentOutcomeHistory,
+      currentThresholds: effectiveThresholds,
+      minSampleSize: 12,
+    });
+    await saveAdaptiveThresholds(
+      process.env.AEGIS_DATA_DIR ?? "./data",
+      adaptiveResult
+    );
+
+    const meta = {
+      mode: parsed.mode,
+      processingMode,
+      offlineState: offlineConfig.state,
+      scanned: scored.length,
+      highCount: alerts.filter((a) => a.priority === "high").length,
+      mediumCount: alerts.filter((a) => a.priority === "medium").length,
+      lowCount: alerts.filter((a) => a.priority === "low").length,
+      policyVersion: INBOX_POLICY_VERSION,
+      modelVersion,
+      classifierVersion,
+      guardrailVersion: INBOX_POLICY_VERSION,
+      learningSamplesUsed,
+      consensusMode,
+      consensusMaxModels: consensusPolicy.enabled ? consensusPolicy.maxModels : 1,
+      consensusSource: consensusPolicy.source,
+      adaptiveDiagnostics: adaptiveResult.diagnostics,
+    };
 
     return Response.json(InboxResponseSchema.parse({ ok: true, alerts, meta }));
   } catch (err: unknown) {

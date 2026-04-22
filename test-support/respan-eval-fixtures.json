@@ -1,0 +1,67 @@
+[
+  {
+    "name": "clear_phishing",
+    "emailText": "Urgent: Your account has been suspended. Click here to verify: http://secure-login.xyz/reset-password",
+    "docText": "",
+    "command": "analyze this suspicious email",
+    "expected": {
+      "risk_category": "security_phishing",
+      "trusted_decision": "block",
+      "should_escalate": false,
+      "acceptable_reply_constraints": "no_reply",
+      "priority": "high"
+    }
+  },
+  {
+    "name": "bec_invoice_fraud",
+    "emailText": "Invoice #1234 for $45,000. New bank details attached. Wire immediately to avoid late fees.",
+    "docText": "Updated beneficiary: Bank of Nigeria, Acct 987654",
+    "command": "check this urgent invoice request",
+    "expected": {
+      "risk_category": "scam_invoice_fraud",
+      "trusted_decision": "quarantine",
+      "should_escalate": true,
+      "acceptable_reply_constraints": "verify_sender_first",
+      "priority": "high"
+    }
+  },
+  {
+    "name": "legit_urgent_business",
+    "emailText": "CEO here. Need Q4 budget approval by EOD for board meeting tomorrow. Attached signed proposal.",
+    "docText": "Standard renewal, same terms as Q3.",
+    "command": "review executive escalation",
+    "expected": {
+      "risk_category": "executive_escalation",
+      "trusted_decision": "allow",
+      "should_escalate": false,
+      "acceptable_reply_constraints": "acknowledge_deadline",
+      "priority": "high"
+    }
+  },
+  {
+    "name": "ambiguous_gray",
+    "emailText": "Quick question about the API rate limit increase we discussed. Can you confirm?",
+    "docText": "",
+    "command": "handle vendor inquiry",
+    "expected": {
+      "risk_category": "general",
+      "trusted_decision": "allow",
+      "should_escalate": false,
+      "acceptable_reply_constraints": "normal_response",
+      "priority": "low"
+    }
+  },
+  {
+    "name": "safe_routine",
+    "emailText": "Weekly standup moved to 2pm. See you there.",
+    "docText": "",
+    "command": "calendar update",
+    "expected": {
+      "risk_category": "general",
+      "trusted_decision": "allow",
+      "should_escalate": false,
+      "acceptable_reply_constraints": "simple_ack",
+      "priority": "low"
+    }
+  }
+]

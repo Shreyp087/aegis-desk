@@ -183,3 +183,25 @@ export function routeInboxDecision(args: RouteInboxDecisionArgs): InboxDecision 
     risk_level: riskLevel,
   });
 }
+
+/**
+ * Applies a post-routing override when another deterministic layer needs to force escalation behavior.
+ *
+ * Pipeline step: used after routeInboxDecision() by temporal-context wiring so unresolved threads and coordinated batch patterns can raise the final routing action.
+ * False-positive scenario addressed: keeps override behavior explicit and schema-validated instead of burying special-case routing mutations inside the route handler.
+ */
+export function applyRoutingOverride(args: {
+  decision: InboxDecision;
+  override: z.infer<typeof InboxDecisionActionEnum> | null;
+  reason: string;
+}): InboxDecision {
+  if (!args.override) {
+    return args.decision;
+  }
+
+  return InboxDecisionSchema.parse({
+    ...args.decision,
+    final_action: args.override,
+    reason: args.reason,
+  });
+}

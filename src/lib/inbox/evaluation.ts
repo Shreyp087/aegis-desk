@@ -4,6 +4,11 @@ import path from "path";
 import { z } from "zod";
 
 import { connectMongo, isMongoConfigured } from "@/lib/db/mongoose";
+import type { AdaptiveThresholdResult } from "@/lib/inbox/adaptiveThresholds";
+import type { FalsePositiveGuardResult } from "@/lib/inbox/falsePositiveGuard";
+import type { SessionStore } from "@/lib/inbox/sessionStore.types";
+import type { TemporalContextResult } from "@/lib/inbox/temporalContext.types";
+import type { UrgencyPredictorResult } from "@/lib/inbox/urgencyPredictor";
 import { InboxEvaluationLogModel } from "@/lib/models/InboxEvaluationLog";
 import { getAegisDataDir } from "@/lib/tickets/paths";
 
@@ -159,4 +164,342 @@ export async function appendInboxEvaluationLogEntries(
   await ensureInboxDataDir();
   const payload = entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n";
   await fs.appendFile(getInboxEvaluationLogPath(), payload, "utf8");
+}
+
+/**
+ * Aggregates how often the false-positive guard fired and how aggressively it reduced scores.
+ *
+ * Pipeline step: offline evaluation and tuning instrumentation for the post-scoring false-positive correction layer.
+ * False-positive scenario addressed: shows which suppression rules are actually reducing noisy inbox surfacing so thresholds can be tuned intentionally.
+ */
+export function computeFPGuardMetrics(
+  results: FalsePositiveGuardResult[]
+): {
+  guardActivationRate: number;
+  ruleBreakdown: Record<string, number>;
+  avgScoreReduction: number;
+  hardSuppressCount: number;
+} {
+  if (results.length === 0) {
+    return {
+      guardActivationRate: 0,
+      ruleBreakdown: {},
+      avgScoreReduction: 0,
+      hardSuppressCount: 0,
+    };
+  }
+
+  const activated = results.filter((result) => result.guardActivated);
+  const ruleBreakdown: Record<string, number> = {};
+  let totalReduction = 0;
+  let hardSuppressCount = 0;
+
+  for (const result of activated) {
+    for (const correction of result.corrections) {
+      ruleBreakdown[correction.rule] = (ruleBreakdown[correction.rule] ?? 0) + 1;
+      if (correction.delta < 0) {
+        totalReduction += Math.abs(correction.delta);
+      }
+      if (correction.rule === "feedback_memory_hard_suppress") {
+        hardSuppressCount += 1;
+      }
+    }
+  }
+
+  return {
+    guardActivationRate: Number(
+      ((activated.length / results.length) * 100).toFixed(2)
+    ),
+    ruleBreakdown,
+    avgScoreReduction:
+      activated.length > 0
+        ? Number((totalReduction / activated.length).toFixed(2))
+        : 0,
+    hardSuppressCount,
+  };
+}
+
+/**
+ * Computes summary metrics for predictive urgency behavior across a batch of scored emails.
+ *
+ * Pipeline step: evaluation-only instrumentation for the predictive urgency layer.
+ * False-positive scenario addressed: helps verify whether predictive boosts and suppressions are firing in the expected contexts instead of inflating noise.
+ */
+export function computeUrgencyPredictorMetrics(
+  predictions: UrgencyPredictorResult[],
+  outcomes: string[]
+): {
+  avgPredictionConfidence: number;
+  boostRate: number;
+  suppressRate: number;
+  avgBoostMagnitude: number;
+  avgSuppressMagnitude: number;
+  temporalContextBreakdown: Record<string, number>;
+  dominantPredictionFactor: string;
+} {
+  const sampleSize = Math.min(predictions.length, outcomes.length || predictions.length);
+  if (sampleSize === 0) {
+    return {
+      avgPredictionConfidence: 0,
+      boostRate: 0,
+      suppressRate: 0,
+      avgBoostMagnitude: 0,
+      avgSuppressMagnitude: 0,
+      temporalContextBreakdown: {},
+      dominantPredictionFactor: "none",
+    };
+  }
+
+  const predictionSlice = predictions.slice(0, sampleSize);
+  const boosts = predictionSlice.filter((prediction) => prediction.urgencyDelta > 0);
+  const suppressions = predictionSlice.filter((prediction) => prediction.urgencyDelta < 0);
+  const temporalContextBreakdown: Record<string, number> = {};
+  const factorCounts: Record<string, number> = {};
+
+  for (const prediction of predictionSlice) {
+    temporalContextBreakdown[prediction.temporalContext] =
+      (temporalContextBreakdown[prediction.temporalContext] ?? 0) + 1;
+    for (const factor of prediction.predictionFactors) {
+      factorCounts[factor.factor] = (factorCounts[factor.factor] ?? 0) + 1;
+    }
+  }
+
+  let dominantPredictionFactor = "none";
+  let dominantFactorCount = 0;
+  for (const [factor, count] of Object.entries(factorCounts)) {
+    if (count > dominantFactorCount) {
+      dominantPredictionFactor = factor;
+      dominantFactorCount = count;
+    }
+  }
+
+  return {
+    avgPredictionConfidence: Number(
+      (
+        predictionSlice.reduce(
+          (sum, prediction) => sum + prediction.predictionConfidence,
+          0
+        ) / sampleSize
+      ).toFixed(2)
+    ),
+    boostRate: Number(((boosts.length / sampleSize) * 100).toFixed(2)),
+    suppressRate: Number(((suppressions.length / sampleSize) * 100).toFixed(2)),
+    avgBoostMagnitude:
+      boosts.length > 0
+        ? Number(
+            (
+              boosts.reduce((sum, prediction) => sum + prediction.urgencyDelta, 0) /
+              boosts.length
+            ).toFixed(2)
+          )
+        : 0,
+    avgSuppressMagnitude:
+      suppressions.length > 0
+        ? Number(
+            (
+              suppressions.reduce(
+                (sum, prediction) => sum + Math.abs(prediction.urgencyDelta),
+                0
+              ) / suppressions.length
+            ).toFixed(2)
+          )
+        : 0,
+    temporalContextBreakdown,
+    dominantPredictionFactor,
+  };
+}
+
+/**
+ * Measures how much adaptive thresholds are drifting over time and how close they appear to stabilization.
+ *
+ * Pipeline step: evaluation-only instrumentation for repeated adaptive threshold runs.
+ * False-positive scenario addressed: catches unstable self-tuning behavior before threshold drift starts creating new false-positive patterns.
+ */
+export function computeAdaptiveThresholdMetrics(
+  history: AdaptiveThresholdResult[]
+): {
+  thresholdDriftMap: Record<string, number>;
+  mostAdjustedThreshold: string;
+  stabilityScore: number;
+  cyclesUntilConvergence: number;
+} {
+  if (history.length === 0) {
+    return {
+      thresholdDriftMap: {},
+      mostAdjustedThreshold: "none",
+      stabilityScore: 100,
+      cyclesUntilConvergence: 0,
+    };
+  }
+
+  const keys = Object.keys(history[0].recommended) as Array<
+    keyof AdaptiveThresholdResult["recommended"]
+  >;
+  const thresholdDriftMap: Record<string, number> = {};
+
+  for (const key of keys) {
+    const first = history[0].recommended[key];
+    const last = history[history.length - 1].recommended[key];
+    thresholdDriftMap[key] = Number((last - first).toFixed(2));
+  }
+
+  let mostAdjustedThreshold = "none";
+  let maxDrift = 0;
+  for (const [threshold, drift] of Object.entries(thresholdDriftMap)) {
+    if (Math.abs(drift) > maxDrift) {
+      mostAdjustedThreshold = threshold;
+      maxDrift = Math.abs(drift);
+    }
+  }
+
+  const transitionMagnitudes: number[] = [];
+  for (let index = 1; index < history.length; index += 1) {
+    const previous = history[index - 1].recommended;
+    const current = history[index].recommended;
+    const avgTransition =
+      keys.reduce(
+        (sum, key) => sum + Math.abs(current[key] - previous[key]),
+        0
+      ) / keys.length;
+    transitionMagnitudes.push(avgTransition);
+  }
+
+  const recentVelocity =
+    transitionMagnitudes.length > 0
+      ? transitionMagnitudes
+          .slice(-3)
+          .reduce((sum, value) => sum + value, 0) /
+        Math.min(3, transitionMagnitudes.length)
+      : 0;
+  const stabilityScore = Math.max(
+    0,
+    Math.min(100, Number((100 - recentVelocity * 18).toFixed(2)))
+  );
+  const cyclesUntilConvergence =
+    recentVelocity <= 0.25 ? 1 : Math.ceil(recentVelocity / 0.25);
+
+  return {
+    thresholdDriftMap,
+    mostAdjustedThreshold,
+    stabilityScore,
+    cyclesUntilConvergence,
+  };
+}
+
+/**
+ * Summarizes the structure of one in-memory session store for observability and tuning.
+ *
+ * Pipeline step: evaluation-only instrumentation for the request-scoped local-first temporal store.
+ * False-positive scenario addressed: confirms the store is being populated and updated as expected before temporal detectors consume it.
+ */
+export function computeSessionStoreMetrics(
+  store: SessionStore
+): {
+  totalRecords: number;
+  emailCount: number;
+  distinctDomainHashes: number;
+  distinctThreadHashes: number;
+  distinctClusters: number;
+  clusterBreakdown: Record<string, number>;
+  avgReceivedAtSpanHours: number;
+  recordsWithScores: number;
+} {
+  const clusterBreakdown: Record<string, number> = {};
+  for (const [clusterKey, records] of store.byCluster.entries()) {
+    clusterBreakdown[clusterKey] = records.length;
+  }
+
+  const receivedTimes = store.allRecords.map((record) => record.receivedAt);
+  const minReceivedAt = receivedTimes.length > 0 ? Math.min(...receivedTimes) : 0;
+  const maxReceivedAt = receivedTimes.length > 0 ? Math.max(...receivedTimes) : 0;
+
+  return {
+    totalRecords: store.allRecords.length,
+    emailCount: store.emailCount,
+    distinctDomainHashes: store.bySenderDomain.size,
+    distinctThreadHashes: store.byThreadKey.size,
+    distinctClusters: store.byCluster.size,
+    clusterBreakdown,
+    avgReceivedAtSpanHours:
+      receivedTimes.length > 1
+        ? Number((((maxReceivedAt - minReceivedAt) / 3_600_000)).toFixed(2))
+        : 0,
+    recordsWithScores: store.allRecords.filter((record) => record.priorityScore > 0).length,
+  };
+}
+
+/**
+ * Summarizes how often temporal-context signals fire inside the current scoring batch.
+ *
+ * Pipeline step: evaluation-only instrumentation for the session-based temporal detectors.
+ * False-positive scenario addressed: helps verify whether silence, thread, and convergence boosts are activating at the right rate instead of becoming background inflation.
+ */
+export function computeTemporalContextMetrics(
+  results: TemporalContextResult[]
+): {
+  silenceBreakRate: number;
+  unresolvedThreadRate: number;
+  convergingSignalRate: number;
+  avgUrgencyDelta: number;
+  avgThreatDelta: number;
+  routingOverrideRate: number;
+  campaignTypeBreakdown: Record<string, number>;
+  clusterConvergenceMap: Record<string, number>;
+  anyCoordinatedAttack: boolean;
+} {
+  if (results.length === 0) {
+    return {
+      silenceBreakRate: 0,
+      unresolvedThreadRate: 0,
+      convergingSignalRate: 0,
+      avgUrgencyDelta: 0,
+      avgThreatDelta: 0,
+      routingOverrideRate: 0,
+      campaignTypeBreakdown: {},
+      clusterConvergenceMap: {},
+      anyCoordinatedAttack: false,
+    };
+  }
+
+  const silenceBreakHits = results.filter((result) => result.silenceBreak.detected);
+  const unresolvedThreadHits = results.filter((result) => result.unresolvedThread.detected);
+  const convergingSignalHits = results.filter((result) => result.convergingSignal.detected);
+  const routingOverrideHits = results.filter((result) => Boolean(result.routingOverride));
+  const campaignTypeBreakdown: Record<string, number> = {};
+  const clusterConvergenceMap: Record<string, number> = {};
+
+  for (const result of convergingSignalHits) {
+    campaignTypeBreakdown[result.convergingSignal.campaignType] =
+      (campaignTypeBreakdown[result.convergingSignal.campaignType] ?? 0) + 1;
+    clusterConvergenceMap[result.convergingSignal.clusterKey] =
+      (clusterConvergenceMap[result.convergingSignal.clusterKey] ?? 0) + 1;
+  }
+
+  return {
+    silenceBreakRate: Number(((silenceBreakHits.length / results.length) * 100).toFixed(2)),
+    unresolvedThreadRate: Number(
+      ((unresolvedThreadHits.length / results.length) * 100).toFixed(2)
+    ),
+    convergingSignalRate: Number(
+      ((convergingSignalHits.length / results.length) * 100).toFixed(2)
+    ),
+    avgUrgencyDelta: Number(
+      (
+        results.reduce((sum, result) => sum + result.totalUrgencyDelta, 0) / results.length
+      ).toFixed(2)
+    ),
+    avgThreatDelta: Number(
+      (
+        results.reduce((sum, result) => sum + result.totalThreatDelta, 0) / results.length
+      ).toFixed(2)
+    ),
+    routingOverrideRate: Number(
+      ((routingOverrideHits.length / results.length) * 100).toFixed(2)
+    ),
+    campaignTypeBreakdown,
+    clusterConvergenceMap,
+    anyCoordinatedAttack: convergingSignalHits.some(
+      (result) => result.convergingSignal.campaignType === "coordinated_attack"
+    ),
+  };
 }
