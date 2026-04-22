@@ -1,6 +1,6 @@
 # Aegis Desk
 
-> Aegis Desk turns inbox uncertainty into prioritized, verified action.
+> An AI workspace for uncertain email: verify who is behind a message, decide what to do next, and respond with confidence.
 
 ![Next.js](https://img.shields.io/badge/Next.js-16-black)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5-blue)
@@ -10,132 +10,124 @@
 
 ## Video Walkthrough
 
-Video URL: https://www.loom.com/share/ba94b6a455b84ab5bcd2375a7d6b9025
+Video URL: _Add Loom or walkthrough link here_
 
 ## Problem Statement
 
-Inbox overload is usually described as a volume problem. In practice, it is often a **trust and prioritization problem**.
+I built Aegis Desk around a moment that felt small at first, but stuck with me.
 
-I built Aegis Desk from a moment that felt small at first, but stayed with me. While applying for jobs and internships, I found a message in my spam folder about a role I may actually have applied to. The sender looked real. The company looked real. The opportunity looked relevant. But because it landed in spam, it immediately created doubt.
+While applying for jobs and internships, I found a message in my spam folder about a role I may actually have applied to. The sender looked real. The company looked real. The opportunity looked relevant. But the fact that it landed in spam immediately created doubt.
 
-I remember the exact tension: **if I ignore this, I might miss something important. If I trust it too quickly, I might get fooled.**
+I remember the exact tension: if I ignore this, I might miss something important. If I trust it too quickly, I might get fooled.
 
-That tension is not unique to job search. It shows up anytime an inbox contains messages that feel relevant, urgent, or consequential, but do not arrive with enough trust context to make the next step obvious. The hardest messages are rarely obvious spam. They are the ones in the middle:
+That is the real problem Aegis Desk is trying to solve.
 
-* recruiter outreach from an unfamiliar sender
-* contract or legal follow-ups without enough context
-* vendor or payment requests with pressure to act quickly
-* operational email that seems relevant but still feels off
-* promotional noise competing with genuinely time-sensitive communication
+Most inbox tools focus on organization.
+Aegis Desk starts from a more human question:
 
-Most inbox tools help organize messages after they arrive. They do not do enough for the moment when a user has to decide whether a message deserves attention, skepticism, escalation, or a response.
+**When an email looks important, but you are not fully sure you should trust it, how do you decide what to do next with confidence?**
 
-That is the workflow problem Aegis Desk focuses on:
+That feeling is easy to relate to, even outside job search:
 
-1. deciding which messages deserve deeper attention
-2. deciding whether the sender or entity is trustworthy enough to act on
-3. deciding when outside research is needed before responding
-4. preserving a reasoning trail so the recommendation can be inspected later
+- a recruiter email that lands in spam
+- a contract follow-up from a sender you do not recognize immediately
+- a vendor or payment request with pressure to act quickly
+- a legal or operational message that seems relevant, but still feels off
+- a noisy inbox where promotions and fake urgency compete with messages that actually matter
 
-Aegis Desk is built for people whose inbox contains real decisions, not just routine correspondence:
+The audience most affected is anyone whose inbox contains important but ambiguous decisions:
 
-* job seekers triaging recruiter or hiring-related email
-* founders, operators, and independent professionals handling legal, vendor, or payment-related communication
-* consultants and freelancers evaluating unfamiliar inbound requests
-* support or operations teams reviewing ambiguous external outreach
-* anyone dealing with a mix of routine noise and potentially important but unverified messages
+- job seekers
+- freelancers and consultants
+- founders and operators
+- support or operations teams
+- people who receive unfamiliar but potentially important outreach
 
-The common thread is not industry. It is **uncertainty**.
+If this problem is solved well, the experience changes in a meaningful way:
 
-### Why This Matters
+- legitimate important messages surface quickly without being drowned out by promo noise
+- suspicious messages are treated as verification problems, not blindly trusted or blindly discarded
+- users get a clear next step, not just a label
+- email triage, reasoning, drafting, and escalation happen in one workflow
 
-Email is still where some of the highest-stakes decisions begin, but most inbox products reduce the problem to simple binaries: spam or not spam, important or not important, safe or unsafe. That misses the real-world middle ground.
+Success for Aegis Desk is not just "better spam filtering."
+It is helping someone look at an uncertain message and say:
+
+- I understand why this matters
+- I understand why it may or may not be trustworthy
+- I know what to do next
+
+## Why This Matters
+
+Email is still where some of the highest-stakes decisions happen, but current inbox products often collapse everything into a simple binary:
+
+- spam vs not spam
+- important vs not important
+- safe vs unsafe
+
+That misses the real-world middle ground.
 
 Some emails are legitimate but uncertain.
-Some are suspicious precisely because they look relevant.
-Some create fake urgency and steal attention from what actually matters.
+Some emails are suspicious precisely because they look relevant.
+Some promotional messages create fake urgency and steal attention from things that actually matter.
 
-Aegis Desk is meant to be an **intelligence layer**, not just a sorting layer. Its goal is to help a user answer:
+Aegis Desk is meant to be an **intelligence layer**, not just a sorting layer.
+The goal is to help a user answer:
 
-* Is this message real?
-* How urgent is it actually?
-* What evidence supports that judgment?
-* What should I do next?
-
-### What Success Looks Like
-
-Success here is not perfect classification. It is **better decisions at the point of uncertainty**.
-
-In practice, that means:
-
-* important messages are less likely to be buried under noise
-* suspicious messages are treated as verification problems, not automatically trusted or discarded
-* the user gets a recommendation with evidence, not just a label
-* follow-up drafting happens after trust evaluation, not before
-* ambiguous cases are pushed toward review instead of false certainty
-
-If measured in a production setting, success would look like:
-
-* fewer false high-priority promotions or newsletters
-* better recovery of legitimate messages that would otherwise be ignored
-* stronger calibration between confidence and actual uncertainty
-* better follow-through quality after a recommendation is made
-
-At its core, Aegis Desk is built around one simple question:
-
-> **When an email looks important, but you are not fully sure you should trust it, how do you decide what to do next with confidence?**
+- Is this message real?
+- How urgent is it really?
+- What evidence supports that judgment?
+- What should I do next?
 
 ## Solution Overview
 
-Aegis Desk is a trust-first inbox workflow system. It is designed less like a chatbot and more like a working desk for triage, verification, and action.
+Aegis Desk is a Next.js App Router application with three connected surfaces:
 
+1. **Inbox Scanner**
+   Scans manual or Gmail-sourced email, classifies messages, scores priority, estimates uncertainty, and proposes a trusted next action.
+2. **Agent Desk**
+   Turns a selected email into a structured analysis workflow: planning, research, entity profiling, evidence synthesis, reply drafting, and calendar artifact generation.
+3. **Tickets / Admin Desk**
+   Escalates high-stakes messages into a helpdesk-style workflow with local-first persistence and optional Peppermint sync.
 
+The core product idea is:
 
-The current product flow is organized around a simple sequence:
+- deterministic safety controls handle policy, risk caps, and offline mode
+- AI handles planning, synthesis, research interpretation, and structured drafting
+- the user sees a decision-oriented workspace instead of disconnected tools
 
+Key capabilities:
 
-1. scan and normalize inbound email
-2. score what deserves attention now versus later
-3. classify likely mail type and risk
-4. decide whether the thread needs deeper review
-5. research and profile relevant people, companies, or entities
-6. synthesize an evidence-backed recommendation
-7. draft a response or create follow-through artifacts
+- Gmail OAuth connection and manual email scanning
+- priority routing into `high`, `medium`, and `low`
+- mail classification into `spam`, `harmful`, `actionable`, and `informational`
+- deterministic decision-importance scoring for urgency, threat, relevance, opportunity, and noise
+- optional **LLM Council Consensus** for ambiguous or high-stakes cases, with single-model mode as the default for cost control
+- entity profiling and external research through LinkUp
+- optional Respan tracing and prompt-managed synthesis
+- reply draft and ICS generation
+- local-first auth and ticketing with Mongo fallback support
+- offline-enforced mode that blocks external AI and research calls
 
-### Product surfaces in the current build
+### What role does AI play?
 
-- **Inbox Scanner**  
-  The inbox intake surface. It supports manual input and optional Gmail-connected scans, then returns priority, class, uncertainty, and recommended action.
-- **Review Queue**  
-  The triage layer. Instead of forcing the user to read their inbox linearly, it surfaces what the system believes deserves attention first.
-- **Agent Desk**  
-  The deeper analysis workspace. This is where Aegis plans next steps, gathers evidence, profiles entities, and produces a final structured output.
-- **Tickets / Follow-through layer**  
-  A place to turn uncertain messages into owned work once they need a response, escalation, or tracking.
+AI is **core**, but intentionally bounded.
 
-### What Aegis Desk does differently
+Without AI, the app could still score deterministic signals and enforce safety policy, but it would be much worse at:
 
+- turning messy inbox context into a structured plan
+- extracting and profiling entities
+- synthesizing external evidence into an explanation
+- drafting a useful reply
+- adapting analysis output to the actual email context instead of a fixed template
 
+The meaningful improvement over a non-AI approach is not "classification for classification's sake."
+It is the combination of:
 
-
-
-
-Aegis Desk does not stop at labeling email. It tries to support the decision around the email.
-
-That means it is built to:
-
-
-
-- separate importance from mere urgency language
-- separate suspicion from certainty of harm
-- research sender and entity context before drafting a response
-- preserve uncertainty when the system does not have enough evidence
-- make the reasoning trail visible instead of hiding it behind a confident answer
-
-> This is why I do not frame it as a generic spam filter, a phishing-only tool, or a simple summarizer. The value is in the workflow: triage, verification, analysis, and action in one path.
-
-
-
+- evidence-backed reasoning
+- context-sensitive drafting
+- research-assisted profiling
+- decision support at the moment of uncertainty
 
 ## AI Integration
 
@@ -217,14 +209,14 @@ The system uses a practical hybrid of chaining and retrieval:
 - making dynamic research plans for detected entities
 - adapting output sections to the context instead of forcing every email into a contract-only frame
 
-### Where AI fell short
+### Where product structure matters most
 
-- legitimate high-stakes emails can still look scam-like
-- promo language can create misleading urgency if not actively suppressed
-- fallback conditions can still force extra human review even for low-value mail
-- personalized inbox preferences need more learning depth than a one-shot LLM call can provide
+- legitimate high-stakes emails often benefit from an extra verification step because relevance and risk can look similar on a first pass
+- promotional language is unusually good at imitating urgency, so the system explicitly separates wording intensity from true decision importance
+- conservative fallback paths are designed to protect trust first, even if that occasionally means routing a lower-value message into review
+- personalized inbox behavior improves most when it is shaped by accumulated feedback and historical patterns rather than a one-shot model judgment
 
-That gap is exactly why the system now leans on deterministic decision logic, feedback memory, and explicit guardrails instead of handing classification entirely to the model.
+That is exactly why the system combines model reasoning with deterministic decision logic, feedback memory, and explicit guardrails instead of treating classification as a model-only problem.
 
 ## Architecture / Design Decisions
 
