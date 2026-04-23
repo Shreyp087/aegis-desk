@@ -1,15 +1,16 @@
 /**
- * Derived signal record for one email within the current session.
- * Contains NO email content. NO PII. NO raw text.
- * Built from pipeline outputs only - safe by construction.
+ * One derived-signal record per email in the current batch.
  *
- * Privacy invariant: every field must be explainable to a
- * regulator without referencing email content, names, or addresses.
+ * PRIVACY INVARIANT - enforced by buildSessionStore() signature:
+ * Every field is a pipeline output (hash, score, label, timestamp).
+ * No email content. No sender names. No addresses. No subjects.
+ * A user can read this file to a regulator without mentioning
+ * a single email.
  */
 export type SessionEmailRecord = {
   senderDomainHash: string;
   threadKeyHash: string;
-  clusterKey: string;
+  clusterKey: ClusterKey;
   receivedAt: number;
   priorityScore: number;
   priorityBand: "high" | "medium" | "low";
@@ -21,17 +22,29 @@ export type SessionEmailRecord = {
   routingAction: string;
   fpGuardActivated: boolean;
   fpGuardDelta: number;
+  scored: boolean;
 };
+
+/**
+ * The six cluster labels - exhaustive, no other values permitted.
+ * Used as keys in byCluster Map and for convergence detection.
+ */
+export type ClusterKey =
+  | "financial_transaction"
+  | "payment_request"
+  | "executive_impersonation"
+  | "legal_pressure"
+  | "deadline_pressure"
+  | "general";
 
 /**
  * The in-memory session store.
  * One instance per /api/inbox request.
- * Discarded when the request completes.
+ * Built once before scoring. Updated per email during scoring.
+ * Abandoned (GC collected) after alerts[] is returned.
  *
- * Keyed by senderDomainHash for O(1) sender lookups.
- * Keyed by threadKeyHash for O(1) thread lookups.
- * All records also kept in receivedAt-sorted order
- * for cadence and convergence calculations.
+ * Three indexes for O(1) lookups by the three detectors.
+ * allRecords is the authoritative sorted list.
  */
 export type SessionStore = {
   bySenderDomain: Map<string, SessionEmailRecord[]>;

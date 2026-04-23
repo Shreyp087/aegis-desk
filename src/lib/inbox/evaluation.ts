@@ -395,14 +395,15 @@ export function computeAdaptiveThresholdMetrics(
 export function computeSessionStoreMetrics(
   store: SessionStore
 ): {
-  totalRecords: number;
   emailCount: number;
   distinctDomainHashes: number;
   distinctThreadHashes: number;
-  distinctClusters: number;
+  distinctClusterKeys: number;
   clusterBreakdown: Record<string, number>;
-  avgReceivedAtSpanHours: number;
-  recordsWithScores: number;
+  scoredCount: number;
+  unscoredCount: number;
+  batchSpanHours: number;
+  generalClusterRate: number;
 } {
   const clusterBreakdown: Record<string, number> = {};
   for (const [clusterKey, records] of store.byCluster.entries()) {
@@ -413,18 +414,27 @@ export function computeSessionStoreMetrics(
   const minReceivedAt = receivedTimes.length > 0 ? Math.min(...receivedTimes) : 0;
   const maxReceivedAt = receivedTimes.length > 0 ? Math.max(...receivedTimes) : 0;
 
+  const scoredCount = store.allRecords.filter((record) => record.scored).length;
+  const generalClusterCount = store.allRecords.filter(
+    (record) => record.clusterKey === "general"
+  ).length;
+
   return {
-    totalRecords: store.allRecords.length,
     emailCount: store.emailCount,
     distinctDomainHashes: store.bySenderDomain.size,
     distinctThreadHashes: store.byThreadKey.size,
-    distinctClusters: store.byCluster.size,
+    distinctClusterKeys: store.byCluster.size,
     clusterBreakdown,
-    avgReceivedAtSpanHours:
+    scoredCount,
+    unscoredCount: Math.max(0, store.allRecords.length - scoredCount),
+    batchSpanHours:
       receivedTimes.length > 1
         ? Number((((maxReceivedAt - minReceivedAt) / 3_600_000)).toFixed(2))
         : 0,
-    recordsWithScores: store.allRecords.filter((record) => record.priorityScore > 0).length,
+    generalClusterRate:
+      store.allRecords.length > 0
+        ? Number(((generalClusterCount / store.allRecords.length) * 100).toFixed(2))
+        : 0,
   };
 }
 
@@ -438,11 +448,12 @@ export function computeTemporalContextMetrics(
   results: TemporalContextResult[]
 ): {
   silenceBreakRate: number;
+  silenceCrossSessionRate: number;
   unresolvedThreadRate: number;
   convergingSignalRate: number;
-  avgUrgencyDelta: number;
-  avgThreatDelta: number;
   routingOverrideRate: number;
+  avgTotalUrgencyDelta: number;
+  avgTotalThreatDelta: number;
   campaignTypeBreakdown: Record<string, number>;
   clusterConvergenceMap: Record<string, number>;
   anyCoordinatedAttack: boolean;
@@ -450,11 +461,12 @@ export function computeTemporalContextMetrics(
   if (results.length === 0) {
     return {
       silenceBreakRate: 0,
+      silenceCrossSessionRate: 0,
       unresolvedThreadRate: 0,
       convergingSignalRate: 0,
-      avgUrgencyDelta: 0,
-      avgThreatDelta: 0,
       routingOverrideRate: 0,
+      avgTotalUrgencyDelta: 0,
+      avgTotalThreatDelta: 0,
       campaignTypeBreakdown: {},
       clusterConvergenceMap: {},
       anyCoordinatedAttack: false,
@@ -462,6 +474,9 @@ export function computeTemporalContextMetrics(
   }
 
   const silenceBreakHits = results.filter((result) => result.silenceBreak.detected);
+  const silenceCrossSessionHits = results.filter((result) =>
+    result.temporalFlags.includes("temporal:silence_cross_session")
+  );
   const unresolvedThreadHits = results.filter((result) => result.unresolvedThread.detected);
   const convergingSignalHits = results.filter((result) => result.convergingSignal.detected);
   const routingOverrideHits = results.filter((result) => Boolean(result.routingOverride));
@@ -477,24 +492,27 @@ export function computeTemporalContextMetrics(
 
   return {
     silenceBreakRate: Number(((silenceBreakHits.length / results.length) * 100).toFixed(2)),
+    silenceCrossSessionRate: Number(
+      ((silenceCrossSessionHits.length / results.length) * 100).toFixed(2)
+    ),
     unresolvedThreadRate: Number(
       ((unresolvedThreadHits.length / results.length) * 100).toFixed(2)
     ),
     convergingSignalRate: Number(
       ((convergingSignalHits.length / results.length) * 100).toFixed(2)
     ),
-    avgUrgencyDelta: Number(
+    routingOverrideRate: Number(
+      ((routingOverrideHits.length / results.length) * 100).toFixed(2)
+    ),
+    avgTotalUrgencyDelta: Number(
       (
         results.reduce((sum, result) => sum + result.totalUrgencyDelta, 0) / results.length
       ).toFixed(2)
     ),
-    avgThreatDelta: Number(
+    avgTotalThreatDelta: Number(
       (
         results.reduce((sum, result) => sum + result.totalThreatDelta, 0) / results.length
       ).toFixed(2)
-    ),
-    routingOverrideRate: Number(
-      ((routingOverrideHits.length / results.length) * 100).toFixed(2)
     ),
     campaignTypeBreakdown,
     clusterConvergenceMap,

@@ -1,4 +1,4 @@
-import type { SessionStore } from "./sessionStore.types";
+import type { ClusterKey, SessionStore } from "./sessionStore.types";
 
 export type SilenceBreakSignal = {
   detected: boolean;
@@ -13,8 +13,8 @@ export type SilenceBreakSignal = {
 export type UnresolvedThreadSignal = {
   detected: boolean;
   threadKeyHash: string;
-  priorRecordCount: number;
-  earliestHoursAgo: number;
+  priorScoredCount: number;
+  hoursApart: number;
   priorMaxBand: "high" | "medium" | "low" | null;
   priorMaxAction: string | null;
   urgencyBoost: number;
@@ -24,7 +24,7 @@ export type UnresolvedThreadSignal = {
 
 export type ConvergingSignalSignal = {
   detected: boolean;
-  clusterKey: string;
+  clusterKey: ClusterKey;
   distinctDomains: number;
   signalStrength: number;
   urgencyBoost: number;
@@ -46,17 +46,22 @@ export type TemporalContextResult = {
 export type TemporalContextInput = {
   senderDomainHash: string;
   threadKeyHash: string;
-  clusterKey: string;
+  clusterKey: ClusterKey;
   receivedAt: number;
+  trustGraph: {
+    senderScore: number;
+    seen: number;
+    lastSeen: Date | null;
+  };
   decisionProfile: {
     threat: number;
     urgency: number;
     primaryCategory: string;
     attentionType: string;
   };
-  trust: {
-    senderScore: number;
-    seen: number;
+  currentPriority?: {
+    priorityScore: number;
+    priorityBand: "high" | "medium" | "low";
   };
   store: SessionStore;
 };

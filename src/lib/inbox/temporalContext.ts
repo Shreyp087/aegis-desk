@@ -16,18 +16,18 @@ import type {
 /**
  * Clamps a number into an inclusive range.
  *
- * Pipeline step: shared helper used by all temporal detectors before any score delta is returned.
- * False-positive scenario addressed: prevents any single temporal signal from overpowering the base classifier and guardrail stack.
+ * Pipeline step: shared helper for the synchronous temporal detectors before any score delta is returned.
+ * False-positive scenario addressed: prevents any one temporal adjustment from overwhelming the base inbox scoring stack.
  */
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
 /**
- * Builds the zero-impact silence-break shape.
+ * Builds the default zero-impact silence-break payload.
  *
- * Pipeline step: returned when sender cadence evidence is too weak to justify an urgency boost.
- * False-positive scenario addressed: sparse sender activity inside the batch should never manufacture urgency.
+ * Pipeline step: returned whenever cadence evidence is too weak to justify temporal urgency amplification.
+ * False-positive scenario addressed: sparse sender activity should never manufacture urgency on its own.
  */
 function defaultSilenceBreakSignal(): SilenceBreakSignal {
   return {
@@ -37,37 +37,39 @@ function defaultSilenceBreakSignal(): SilenceBreakSignal {
     deviationFactor: 0,
     urgencyBoost: 0,
     confidence: 0,
-    rationale: "No meaningful within-batch silence break detected.",
+    rationale: "No meaningful silence break detected.",
   };
 }
 
 /**
- * Builds the zero-impact unresolved-thread shape.
+ * Builds the default zero-impact unresolved-thread payload.
  *
- * Pipeline step: returned when there is no scored prior record in the same thread for the current batch.
- * False-positive scenario addressed: prevents first-touch or already-suppressed threads from gaining false escalation pressure.
+ * Pipeline step: returned whenever no earlier scored thread record is eligible to carry urgency forward.
+ * False-positive scenario addressed: first-touch and previously suppressed threads stay suppressed.
  */
 function defaultUnresolvedThreadSignal(threadKeyHash: string): UnresolvedThreadSignal {
   return {
     detected: false,
     threadKeyHash,
-    priorRecordCount: 0,
-    earliestHoursAgo: 0,
+    priorScoredCount: 0,
+    hoursApart: 0,
     priorMaxBand: null,
     priorMaxAction: null,
     urgencyBoost: 0,
     routingOverride: null,
-    rationale: "No unresolved within-batch thread follow-up detected.",
+    rationale: "No unresolved thread follow-up detected.",
   };
 }
 
 /**
- * Builds the zero-impact converging-signal shape.
+ * Builds the default zero-impact converging-signal payload.
  *
- * Pipeline step: returned when cross-sender cluster evidence is too weak or too vague.
- * False-positive scenario addressed: avoids turning isolated medium-value messages into fake campaigns.
+ * Pipeline step: returned when cross-domain cluster evidence is too weak or too generic to matter.
+ * False-positive scenario addressed: prevents isolated medium-value messages from being misread as campaigns.
  */
-function defaultConvergingSignalSignal(clusterKey: string): ConvergingSignalSignal {
+function defaultConvergingSignalSignal(
+  clusterKey: TemporalContextInput["clusterKey"]
+): ConvergingSignalSignal {
   return {
     detected: false,
     clusterKey,
@@ -76,139 +78,192 @@ function defaultConvergingSignalSignal(clusterKey: string): ConvergingSignalSign
     urgencyBoost: 0,
     threatElevation: 0,
     campaignType: "ambiguous",
-    rationale: "No converging within-batch signal pattern detected.",
+    rationale: "No converging signal pattern detected.",
   };
 }
 
 /**
- * Converts a priority band into a comparable rank.
+ * Maps a priority band to a sortable rank.
  *
- * Pipeline step: unresolved-thread detection uses this to report the strongest prior band in the thread.
- * False-positive scenario addressed: ensures high-priority prior items outrank medium and low when computing carry-forward urgency.
+ * Pipeline step: unresolved-thread detection uses this to preserve the strongest prior thread band in its output.
+ * False-positive scenario addressed: ensures high-priority prior thread state outranks medium and low when summarizing thread pressure.
  */
-function bandRank(band: "high" | "medium" | "low" | null): number {
-  if (band === "high") return 3;
-  if (band === "medium") return 2;
-  if (band === "low") return 1;
+function bandRank(value: "high" | "medium" | "low" | null): number {
+  if (value === "high") return 3;
+  if (value === "medium") return 2;
+  if (value === "low") return 1;
   return 0;
 }
 
 /**
- * Detects whether the current email breaks the sender's within-batch cadence.
+ * Detects whether the current email breaks the sender's cadence pattern, first within the batch and then via the trust-graph bridge.
  *
- * Pipeline step: runs after base scoring and before false-positive correction so sender timing can amplify urgency without reading historical storage.
- * False-positive scenario addressed: ignores loose or low-confidence cadence patterns, especially for newsletter and marketing traffic.
+ * Pipeline step: runs after scoreEmail() and before the FP Guard so temporal silence can amplify urgency without any new persistence.
+ * False-positive scenario addressed: promotional senders and low-confidence cadence estimates are filtered out before any boost is applied.
  */
 function detectSilenceBreak(input: TemporalContextInput): SilenceBreakSignal {
   const empty = defaultSilenceBreakSignal();
   const senderRecords = getSenderRecords(input.store, input.senderDomainHash);
+
   if (
-    senderRecords.length < 3 ||
-    input.trust.seen < 4 ||
+    input.trustGraph.seen < 4 ||
     input.decisionProfile.primaryCategory === "newsletter" ||
     input.decisionProfile.primaryCategory === "sales_marketing"
   ) {
     return empty;
   }
 
-  const currentIndex = senderRecords.findIndex(
-    (record) =>
-      record.receivedAt === input.receivedAt &&
-      record.threadKeyHash === input.threadKeyHash
-  );
-  if (currentIndex <= 0) {
-    return empty;
+  if (senderRecords.length >= 3) {
+    const currentIndex = senderRecords.findIndex(
+      (record) =>
+        record.receivedAt === input.receivedAt && record.threadKeyHash === input.threadKeyHash
+    );
+    if (currentIndex <= 0) {
+      return empty;
+    }
+
+    const gaps = computeGapsHours(senderRecords);
+    const expectedGapHours = median(gaps);
+    if (expectedGapHours <= 0) {
+      return empty;
+    }
+
+    const priorRecord = senderRecords[currentIndex - 1];
+    const gapHours = (input.receivedAt - priorRecord.receivedAt) / 3_600_000;
+    const deviationFactor = gapHours / Math.max(0.5, expectedGapHours);
+
+    let confidence = 40;
+    if (senderRecords.length >= 6) confidence += 18;
+    else if (senderRecords.length >= 4) confidence += 10;
+    if (deviationFactor >= 3.5) confidence += 8;
+    if (expectedGapHours <= 4) confidence += 8;
+    if (senderRecords.length < 4) confidence -= 15;
+    confidence = clamp(confidence, 0, 100);
+
+    if (
+      deviationFactor < 2.2 ||
+      gapHours < 1.5 ||
+      confidence < 38 ||
+      input.decisionProfile.attentionType === "verify_now"
+    ) {
+      return {
+        ...empty,
+        gapHours: Number(gapHours.toFixed(2)),
+        expectedGapHours: Number(expectedGapHours.toFixed(2)),
+        deviationFactor: Number(deviationFactor.toFixed(2)),
+        confidence,
+      };
+    }
+
+    let urgencyBoost = deviationFactor > 5 ? 18 : deviationFactor >= 3.5 ? 13 : 8;
+    const priorScored = senderRecords
+      .slice(0, currentIndex)
+      .filter((record) => record.scored);
+    if (priorScored.length >= 2) {
+      const avgPrior =
+        priorScored.reduce((sum, record) => sum + record.priorityScore, 0) / priorScored.length;
+      if (avgPrior >= 60) {
+        urgencyBoost += 3;
+      }
+    }
+    if (input.decisionProfile.threat >= 55) {
+      urgencyBoost += 2;
+    }
+
+    return {
+      detected: true,
+      gapHours: Number(gapHours.toFixed(2)),
+      expectedGapHours: Number(expectedGapHours.toFixed(2)),
+      deviationFactor: Number(deviationFactor.toFixed(2)),
+      urgencyBoost: clamp(urgencyBoost, 0, 18),
+      confidence,
+      rationale: `Sender broke an intra-batch cadence of ${expectedGapHours.toFixed(1)}h after ${gapHours.toFixed(1)}h of silence.`,
+    };
   }
-
-  const gaps = computeGapsHours(senderRecords);
-  const expectedGapHours = median(gaps);
-  if (expectedGapHours <= 0) {
-    return empty;
-  }
-
-  const priorEmail = senderRecords[currentIndex - 1];
-  const currentGapHours = (input.receivedAt - priorEmail.receivedAt) / 3_600_000;
-  const deviationFactor = currentGapHours / Math.max(0.5, expectedGapHours);
-
-  let confidence = 35;
-  if (senderRecords.length >= 5) confidence += 18;
-  else if (senderRecords.length >= 4) confidence += 10;
-  if (deviationFactor >= 3.5) confidence += 8;
-  if (expectedGapHours <= 4) confidence += 8;
-  if (senderRecords.length < 4) confidence -= 20;
-  confidence = clamp(confidence, 0, 100);
 
   if (
-    confidence < 38 ||
-    deviationFactor < 2.2 ||
-    currentGapHours < 1.5 ||
+    input.trustGraph.lastSeen === null ||
+    input.trustGraph.seen < 5 ||
     input.decisionProfile.attentionType === "verify_now"
   ) {
+    return empty;
+  }
+
+  const crossSessionGapHours =
+    (input.receivedAt - input.trustGraph.lastSeen.getTime()) / 3_600_000;
+  const estimatedCadenceHours = (24 * 7) / Math.max(1, input.trustGraph.seen / 4);
+  if (estimatedCadenceHours > 72) {
+    return empty;
+  }
+
+  const deviationFactor = crossSessionGapHours / Math.max(0.5, estimatedCadenceHours);
+  let confidence = 28;
+  if (deviationFactor >= 3.5) confidence += 8;
+  if (estimatedCadenceHours <= 12) confidence += 8;
+  confidence = clamp(confidence, 0, 100);
+
+  if (deviationFactor < 2.5 || crossSessionGapHours < 4 || confidence < 38) {
     return {
       ...empty,
-      gapHours: Number(currentGapHours.toFixed(2)),
-      expectedGapHours: Number(expectedGapHours.toFixed(2)),
+      gapHours: Number(crossSessionGapHours.toFixed(2)),
+      expectedGapHours: Number(estimatedCadenceHours.toFixed(2)),
       deviationFactor: Number(deviationFactor.toFixed(2)),
       confidence,
     };
   }
 
   let urgencyBoost = deviationFactor > 5 ? 18 : deviationFactor >= 3.5 ? 13 : 8;
-  const priorRecords = senderRecords.slice(0, currentIndex);
-  const avgPriorityScore =
-    priorRecords.reduce((sum, record) => sum + record.priorityScore, 0) /
-    Math.max(1, priorRecords.length);
-  if (avgPriorityScore >= 60) urgencyBoost += 3;
-  if (input.decisionProfile.threat >= 55) urgencyBoost += 2;
-  urgencyBoost = clamp(urgencyBoost, 0, 18);
+  if (input.decisionProfile.threat >= 55) {
+    urgencyBoost += 2;
+  }
 
   return {
     detected: true,
-    gapHours: Number(currentGapHours.toFixed(2)),
-    expectedGapHours: Number(expectedGapHours.toFixed(2)),
+    gapHours: Number(crossSessionGapHours.toFixed(2)),
+    expectedGapHours: Number(estimatedCadenceHours.toFixed(2)),
     deviationFactor: Number(deviationFactor.toFixed(2)),
-    urgencyBoost,
+    urgencyBoost: clamp(urgencyBoost, 0, 18),
     confidence,
-    rationale: `Sender paused for ${currentGapHours.toFixed(1)}h against a normal ${expectedGapHours.toFixed(1)}h within-batch cadence.`,
+    rationale: `Cross-session silence break: sender reappeared after ${crossSessionGapHours.toFixed(1)}h against an estimated ${estimatedCadenceHours.toFixed(1)}h cadence.`,
   };
 }
 
 /**
- * Detects whether the current email is a follow-up to an already-scored, still-active thread in this batch.
+ * Detects whether the current email is a follow-up to an already-scored, still-actionable earlier email in the same thread.
  *
- * Pipeline step: runs after base scoring and before false-positive correction so thread follow-ups can inherit urgency from earlier scored records.
- * False-positive scenario addressed: only prior scored thread items count, so unscored placeholders and already-suppressed threads do not create fake escalation.
+ * Pipeline step: runs after scoreEmail() and before the FP Guard so thread continuity can compound urgency for later messages.
+ * False-positive scenario addressed: relies on the explicit scored flag so only completed earlier pipeline outputs can influence follow-up urgency.
  */
 function detectUnresolvedThread(input: TemporalContextInput): UnresolvedThreadSignal {
   const empty = defaultUnresolvedThreadSignal(input.threadKeyHash);
-  const threadRecords = getThreadRecords(input.store, input.threadKeyHash)
-    .filter((record) => record.receivedAt < input.receivedAt && record.priorityScore > 0)
-    .sort((a, b) => b.receivedAt - a.receivedAt);
+  const priorScored = getThreadRecords(input.store, input.threadKeyHash).filter(
+    (record) => record.scored && record.receivedAt < input.receivedAt
+  );
 
-  if (threadRecords.length === 0) {
+  if (priorScored.length === 0) {
     return empty;
   }
 
-  const mostRecent = threadRecords[0];
+  const mostRecent = priorScored[priorScored.length - 1];
+  const hoursApart = (input.receivedAt - mostRecent.receivedAt) / 3_600_000;
   const wasActionable =
     mostRecent.priorityBand === "high" ||
     mostRecent.priorityBand === "medium" ||
     mostRecent.trustedAction === "escalate" ||
     mostRecent.trustedAction === "quarantine";
-  const hoursApart = (input.receivedAt - mostRecent.receivedAt) / 3_600_000;
 
   if (
     (mostRecent.routingAction === "auto_triage" && mostRecent.priorityBand === "low") ||
     !wasActionable ||
     hoursApart < 0.25 ||
-    hoursApart > 48
+    hoursApart > 72
   ) {
     return {
       ...empty,
-      priorRecordCount: threadRecords.length,
-      earliestHoursAgo: Number(hoursApart.toFixed(2)),
+      priorScoredCount: priorScored.length,
+      hoursApart: Number(hoursApart.toFixed(2)),
       priorMaxBand: mostRecent.priorityBand,
-      priorMaxAction: mostRecent.trustedAction,
+      priorMaxAction: mostRecent.trustedAction || null,
     };
   }
 
@@ -224,20 +279,22 @@ function detectUnresolvedThread(input: TemporalContextInput): UnresolvedThreadSi
   ) {
     urgencyBoost += 3;
   }
-  if (threadRecords.length >= 3) urgencyBoost += 2;
+  if (priorScored.length >= 3) {
+    urgencyBoost += 2;
+  }
   urgencyBoost = clamp(urgencyBoost, 0, 22);
 
   let routingOverride: "escalate" | "human_review" | null = null;
-  let rationale = `Thread follow-up arrived ${hoursApart.toFixed(1)}h after an unresolved scored item in the same batch.`;
+  let rationale = `Follow-up to unresolved thread ${hoursApart.toFixed(1)}h after the last scored email.`;
   if (urgencyBoost >= 18 && hoursApart <= 4) {
     routingOverride = "escalate";
-    rationale = `Rapid follow-up to unresolved high-priority thread from ${hoursApart.toFixed(1)}h ago - escalating.`;
+    rationale = `Follow-up to unresolved ${mostRecent.priorityBand} priority thread from ${hoursApart.toFixed(1)}h ago - escalating.`;
   } else if (urgencyBoost >= 12 && input.decisionProfile.threat >= 55) {
     routingOverride = "human_review";
-    rationale = "Unresolved thread with elevated threat signals - routing to human review.";
+    rationale = `Unresolved thread with elevated threat (${input.decisionProfile.threat.toFixed(0)}) - human review.`;
   }
 
-  const strongestBand = threadRecords.reduce<"high" | "medium" | "low" | null>(
+  const priorMaxBand = priorScored.reduce<"high" | "medium" | "low" | null>(
     (current, record) =>
       bandRank(record.priorityBand) > bandRank(current) ? record.priorityBand : current,
     null
@@ -246,10 +303,10 @@ function detectUnresolvedThread(input: TemporalContextInput): UnresolvedThreadSi
   return {
     detected: true,
     threadKeyHash: input.threadKeyHash,
-    priorRecordCount: threadRecords.length,
-    earliestHoursAgo: Number(hoursApart.toFixed(2)),
-    priorMaxBand: strongestBand,
-    priorMaxAction: mostRecent.trustedAction,
+    priorScoredCount: priorScored.length,
+    hoursApart: Number(hoursApart.toFixed(2)),
+    priorMaxBand,
+    priorMaxAction: mostRecent.trustedAction || null,
     urgencyBoost,
     routingOverride,
     rationale,
@@ -257,13 +314,14 @@ function detectUnresolvedThread(input: TemporalContextInput): UnresolvedThreadSi
 }
 
 /**
- * Detects whether the current email participates in a multi-domain signal cluster inside the same batch.
+ * Detects whether the current email participates in a cross-domain cluster pattern inside the current batch.
  *
- * Pipeline step: runs after base scoring and before false-positive correction so coordinated patterns can elevate urgency and threat.
- * False-positive scenario addressed: ignores general clusters and promotional categories, requiring at least two other domains before any convergence boost is returned.
+ * Pipeline step: runs after scoreEmail() and before the FP Guard so same-batch campaigns can elevate urgency and threat.
+ * False-positive scenario addressed: ignores promotional/general clusters and requires at least two other domains before any convergence boost is returned.
  */
 function detectConvergingSignals(input: TemporalContextInput): ConvergingSignalSignal {
   const empty = defaultConvergingSignalSignal(input.clusterKey);
+
   if (
     input.clusterKey === "general" ||
     input.decisionProfile.primaryCategory === "newsletter" ||
@@ -272,13 +330,10 @@ function detectConvergingSignals(input: TemporalContextInput): ConvergingSignalS
     return empty;
   }
 
-  const clusterRecords = getClusterRecords(
-    input.store,
-    input.clusterKey,
-    input.senderDomainHash
-  ).filter((record) => record.priorityScore > 0 || record.receivedAt < input.receivedAt);
-
+  const clusterRecords = getClusterRecords(input.store, input.clusterKey, input.senderDomainHash)
+    .filter((record) => record.scored || record.receivedAt < input.receivedAt);
   const distinctDomains = new Set(clusterRecords.map((record) => record.senderDomainHash)).size;
+
   if (distinctDomains < 2) {
     return {
       ...empty,
@@ -286,18 +341,27 @@ function detectConvergingSignals(input: TemporalContextInput): ConvergingSignalS
     };
   }
 
-  const avgPriorityScore =
-    clusterRecords.reduce((sum, record) => sum + record.priorityScore, 0) /
-    Math.max(1, clusterRecords.length);
-  const hasBlockedOrQuarantined = clusterRecords.some(
+  let signalStrength = Math.min(55, distinctDomains * 17);
+  const scoredRecords = clusterRecords.filter((record) => record.scored);
+  const avgScore =
+    scoredRecords.length >= 2
+      ? scoredRecords.reduce((sum, record) => sum + record.priorityScore, 0) /
+        scoredRecords.length
+      : 0;
+  if (scoredRecords.length >= 2 && avgScore >= 60) {
+    signalStrength += 15;
+  }
+
+  const anyHarmful = clusterRecords.some(
     (record) => record.trustedAction === "quarantine" || record.trustedAction === "block"
   );
-
-  let signalStrength = Math.min(55, distinctDomains * 17);
-  if (avgPriorityScore >= 60) signalStrength += 15;
-  if (hasBlockedOrQuarantined) signalStrength += 20;
-  if (clusterRecords.length >= 4) signalStrength += 10;
-  signalStrength = clamp(Math.round(signalStrength), 0, 100);
+  if (anyHarmful) {
+    signalStrength += 20;
+  }
+  if (clusterRecords.length >= 4) {
+    signalStrength += 10;
+  }
+  signalStrength = clamp(signalStrength, 0, 100);
 
   const urgencyBoost = clamp(Math.round(signalStrength * 0.28), 0, 24);
   let threatElevation = 0;
@@ -305,9 +369,9 @@ function detectConvergingSignals(input: TemporalContextInput): ConvergingSignalS
     input.clusterKey === "financial_transaction" ||
     input.clusterKey === "payment_request"
   ) {
-    threatElevation = clamp(distinctDomains * 8, 0, 18);
+    threatElevation = Math.min(18, distinctDomains * 8);
   } else if (input.clusterKey === "executive_impersonation") {
-    threatElevation = clamp(distinctDomains * 9, 0, 18);
+    threatElevation = Math.min(18, distinctDomains * 9);
   }
 
   let campaignType: ConvergingSignalSignal["campaignType"] = "ambiguous";
@@ -316,12 +380,13 @@ function detectConvergingSignals(input: TemporalContextInput): ConvergingSignalS
     ["financial_transaction", "payment_request", "executive_impersonation"].includes(
       input.clusterKey
     ) &&
-    avgPriorityScore >= 55
+    scoredRecords.length >= 2 &&
+    avgScore >= 55
   ) {
     campaignType = "coordinated_attack";
   } else if (
     ["legal_pressure", "deadline_pressure"].includes(input.clusterKey) &&
-    !hasBlockedOrQuarantined &&
+    !anyHarmful &&
     distinctDomains >= 2
   ) {
     campaignType = "legitimate_convergence";
@@ -335,35 +400,37 @@ function detectConvergingSignals(input: TemporalContextInput): ConvergingSignalS
     urgencyBoost,
     threatElevation,
     campaignType,
-    rationale: `${distinctDomains} other domain(s) converged on ${input.clusterKey.replace(/_/g, " ")} within this batch.`,
+    rationale: `${distinctDomains} other sender domain(s) converged on ${input.clusterKey.replace(/_/g, " ")} in this batch.`,
   };
 }
 
 /**
- * Builds the combined temporal context for one email from the in-memory session store.
+ * Builds the combined temporal context for one email from the in-memory session store plus the trust-graph bridge.
  *
- * Pipeline step: runs after scoreEmail() and before false-positive correction, using only the current batch's hashed, derived state.
- * False-positive scenario addressed: caps temporal amplification so within-batch patterns can sharpen attention without laundering low-value noise into high-priority certainty.
+ * Pipeline step: runs after scoreEmail() and before the FP Guard so temporal context sharpens urgency and routing using only local derived signals.
+ * False-positive scenario addressed: enforces an anti-laundering cap so temporal boosts can amplify real signals without turning low-priority noise into high-priority mail.
  */
-export function buildTemporalContext(
-  input: TemporalContextInput
-): TemporalContextResult {
+export function buildTemporalContext(input: TemporalContextInput): TemporalContextResult {
   const silenceBreak = detectSilenceBreak(input);
   const unresolvedThread = detectUnresolvedThread(input);
   const convergingSignal = detectConvergingSignals(input);
 
-  const totalUrgencyDelta = clamp(
+  let totalUrgencyDelta =
     (silenceBreak.detected ? silenceBreak.urgencyBoost : 0) +
-      (unresolvedThread.detected ? unresolvedThread.urgencyBoost : 0) +
-      (convergingSignal.detected ? convergingSignal.urgencyBoost : 0),
-    0,
-    30
-  );
-  const totalThreatDelta = clamp(
-    convergingSignal.detected ? convergingSignal.threatElevation : 0,
-    0,
-    18
-  );
+    (unresolvedThread.detected ? unresolvedThread.urgencyBoost : 0) +
+    (convergingSignal.detected ? convergingSignal.urgencyBoost : 0);
+
+  if (
+    input.currentPriority?.priorityBand === "low" &&
+    input.currentPriority.priorityScore + totalUrgencyDelta > 74
+  ) {
+    totalUrgencyDelta = Math.max(0, 74 - input.currentPriority.priorityScore);
+  }
+
+  totalUrgencyDelta = clamp(totalUrgencyDelta, 0, 30);
+  const totalThreatDelta = convergingSignal.detected
+    ? clamp(convergingSignal.threatElevation, 0, 18)
+    : 0;
 
   const routingOverride = unresolvedThread.routingOverride
     ? unresolvedThread.routingOverride
@@ -373,8 +440,15 @@ export function buildTemporalContext(
       : null;
 
   const temporalFlags: string[] = [];
-  if (silenceBreak.detected) temporalFlags.push("temporal:silence_break");
-  if (unresolvedThread.detected) temporalFlags.push("temporal:unresolved_thread");
+  if (silenceBreak.detected) {
+    temporalFlags.push("temporal:silence_break");
+    if (silenceBreak.rationale.startsWith("Cross-session silence break")) {
+      temporalFlags.push("temporal:silence_cross_session");
+    }
+  }
+  if (unresolvedThread.detected) {
+    temporalFlags.push("temporal:unresolved_thread");
+  }
   if (convergingSignal.detected) {
     temporalFlags.push(`temporal:converging:${convergingSignal.clusterKey}`);
     temporalFlags.push(`temporal:campaign:${convergingSignal.campaignType}`);

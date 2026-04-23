@@ -89,6 +89,7 @@ import {
   hashSignal,
   updateRecord,
 } from "@/lib/inbox/sessionStore";
+import type { ClusterKey } from "@/lib/inbox/sessionStore.types";
 import { buildTemporalContext } from "@/lib/inbox/temporalContext";
 import type { TemporalContextResult } from "@/lib/inbox/temporalContext.types";
 import {
@@ -224,7 +225,7 @@ type ScoredEmail = ParsedEmail & ScoringSnapshot & {
 type SessionRecordMeta = {
   senderDomainHash: string;
   threadKeyHash: string;
-  clusterKey: string;
+  clusterKey: ClusterKey;
   receivedAtMs: number;
   preScorePrimaryCategory: string;
 };
@@ -2776,9 +2777,10 @@ export async function POST(req: Request) {
     const emails = await getEmails(parsed, buildPublicRequestUrl(req), cookieStore);
 
     const parsedEmails = emails.map((raw, idx) => parseRawEmail(raw, `email-${idx + 1}`));
-    const sortedEmails = [...parsedEmails].sort(
+    parsedEmails.sort(
       (a, b) => (a.receivedAt?.getTime() ?? 0) - (b.receivedAt?.getTime() ?? 0)
     );
+    const sortedEmails = parsedEmails;
     const threadProfiles = buildThreadProfiles(sortedEmails);
     const trustGraph = readTrustGraphCookie(cookieStore.get(TRUST_COOKIE)?.value);
     const incidentHintsByEmail = await loadIncidentHints(sortedEmails);
@@ -2935,29 +2937,29 @@ export async function POST(req: Request) {
         threadKeyHash: sessionMeta.threadKeyHash,
         clusterKey: sessionMeta.clusterKey,
         receivedAt: sessionMeta.receivedAtMs,
+        trustGraph: {
+          senderScore: trustScore,
+          seen: trustNodeForHistory?.seen ?? 0,
+          lastSeen: trustNodeForHistory ? new Date(trustNodeForHistory.lastSeen) : null,
+        },
         decisionProfile: {
           threat: decisionImportanceFromUrgency.threatScore,
           urgency: decisionImportanceFromUrgency.urgencyScore,
           primaryCategory: s.primaryCategory,
           attentionType: decisionImportanceFromUrgency.attentionType,
         },
-        trust: {
-          senderScore: trustScoreFromNode(senderNode),
-          seen: trustNodeForHistory?.seen ?? 0,
+        currentPriority: {
+          priorityScore: preTemporalPriority.priorityScore,
+          priorityBand: preTemporalPriority.priority,
         },
         store: sessionStore,
       });
-      const antiLaunderedUrgencyDelta =
-        preTemporalPriority.priority === "low" &&
-        preTemporalPriority.priorityScore + temporalContext.totalUrgencyDelta > 74
-          ? Math.max(0, 74 - preTemporalPriority.priorityScore)
-          : temporalContext.totalUrgencyDelta;
       const decisionImportance =
-        antiLaunderedUrgencyDelta !== 0 || temporalContext.totalThreatDelta !== 0
+        temporalContext.totalUrgencyDelta !== 0 || temporalContext.totalThreatDelta !== 0
           ? rebalanceDecisionImportanceProfile({
               ...decisionImportanceFromUrgency,
               urgencyScore: clamp(
-                decisionImportanceFromUrgency.urgencyScore + antiLaunderedUrgencyDelta,
+                decisionImportanceFromUrgency.urgencyScore + temporalContext.totalUrgencyDelta,
                 0,
                 100
               ),
@@ -2974,9 +2976,6 @@ export async function POST(req: Request) {
       });
       const urgencySignals = [
         ...temporalContext.temporalFlags,
-        ...(antiLaunderedUrgencyDelta !== temporalContext.totalUrgencyDelta
-          ? ["temporal:urgency_cap:74"]
-          : []),
         `temporal_context:${urgencyPrediction.temporalContext}`,
         `urgency_prediction:${urgencyPrediction.predictedUrgencyScore}/100 delta=${urgencyPrediction.urgencyDelta} confidence=${urgencyPrediction.predictionConfidence}/100`,
         ...urgencyPrediction.predictionFactors.map(
@@ -3415,6 +3414,11 @@ export async function POST(req: Request) {
               ? `Temporal context override: ${email.temporalContext.convergingSignal.rationale}`
               : routedDecision.reason,
         });
+        const temporalRoutingNote = email.temporalContext.routingOverride
+          ? ` Routing elevated by temporal context: ${email.temporalContext.temporalFlags
+              .filter((flag) => flag.startsWith("temporal:routing"))
+              .join(", ")}.`
+          : "";
         const decisionTrace = {
           ...buildDecisionTrace({
             primaryCategory: email.primaryCategory,
@@ -3433,7 +3437,7 @@ export async function POST(req: Request) {
             policyVersion: INBOX_POLICY_VERSION,
             modelVersion,
           }),
-          explanation: explanation.summary,
+          explanation: `${explanation.summary}${temporalRoutingNote}`,
         };
 
         const memoryRef = buildMemoryRef({
@@ -3631,6 +3635,11 @@ export async function POST(req: Request) {
             ? `Temporal context override: ${email.temporalContext.convergingSignal.rationale}`
             : routedDecision.reason,
       });
+      const temporalRoutingNote = email.temporalContext.routingOverride
+        ? ` Routing elevated by temporal context: ${email.temporalContext.temporalFlags
+            .filter((flag) => flag.startsWith("temporal:routing"))
+            .join(", ")}.`
+        : "";
       const decisionTrace = {
         ...buildDecisionTrace({
           primaryCategory: email.primaryCategory,
@@ -3649,7 +3658,7 @@ export async function POST(req: Request) {
           policyVersion: INBOX_POLICY_VERSION,
           modelVersion,
         }),
-        explanation: explanation.summary,
+        explanation: `${explanation.summary}${temporalRoutingNote}`,
       };
       const memoryRef = buildMemoryRef({
         raw: email.raw,
