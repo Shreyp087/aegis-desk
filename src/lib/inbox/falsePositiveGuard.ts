@@ -534,11 +534,14 @@ function applyFeedbackMemoryDecayCorrection(
   }
 
   const negativeOutcomes = input.history.outcomeLabels.filter(
-    (label) => label === "spam_false_positive" || label === "spam_true_positive"
+    (label) => label === "spam_true_positive"
   ).length;
   const positiveOutcomes = input.history.outcomeLabels.filter(
     (label) =>
-      label === "actionable_correct" || label === "informational_correct"
+      label === "actionable_correct" ||
+      label === "informational_correct" ||
+      label === "spam_false_positive" ||
+      label === "harmful_false_positive"
   ).length;
 
   if (

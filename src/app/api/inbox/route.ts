@@ -31,6 +31,10 @@ import {
   InboxUncertaintySchema,
 } from "@/lib/inbox/compatibility";
 import {
+  buildDecisionCapsule,
+  DecisionCapsuleSchema,
+} from "@/lib/inbox/decisionCapsule";
+import {
   ConsensusAgreementScoresSchema,
   ConsensusModelOutputSchema,
   defaultAgreementScores,
@@ -48,6 +52,15 @@ import {
   buildInboxEvaluationLogEntry,
 } from "@/lib/inbox/evaluation";
 import {
+  applyEventDecisionAdjustments,
+  applySensitiveEventBoosts,
+  inferInboxEvent,
+  InboxEventInferenceSchema,
+  InboxEventTypeEnum,
+  type InboxEventInference,
+} from "@/lib/inbox/eventTaxonomy";
+import { applyLearningCorrections } from "@/lib/inbox/learningCorrections";
+import {
   applyFalsePositiveGuard,
   type FalsePositiveGuardResult,
 } from "@/lib/inbox/falsePositiveGuard";
@@ -58,6 +71,14 @@ import {
   routeInboxDecision,
   type InboxDecisionPolicyConfig,
 } from "@/lib/inbox/decision";
+import {
+  ActionRouteEnum,
+  AttentionPriorityLevelEnum,
+  buildDecisionAxes,
+  buildDecisionAxesFeedbackLabel,
+  InboxDecisionAxesSchema,
+  SecuritySeverityLevelEnum,
+} from "@/lib/inbox/decisionAxes";
 import {
   buildDecisionImportanceProfile,
   rebalanceDecisionImportanceProfile,
@@ -208,6 +229,7 @@ type ScoringSnapshot = {
 };
 
 type ScoredEmail = ParsedEmail & ScoringSnapshot & {
+  eventContext: InboxEventInference;
   classifier: MailClassifierResult;
   incidentHints: IncidentHint[];
   temporalContext: TemporalContextResult;
@@ -309,8 +331,11 @@ const AlertSchema = z.object({
   priorityScore: z.number().min(0).max(100),
   priority: PriorityEnum,
   primaryCategory: CategoryEnum,
+  primaryEventType: InboxEventTypeEnum,
+  secondaryEventTags: z.array(InboxEventTypeEnum),
   mailClass: InboxMailClassEnum,
   threatType: InboxThreatTypeEnum,
+  eventContext: InboxEventInferenceSchema,
   decisionTrace: InboxDecisionTraceSchema,
   categoryScores: z.array(CategoryScoreSchema),
   riskTags: z.array(z.string()),
@@ -318,7 +343,12 @@ const AlertSchema = z.object({
   signalGroups: InboxSignalGroupsSchema,
   uncertainty: InboxUncertaintySchema,
   explanation: InboxExplanationSchema,
+  decisionCapsule: DecisionCapsuleSchema,
   decision: InboxDecisionSchema,
+  attentionPriority: AttentionPriorityLevelEnum,
+  securitySeverity: SecuritySeverityLevelEnum,
+  actionRoute: ActionRouteEnum,
+  decisionAxes: InboxDecisionAxesSchema,
   suggestedAction: z.string(),
   draftReply: z.string(),
   consensusScore: z.number().min(0).max(100),
@@ -2491,6 +2521,7 @@ async function loadIncidentHints(parsedEmails: ParsedEmail[]): Promise<Record<st
       trustedAction?: unknown;
       priorityScore?: unknown;
       outcomeLabel?: unknown;
+      primaryCategory?: unknown;
     }>;
 
     const out: Record<string, IncidentHint[]> = {};
@@ -2539,6 +2570,10 @@ async function loadIncidentHints(parsedEmails: ParsedEmail[]): Promise<Record<st
               : 50,
           outcomeLabel:
             typeof doc.outcomeLabel === "string" ? doc.outcomeLabel.trim() : "",
+          primaryCategory:
+            typeof doc.primaryCategory === "string"
+              ? doc.primaryCategory.trim()
+              : undefined,
         });
 
         if (hints.length >= 24) break;
@@ -2682,7 +2717,9 @@ async function persistInboxEvaluationLog(args: {
       buildInboxEvaluationLogEntry({
         messageId: alert.id,
         prediction: alert.mailClass,
-        rawPrediction: alert.classifier.predictedClass,
+        rawPrediction: `${alert.classifier.predictedClass}|${buildDecisionAxesFeedbackLabel(
+          alert.decisionAxes
+        )}`,
         confidence: alert.trustedDecision.confidencePct,
         rawModelConfidence: Math.max(
           alert.classifier.probabilities.spam,
@@ -2875,6 +2912,48 @@ export async function POST(req: Request) {
         thread,
         incidentHints,
       });
+      const eventContext = inferInboxEvent({
+        email: {
+          subject: email.subject,
+          body: email.body,
+          senderEmail: email.senderEmail,
+          senderDomain: email.senderDomain,
+          extracted: {
+            deadlines: email.extracted.deadlines,
+            moneyMentions: email.extracted.moneyMentions,
+            urls: email.extracted.urls,
+            attachments: email.extracted.attachments,
+            attachmentRiskScore: email.extracted.attachmentRiskScore,
+          },
+        },
+        scoring: {
+          primaryCategory: s.primaryCategory,
+          riskTags: s.riskTags,
+          trustScore: s.trustScore,
+          reputationScore: s.reputation.score,
+          promotional: s.promotional,
+          decisionImportance: s.decisionImportance,
+        },
+      });
+      const decisionImportanceFromEvent = rebalanceDecisionImportanceProfile(
+        applySensitiveEventBoosts(
+          applyEventDecisionAdjustments(s.decisionImportance, eventContext),
+          eventContext
+        )
+      );
+      const learningCorrection = applyLearningCorrections({
+        primaryCategory: s.primaryCategory,
+        decisionImportance: decisionImportanceFromEvent,
+        eventContext,
+        incidentHints,
+        promotional: s.promotional,
+        trust: {
+          score: trustScore,
+          seen: trustNodeForHistory?.seen ?? 0,
+          highCount: trustNodeForHistory?.high ?? 0,
+          mediumCount: trustNodeForHistory?.medium ?? 0,
+        },
+      });
       const predictiveHistory = predictiveHistoryByEmail[email.id] || {
         subjectHashes: [],
         priorPriorityScores: [],
@@ -2900,22 +2979,23 @@ export async function POST(req: Request) {
         },
         history: predictiveHistory,
         currentDecisionProfile: {
-          urgency: s.decisionImportance.urgencyScore,
-          relevance: s.decisionImportance.relevanceScore,
-          threat: s.decisionImportance.threatScore,
+          urgency: learningCorrection.adjustedProfile.urgencyScore,
+          relevance: learningCorrection.adjustedProfile.relevanceScore,
+          threat: learningCorrection.adjustedProfile.threatScore,
         },
       });
       const decisionImportanceFromUrgency =
         urgencyPrediction.urgencyDelta !== 0
           ? rebalanceDecisionImportanceProfile({
-              ...s.decisionImportance,
+              ...learningCorrection.adjustedProfile,
               urgencyScore: clamp(
-                s.decisionImportance.urgencyScore + urgencyPrediction.urgencyDelta,
+                learningCorrection.adjustedProfile.urgencyScore +
+                  urgencyPrediction.urgencyDelta,
                 0,
                 100
               ),
             })
-          : s.decisionImportance;
+          : learningCorrection.adjustedProfile;
       const sessionMeta = sessionMetaByEmailId[email.id] ?? {
         senderDomainHash: hashSignal(email.senderDomain || ""),
         threadKeyHash: hashSignal(email.threadKey || ""),
@@ -2975,6 +3055,22 @@ export async function POST(req: Request) {
         routineNoiseCap: effectiveThresholds.routineNoiseCap,
       });
       const urgencySignals = [
+        ...eventContext.eventSignals,
+        ...learningCorrection.signals,
+        ...(eventContext.sensitiveEvent.detected
+          ? [
+              `sensitive_event:${eventContext.sensitiveEvent.family}`,
+              `sensitive_event_confidence:${eventContext.sensitiveEvent.confidence}/100`,
+              `sensitive_event_attention_boost:${eventContext.sensitiveEvent.attentionBoost}`,
+              ...(eventContext.sensitiveEvent.securityBoost > 0
+                ? [`sensitive_event_security_boost:${eventContext.sensitiveEvent.securityBoost}`]
+                : []),
+            ]
+          : []),
+        `event_primary:${eventContext.primaryEventType}`,
+        ...(eventContext.secondaryTags.length > 0
+          ? [`event_secondary:${eventContext.secondaryTags.join(",")}`]
+          : []),
         ...temporalContext.temporalFlags,
         `temporal_context:${urgencyPrediction.temporalContext}`,
         `urgency_prediction:${urgencyPrediction.predictedUrgencyScore}/100 delta=${urgencyPrediction.urgencyDelta} confidence=${urgencyPrediction.predictionConfidence}/100`,
@@ -3150,16 +3246,27 @@ export async function POST(req: Request) {
         riskTags: finalRiskTags,
         signals: finalSignals,
         decisionImportance,
+        eventContext,
         classifier,
         incidentHints,
         temporalContext,
         urgencyPrediction,
         priorityGuardrail: {
-          adjusted: priorityGuardrail.adjusted || adaptivePriority.adjusted,
-          ruleHits: [...priorityGuardrail.ruleHits, ...adaptivePriority.ruleHits],
+          adjusted:
+            priorityGuardrail.adjusted ||
+            adaptivePriority.adjusted ||
+            learningCorrection.ruleHits.length > 0,
+          ruleHits: [
+            ...priorityGuardrail.ruleHits,
+            ...adaptivePriority.ruleHits,
+            ...learningCorrection.ruleHits,
+          ],
           rationale: [
             priorityGuardrail.rationale,
             ...(adaptivePriority.adjusted ? [adaptivePriority.rationale] : []),
+            ...(learningCorrection.ruleHits.length > 0
+              ? [learningCorrection.rationale]
+              : []),
           ]
             .filter(Boolean)
             .join(" "),
@@ -3391,13 +3498,6 @@ export async function POST(req: Request) {
           consensusStrength: finalAssist.consensus_strength,
           disagreementFlags: finalAssist.disagreement_flags,
         });
-        const explanation = buildExplanation({
-          primaryCategory: email.primaryCategory,
-          priorityScore: email.priorityScore,
-          trustedDecision,
-          signalGroups,
-          uncertainty,
-        });
         const routedDecision = routeInboxDecision({
           confidencePct: trustedDecision.confidencePct,
           uncertaintyPercent,
@@ -3413,6 +3513,44 @@ export async function POST(req: Request) {
             : email.temporalContext.routingOverride
               ? `Temporal context override: ${email.temporalContext.convergingSignal.rationale}`
               : routedDecision.reason,
+        });
+        const decisionAxes = buildDecisionAxes({
+          primaryCategory: email.primaryCategory,
+          priorityScore: email.priorityScore,
+          priorityBand: email.priority,
+          mailClass: classReconcile.mailClass,
+          decisionImportance: email.decisionImportance,
+          trustedDecision,
+          decision,
+          threatType: classReconcile.threatType,
+          classifier: email.classifier,
+          extracted: {
+            attachmentRiskScore: email.extracted.attachmentRiskScore,
+            urls: email.extracted.urls,
+            deadlines: email.extracted.deadlines,
+          },
+          riskTags: decisionRiskTags,
+          subject: email.subject,
+          bodyPreview: email.body,
+          temporalFlags: email.temporalContext.temporalFlags,
+          eventContext: email.eventContext,
+        });
+        const explanation = buildExplanation({
+          primaryCategory: email.primaryCategory,
+          priorityScore: email.priorityScore,
+          trustedDecision,
+          signalGroups,
+          uncertainty,
+          decisionAxes,
+          eventContext: email.eventContext,
+        });
+        const decisionCapsule = buildDecisionCapsule({
+          eventContext: email.eventContext,
+          attentionPriority: decisionAxes.attentionPriority.level,
+          securitySeverity: decisionAxes.securitySeverity.level,
+          actionRoute: decisionAxes.actionRoute.route,
+          uncertainty,
+          extracted: email.extracted,
         });
         const temporalRoutingNote = email.temporalContext.routingOverride
           ? ` Routing elevated by temporal context: ${email.temporalContext.temporalFlags
@@ -3436,6 +3574,12 @@ export async function POST(req: Request) {
             consensusScore: finalAssist.consensusScore,
             policyVersion: INBOX_POLICY_VERSION,
             modelVersion,
+            decisionAxes: {
+              attentionLevel: decisionAxes.attentionPriority.level,
+              securityLevel: decisionAxes.securitySeverity.level,
+              actionRoute: decisionAxes.actionRoute.route,
+            },
+            eventContext: email.eventContext,
           }),
           explanation: `${explanation.summary}${temporalRoutingNote}`,
         };
@@ -3455,8 +3599,11 @@ export async function POST(req: Request) {
           priorityScore: email.priorityScore,
           priority: email.priority,
           primaryCategory: email.primaryCategory,
+          primaryEventType: email.eventContext.primaryEventType,
+          secondaryEventTags: email.eventContext.secondaryTags,
           mailClass: classReconcile.mailClass,
           threatType: classReconcile.threatType,
+          eventContext: email.eventContext,
           decisionTrace,
           categoryScores: email.categoryScores,
           riskTags: decisionRiskTags,
@@ -3464,7 +3611,12 @@ export async function POST(req: Request) {
           signalGroups,
           uncertainty,
           explanation,
+          decisionCapsule,
           decision,
+          attentionPriority: decisionAxes.attentionPriority.level,
+          securitySeverity: decisionAxes.securitySeverity.level,
+          actionRoute: decisionAxes.actionRoute.route,
+          decisionAxes,
           suggestedAction: finalAssist.suggestedAction,
           draftReply: finalAssist.draftReply,
           consensusScore: finalAssist.consensusScore,
@@ -3612,13 +3764,6 @@ export async function POST(req: Request) {
         consensusStrength: 0.5,
         disagreementFlags: ["not_analyzed_budget_capped"],
       });
-      const explanation = buildExplanation({
-        primaryCategory: email.primaryCategory,
-        priorityScore: email.priorityScore,
-        trustedDecision,
-        signalGroups,
-        uncertainty,
-      });
       const routedDecision = routeInboxDecision({
         confidencePct: trustedDecision.confidencePct,
         uncertaintyPercent,
@@ -3634,6 +3779,44 @@ export async function POST(req: Request) {
           : email.temporalContext.routingOverride
             ? `Temporal context override: ${email.temporalContext.convergingSignal.rationale}`
             : routedDecision.reason,
+      });
+      const decisionAxes = buildDecisionAxes({
+        primaryCategory: email.primaryCategory,
+        priorityScore: email.priorityScore,
+        priorityBand: email.priority,
+        mailClass: classReconcile.mailClass,
+        decisionImportance: email.decisionImportance,
+        trustedDecision,
+        decision,
+        threatType: classReconcile.threatType,
+        classifier: email.classifier,
+        extracted: {
+          attachmentRiskScore: email.extracted.attachmentRiskScore,
+          urls: email.extracted.urls,
+          deadlines: email.extracted.deadlines,
+        },
+        riskTags: decisionRiskTags,
+        subject: email.subject,
+        bodyPreview: email.body,
+        temporalFlags: email.temporalContext.temporalFlags,
+        eventContext: email.eventContext,
+      });
+      const explanation = buildExplanation({
+        primaryCategory: email.primaryCategory,
+        priorityScore: email.priorityScore,
+        trustedDecision,
+        signalGroups,
+        uncertainty,
+        decisionAxes,
+        eventContext: email.eventContext,
+      });
+      const decisionCapsule = buildDecisionCapsule({
+        eventContext: email.eventContext,
+        attentionPriority: decisionAxes.attentionPriority.level,
+        securitySeverity: decisionAxes.securitySeverity.level,
+        actionRoute: decisionAxes.actionRoute.route,
+        uncertainty,
+        extracted: email.extracted,
       });
       const temporalRoutingNote = email.temporalContext.routingOverride
         ? ` Routing elevated by temporal context: ${email.temporalContext.temporalFlags
@@ -3657,6 +3840,12 @@ export async function POST(req: Request) {
           consensusScore: 50,
           policyVersion: INBOX_POLICY_VERSION,
           modelVersion,
+          decisionAxes: {
+            attentionLevel: decisionAxes.attentionPriority.level,
+            securityLevel: decisionAxes.securitySeverity.level,
+            actionRoute: decisionAxes.actionRoute.route,
+          },
+          eventContext: email.eventContext,
         }),
         explanation: `${explanation.summary}${temporalRoutingNote}`,
       };
@@ -3675,8 +3864,11 @@ export async function POST(req: Request) {
         priorityScore: email.priorityScore,
         priority: email.priority,
         primaryCategory: email.primaryCategory,
+        primaryEventType: email.eventContext.primaryEventType,
+        secondaryEventTags: email.eventContext.secondaryTags,
         mailClass: classReconcile.mailClass,
         threatType: classReconcile.threatType,
+        eventContext: email.eventContext,
         decisionTrace,
         categoryScores: email.categoryScores,
         riskTags: decisionRiskTags,
@@ -3684,7 +3876,12 @@ export async function POST(req: Request) {
         signalGroups,
         uncertainty,
         explanation,
+        decisionCapsule,
         decision,
+        attentionPriority: decisionAxes.attentionPriority.level,
+        securitySeverity: decisionAxes.securitySeverity.level,
+        actionRoute: decisionAxes.actionRoute.route,
+        decisionAxes,
         suggestedAction: "No action suggested (not analyzed).",
         draftReply: "No reply needed.",
         consensusScore: 50,

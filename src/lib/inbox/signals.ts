@@ -1,3 +1,5 @@
+import type { InboxDecisionAxes } from "./decisionAxes";
+import type { InboxEventInference } from "./eventTaxonomy";
 import type {
   InboxDecisionTrace,
   InboxMailClass,
@@ -17,6 +19,12 @@ export type DecisionTraceArgs = {
   consensusScore: number;
   policyVersion: string;
   modelVersion: string;
+  decisionAxes?: {
+    attentionLevel: InboxDecisionAxes["attentionPriority"]["level"];
+    securityLevel: InboxDecisionAxes["securitySeverity"]["level"];
+    actionRoute: InboxDecisionAxes["actionRoute"]["route"];
+  };
+  eventContext?: Pick<InboxEventInference, "primaryEventType" | "secondaryTags">;
 };
 
 function hasAny(tags: string[], values: string[]): boolean {
@@ -110,10 +118,22 @@ export function buildDecisionTrace(args: DecisionTraceArgs): InboxDecisionTrace 
   const explanation = [
     `Primary category ${args.primaryCategory}.`,
     `Trusted action ${args.trustedAction} at priority ${args.priorityScore}/100.`,
+    args.decisionAxes
+      ? `Attention ${args.decisionAxes.attentionLevel}, security ${args.decisionAxes.securityLevel}, route ${args.decisionAxes.actionRoute}.`
+      : null,
+    args.eventContext
+      ? `Primary event ${args.eventContext.primaryEventType}${
+          args.eventContext.secondaryTags.length > 0
+            ? ` with secondary tags ${args.eventContext.secondaryTags.join(", ")}`
+            : ""
+        }.`
+      : null,
     `Top category evidence: ${topSignals.join(", ") || "none"}.`,
     `Trust/Reputation ${args.trustScore}/${args.reputationScore}.`,
     `Thread depth ${args.threadDepth} (risk density ${args.threadRiskDensity}).`,
-  ].join(" ");
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   const evidenceRefs: InboxDecisionTrace["evidenceRefs"] = [];
 
@@ -147,6 +167,30 @@ export function buildDecisionTrace(args: DecisionTraceArgs): InboxDecisionTrace 
     ref: `consensus:${args.consensusScore}`,
     weight: Math.min(1, Math.max(0, args.consensusScore / 100)),
   });
+  if (args.decisionAxes) {
+    evidenceRefs.push({
+      type: "signal",
+      ref: `attention:${args.decisionAxes.attentionLevel}`,
+      weight: 0.5,
+    });
+    evidenceRefs.push({
+      type: "signal",
+      ref: `security:${args.decisionAxes.securityLevel}`,
+      weight: 0.6,
+    });
+    evidenceRefs.push({
+      type: "signal",
+      ref: `route:${args.decisionAxes.actionRoute}`,
+      weight: 0.55,
+    });
+  }
+  if (args.eventContext) {
+    evidenceRefs.push({
+      type: "signal",
+      ref: `event:${args.eventContext.primaryEventType}`,
+      weight: 0.58,
+    });
+  }
 
   return {
     policyVersion: args.policyVersion,

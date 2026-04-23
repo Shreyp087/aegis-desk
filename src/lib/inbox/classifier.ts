@@ -7,6 +7,7 @@ export type IncidentHint = {
   trustedAction: "allow" | "escalate" | "quarantine" | "block";
   priorityScore: number;
   outcomeLabel: string;
+  primaryCategory?: string;
 };
 
 export type MailClassifierInput = {
@@ -95,6 +96,10 @@ export function classifyInboxMail(input: MailClassifierInput): MailClassifierRes
 
   const learnedHints = input.incidentHints.filter((hint) => Boolean(hint.outcomeLabel));
   const memoryCount = learnedHints.length;
+  const sameCategoryHints = learnedHints.filter(
+    (hint) => hint.primaryCategory === input.primaryCategory
+  );
+  const sameCategoryCount = sameCategoryHints.length;
   const spamHistory =
     memoryCount === 0
       ? 0
@@ -124,6 +129,39 @@ export function classifyInboxMail(input: MailClassifierInput): MailClassifierRes
     memoryCount === 0
       ? 0
       : learnedHints.filter((h) => h.outcomeLabel === "harmful_true_positive").length / memoryCount;
+  const sameCategoryLowValue =
+    sameCategoryCount === 0
+      ? 0
+      : sameCategoryHints.filter(
+          (hint) =>
+            hint.outcomeLabel === "spam_true_positive" ||
+            (hint.outcomeLabel === "informational_correct" &&
+              hint.priorityScore < 40 &&
+              hint.mailClass !== "actionable")
+        ).length / sameCategoryCount;
+  const sameCategorySafeAffinity =
+    sameCategoryCount === 0
+      ? 0
+      : sameCategoryHints.filter(
+          (hint) =>
+            hint.outcomeLabel === "actionable_correct" ||
+            hint.outcomeLabel === "informational_correct" ||
+            hint.outcomeLabel === "spam_false_positive" ||
+            hint.outcomeLabel === "harmful_false_positive"
+        ).length / sameCategoryCount;
+  const sameCategoryHarmful =
+    sameCategoryCount === 0
+      ? 0
+      : sameCategoryHints.filter((hint) => hint.outcomeLabel === "harmful_true_positive")
+          .length / sameCategoryCount;
+  const promoCategory =
+    input.primaryCategory === "sales_marketing" ||
+    input.primaryCategory === "newsletter";
+  const transactionalCategory =
+    input.primaryCategory === "finance_payment" ||
+    input.primaryCategory === "security_phishing" ||
+    input.primaryCategory === "ops_support" ||
+    input.primaryCategory === "deadline_scheduling";
 
   const spamLogit =
     -0.5 +
@@ -138,7 +176,9 @@ export function classifyInboxMail(input: MailClassifierInput): MailClassifierRes
     spamHistory * 0.9 +
     confirmedSpam * 0.95 -
     falsePositivePressure * 1.25 -
-    safeAffinity * 1.05;
+    safeAffinity * 1.05 +
+    (promoCategory ? sameCategoryLowValue * 1.15 : 0) -
+    (transactionalCategory ? sameCategorySafeAffinity * 0.85 : 0);
 
   const harmfulLogit =
     -1.0 +
@@ -154,7 +194,9 @@ export function classifyInboxMail(input: MailClassifierInput): MailClassifierRes
     input.threadRiskDensity * 0.55 +
     harmfulHistory * 1.3 +
     confirmedHarmful * 1.1 -
-    safeAffinity * 0.25;
+    safeAffinity * 0.25 +
+    sameCategoryHarmful * 0.85 -
+    (transactionalCategory ? sameCategorySafeAffinity * 0.2 : 0);
 
   const actionableLogit =
     -0.85 +
@@ -167,7 +209,9 @@ export function classifyInboxMail(input: MailClassifierInput): MailClassifierRes
     Math.min(0.8, input.deadlineCount * 0.15) +
     Math.min(0.6, input.moneyMentionsCount * 0.12) +
     (input.threadDepth >= 2 ? 0.2 : 0) +
-    safeAffinity * 0.35;
+    safeAffinity * 0.35 +
+    (transactionalCategory ? sameCategorySafeAffinity * 0.55 : 0) -
+    (promoCategory ? sameCategoryLowValue * 0.55 : 0);
 
   const informationalLogit =
     -0.25 +
@@ -177,7 +221,8 @@ export function classifyInboxMail(input: MailClassifierInput): MailClassifierRes
     (input.threadDepth <= 1 ? 0.2 : 0) +
     input.decisionImportance.noiseScore * 0.014 +
     input.decisionImportance.opportunityScore * 0.01 +
-    safeAffinity * 0.25 -
+    safeAffinity * 0.25 +
+    (promoCategory ? sameCategoryLowValue * 0.35 : 0) -
     input.decisionImportance.threatScore * 0.01 -
     input.decisionImportance.urgencyScore * 0.012;
 
@@ -204,7 +249,7 @@ export function classifyInboxMail(input: MailClassifierInput): MailClassifierRes
     normalized.harmful * 100
   )} actionable=${Math.round(normalized.actionable * 100)} informational=${Math.round(
     normalized.informational * 100
-  )}; memory=${memoryCount} hints`;
+  )}; memory=${memoryCount} hints, sameCategory=${sameCategoryCount}`;
 
   return {
     probabilities: normalized,

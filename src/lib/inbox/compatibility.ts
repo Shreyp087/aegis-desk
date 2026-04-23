@@ -4,6 +4,8 @@ import {
   ConsensusAgreementScoresSchema,
   defaultAgreementScores,
 } from "./consensus";
+import type { InboxDecisionAxes } from "./decisionAxes";
+import type { InboxEventInference } from "./eventTaxonomy";
 import type { InboxAttentionType } from "./importance";
 import { InboxMailClassEnum } from "./schemas";
 
@@ -191,6 +193,8 @@ type ExplanationArgs = {
   };
   signalGroups: InboxSignalGroups;
   uncertainty: InboxUncertainty;
+  decisionAxes?: InboxDecisionAxes;
+  eventContext?: Pick<InboxEventInference, "primaryEventType" | "secondaryTags" | "confidence">;
 };
 
 function clamp(value: number, min: number, max: number): number {
@@ -383,6 +387,23 @@ export function buildExplanation(args: ExplanationArgs): InboxExplanation {
       `${humanizeToken(topCategory.category)} scored ${Math.round(topCategory.score)}/100`
     );
   }
+  if (args.decisionAxes) {
+    pushFactor(
+      `Attention ${args.decisionAxes.attentionPriority.level.toUpperCase()} / Security ${args.decisionAxes.securitySeverity.level.toUpperCase()} / Route ${args.decisionAxes.actionRoute.route.toUpperCase()}`
+    );
+  }
+  if (args.eventContext) {
+    pushFactor(
+      `Event ${humanizeToken(args.eventContext.primaryEventType)} (${args.eventContext.confidence}% confidence)${
+        args.eventContext.secondaryTags.length > 0
+          ? ` with tags ${args.eventContext.secondaryTags
+              .slice(0, 2)
+              .map(humanizeToken)
+              .join(", ")}`
+          : ""
+      }`
+    );
+  }
   if (importance.attentionType === "act_now") {
     pushFactor(
       `Urgency ${importance.urgencyScore}/100 with relevance ${importance.relevanceScore}/100`
@@ -449,6 +470,17 @@ export function buildExplanation(args: ExplanationArgs): InboxExplanation {
         .join(", ")}`
     );
   }
+  const learningRuleHits = args.signalGroups.deterministic.guardrails.ruleHits.filter((rule) =>
+    rule.startsWith("learning_")
+  );
+  if (learningRuleHits.length > 0) {
+    pushFactor(
+      `Learning correction: ${learningRuleHits
+        .slice(0, 2)
+        .map(humanizeToken)
+        .join(", ")}`
+    );
+  }
 
   while (factors.length < 3) {
     if (factors.length === 0) {
@@ -484,12 +516,47 @@ export function buildExplanation(args: ExplanationArgs): InboxExplanation {
     summaryLead = "Low-attention routine";
     summaryRationale = "Promotional or routine noise signals outweigh any likely action value.";
   }
+  if (learningRuleHits.includes("learning_promo_fatigue")) {
+    summaryLead = "Low-attention routine";
+    summaryRationale =
+      "Repeated low-value promo history for this sender/category pushed Aegis to suppress the message as noise rather than treat it as harmful.";
+  } else if (learningRuleHits.includes("learning_transactional_protection")) {
+    summaryLead =
+      summaryLead === "Low-attention routine" ? "Review later" : summaryLead;
+    summaryRationale =
+      "Aegis protected this transactional or account-critical message from promo-history suppression because it still looks user-relevant.";
+  }
   const summary = `${summaryLead}: ${summaryRationale} Aegis recommends ${args.trustedDecision.action.toUpperCase()} with ${args.trustedDecision.riskScore}/100 risk. Drivers: ${keyFactors
     .slice(0, 3)
     .join("; ")}.`;
+  const eventSummary = args.eventContext
+    ? ` Primary event type is ${humanizeToken(args.eventContext.primaryEventType)}${
+        args.eventContext.secondaryTags.length > 0
+          ? ` with secondary tags ${args.eventContext.secondaryTags
+              .slice(0, 3)
+              .map(humanizeToken)
+              .join(", ")}`
+          : ""
+      }.`
+    : "";
+  const axisRelationshipSummary = args.decisionAxes
+    ? args.decisionAxes.attentionPriority.level === "none" ||
+      args.decisionAxes.attentionPriority.level === "low"
+      ? args.decisionAxes.securitySeverity.level === "harmful" ||
+        args.decisionAxes.securitySeverity.level === "critical"
+        ? "Dangerous, but no user attention is needed because Aegis is containing it automatically."
+        : "Low user attention is appropriate because the message is routine noise."
+      : args.decisionAxes.securitySeverity.level === "benign" ||
+          args.decisionAxes.securitySeverity.level === "noisy"
+        ? "Safe, but user attention is required because the message looks operational or personally relevant."
+        : "User attention and security review are both warranted for this message."
+    : "";
+  const summaryWithAxes = args.decisionAxes
+    ? `${summary}${eventSummary} Attention is ${args.decisionAxes.attentionPriority.level.toUpperCase()}, security severity is ${args.decisionAxes.securitySeverity.level.toUpperCase()}, and action route is ${args.decisionAxes.actionRoute.route.toUpperCase()}. ${axisRelationshipSummary}`
+    : `${summary}${eventSummary}`;
 
   return {
     keyFactors,
-    summary,
+    summary: summaryWithAxes,
   };
 }

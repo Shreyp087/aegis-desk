@@ -9,6 +9,7 @@ import type {
   InboxUncertainty,
 } from "@/lib/inbox/compatibility";
 import type { AgentEscalationScannerContext } from "@/lib/agent/prefill";
+import type { DecisionCapsule } from "@/lib/inbox/decisionCapsule";
 import type { InboxDecision } from "@/lib/inbox/decision";
 
 import PanelFrame from "@/components/PanelFrame";
@@ -105,6 +106,7 @@ type InboxAlert = {
   signalGroups?: InboxSignalGroups;
   uncertainty?: InboxUncertainty;
   explanation?: InboxExplanation;
+  decisionCapsule?: DecisionCapsule;
   decision?: InboxDecision;
   suggestedAction: string;
   draftReply: string;
@@ -470,6 +472,32 @@ function actionTone(action?: "allow" | "escalate" | "quarantine" | "block"): "ri
   if (action === "escalate") return "caution";
   if (action === "allow") return "clear";
   return "info";
+}
+
+function capsuleAttentionTone(
+  value?: DecisionCapsule["attentionPriority"]
+): "risk" | "caution" | "clear" | "info" | "muted" {
+  if (value === "urgent" || value === "high") return "caution";
+  if (value === "medium") return "info";
+  if (value === "low") return "muted";
+  return "clear";
+}
+
+function capsuleSecurityTone(
+  value?: DecisionCapsule["securitySeverity"]
+): "risk" | "caution" | "clear" | "info" | "muted" {
+  if (value === "critical" || value === "harmful") return "risk";
+  if (value === "suspicious") return "caution";
+  if (value === "noisy") return "muted";
+  return "clear";
+}
+
+function capsuleActionTone(
+  value?: DecisionCapsule["userActionNeeded"]
+): "risk" | "caution" | "clear" | "info" | "muted" {
+  if (value === "yes") return "caution";
+  if (value === "maybe") return "info";
+  return "clear";
 }
 
 function mailClassTone(mailClass: InboxAlert["mailClass"]): "risk" | "caution" | "clear" | "info" | "muted" {
@@ -1480,6 +1508,83 @@ export default function InboxScannerPanel({
                               </div>
                             ))}
                           </div>
+                        </div>
+                      </div>
+
+                      <div className="grid gap-3 rounded-xl border border-aegis-border bg-aegis-base px-5 py-5">
+                        <SectionLabel>Decision Capsule</SectionLabel>
+                        <div className="grid gap-4 rounded-lg border border-aegis-border bg-aegis-elevated/70 px-4 py-4">
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="text-base font-medium tracking-tight text-aegis-text">
+                                {selected.decisionCapsule?.headline || "No decision capsule available"}
+                              </div>
+                              <div className="mt-2 text-sm leading-7 text-aegis-muted">
+                                {selected.decisionCapsule?.shortRationale ||
+                                  selected.explanation?.summary ||
+                                  "Aegis did not return a decision capsule for this message."}
+                              </div>
+                            </div>
+                            {selected.decisionCapsule?.confidenceLabel ? (
+                              <StatusBadge
+                                tone={
+                                  selected.decisionCapsule.confidenceLabel === "low"
+                                    ? "caution"
+                                    : selected.decisionCapsule.confidenceLabel === "medium"
+                                      ? "info"
+                                      : "clear"
+                                }
+                              >
+                                {selected.decisionCapsule.confidenceLabel.toUpperCase()} CONFIDENCE
+                              </StatusBadge>
+                            ) : null}
+                          </div>
+
+                          {selected.decisionCapsule ? (
+                            <>
+                              <div className="flex flex-wrap gap-2">
+                                <StatusBadge tone="info">
+                                  {humanizeFlag(selected.decisionCapsule.eventType).toUpperCase()}
+                                </StatusBadge>
+                                <StatusBadge tone={capsuleAttentionTone(selected.decisionCapsule.attentionPriority)}>
+                                  ATTENTION {selected.decisionCapsule.attentionPriority.toUpperCase()}
+                                </StatusBadge>
+                                <StatusBadge tone={capsuleSecurityTone(selected.decisionCapsule.securitySeverity)}>
+                                  SECURITY {selected.decisionCapsule.securitySeverity.toUpperCase()}
+                                </StatusBadge>
+                                <StatusBadge tone={capsuleActionTone(selected.decisionCapsule.userActionNeeded)}>
+                                  ACTION {selected.decisionCapsule.userActionNeeded.toUpperCase()}
+                                </StatusBadge>
+                              </div>
+
+                              <div className="grid gap-3 rounded-lg border border-aegis-border bg-aegis-base px-4 py-4 md:grid-cols-2">
+                                <MetaItem
+                                  label="Deadline / Expiry"
+                                  value={selected.decisionCapsule.expiresOrDeadline || "None stated"}
+                                />
+                                <MetaItem
+                                  label="Safest Next Step"
+                                  value={selected.decisionCapsule.safeNextStep}
+                                />
+                              </div>
+
+                              {selected.decisionCapsule.sensitivityFlags.length > 0 ? (
+                                <div className="flex flex-wrap gap-2">
+                                  {selected.decisionCapsule.sensitivityFlags.map((flag) => (
+                                    <StatusBadge key={flag} tone="muted">
+                                      {humanizeFlag(flag).toUpperCase()}
+                                    </StatusBadge>
+                                  ))}
+                                </div>
+                              ) : null}
+
+                              {selected.decisionCapsule.confidenceNote ? (
+                                <div className="rounded-lg border border-aegis-border bg-aegis-base px-3 py-3 text-sm leading-6 text-aegis-muted">
+                                  {selected.decisionCapsule.confidenceNote}
+                                </div>
+                              ) : null}
+                            </>
+                          ) : null}
                         </div>
                       </div>
 

@@ -107,6 +107,7 @@ function buildAffinityScore(hints: DecisionImportanceHint[]): number {
   const positive = learnedHints.filter(
     (hint) =>
       hint.outcomeLabel === "spam_false_positive" ||
+      hint.outcomeLabel === "harmful_false_positive" ||
       hint.outcomeLabel === "actionable_correct" ||
       hint.outcomeLabel === "informational_correct"
   ).length;

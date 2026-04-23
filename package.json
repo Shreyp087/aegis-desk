@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "node -e \"require('fs').rmSync('.tmp-test',{recursive:true,force:true})\" && npx tsc --module commonjs --target es2022 --moduleResolution node --esModuleInterop --outDir .tmp-test --rootDir src/lib/inbox src/lib/inbox/decision.ts src/lib/inbox/consensus.ts src/lib/inbox/compatibility.ts src/lib/inbox/importance.ts src/lib/inbox/schemas.ts src/lib/inbox/classifier.ts src/lib/inbox/classifier.test.ts src/lib/inbox/falsePositiveGuard.ts src/lib/inbox/falsePositiveGuard.test.ts src/lib/inbox/learningCorrections.ts src/lib/inbox/learningCorrections.test.ts src/lib/inbox/eventTaxonomy.ts src/lib/inbox/eventTaxonomy.test.ts src/lib/inbox/decisionAxes.ts src/lib/inbox/decisionAxes.test.ts src/lib/inbox/decisionCapsule.ts src/lib/inbox/decisionCapsule.test.ts src/lib/inbox/decisionModelHarness.ts src/lib/inbox/decisionModelHarness.test.ts && node --test .tmp-test/classifier.test.js .tmp-test/falsePositiveGuard.test.js .tmp-test/learningCorrections.test.js .tmp-test/decisionAxes.test.js .tmp-test/eventTaxonomy.test.js .tmp-test/decisionCapsule.test.js .tmp-test/decisionModelHarness.test.js && node -e \"require('fs').rmSync('.tmp-test',{recursive:true,force:true})\"",
+    "eval:decision-model": "node -e \"require('fs').rmSync('.tmp-eval',{recursive:true,force:true})\" && npx tsc --module commonjs --target es2022 --moduleResolution node --esModuleInterop --outDir .tmp-eval --rootDir src/lib/inbox src/lib/inbox/decision.ts src/lib/inbox/consensus.ts src/lib/inbox/compatibility.ts src/lib/inbox/importance.ts src/lib/inbox/schemas.ts src/lib/inbox/eventTaxonomy.ts src/lib/inbox/decisionAxes.ts src/lib/inbox/decisionCapsule.ts src/lib/inbox/decisionModelHarness.ts src/lib/inbox/decisionModelHarness.report.ts && node .tmp-eval/decisionModelHarness.report.js && node -e \"require('fs').rmSync('.tmp-eval',{recursive:true,force:true})\""
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.46",
