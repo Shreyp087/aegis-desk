@@ -11,6 +11,7 @@ export type SessionEmailRecord = {
   senderDomainHash: string;
   threadKeyHash: string;
   clusterKey: ClusterKey;
+  subjectPatternHash: string;
   receivedAt: number;
   priorityScore: number;
   priorityBand: "high" | "medium" | "low";
@@ -50,6 +51,7 @@ export type SessionStore = {
   bySenderDomain: Map<string, SessionEmailRecord[]>;
   byThreadKey: Map<string, SessionEmailRecord[]>;
   byCluster: Map<string, SessionEmailRecord[]>;
+  bySubjectPattern: Map<string, SessionEmailRecord[]>;
   allRecords: SessionEmailRecord[];
   sessionId: string;
   emailCount: number;

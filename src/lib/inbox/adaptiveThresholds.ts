@@ -12,7 +12,34 @@ export type AdaptiveThresholdRecommendation = {
   urgentDecisionFloor: number;
   deadlineHighFloor: number;
   routineNoiseCap: number;
+  attentionHighFloor: number;
+  attentionUrgentFloor: number;
+  securitySuspiciousFloor: number;
+  securityHarmfulFloor: number;
+  surfaceAttentionFloor: number;
+  escalateSecurityFloor: number;
+  promoSuppressionSensitivity: number;
+  mustNotMissFloor: number;
 };
+
+type AttentionPriorityLevel =
+  | "none"
+  | "low"
+  | "medium"
+  | "high"
+  | "urgent";
+type SecuritySeverityLevel =
+  | "benign"
+  | "noisy"
+  | "suspicious"
+  | "harmful"
+  | "critical";
+type ActionRoute =
+  | "suppress"
+  | "surface"
+  | "escalate"
+  | "quarantine"
+  | "block";
 
 export type AdaptiveThresholdInput = {
   outcomeHistory: Array<{
@@ -27,6 +54,9 @@ export type AdaptiveThresholdInput = {
     uncertainty: number;
     timestamp: Date;
     routingAction?: string;
+    attentionPriority?: AttentionPriorityLevel;
+    securitySeverity?: SecuritySeverityLevel;
+    actionRoute?: ActionRoute;
   }>;
   currentThresholds: AdaptiveThresholdRecommendation;
   minSampleSize: number;
@@ -49,6 +79,10 @@ export type AdaptiveThresholdResult = {
     fpGuardEffectiveness: number;
     avgUncertaintyAtFP: number;
     dominantFPCategory: string;
+    effectiveSampleWeight: number;
+    promoPressure: number;
+    protectedLaneMissRate: number;
+    harmfulMissRate: number;
     recommendedFocus: string;
   };
 };
@@ -64,6 +98,35 @@ const THRESHOLD_BOUNDS: Record<keyof AdaptiveThresholdRecommendation, [number, n
   urgentDecisionFloor: [74, 88],
   deadlineHighFloor: [72, 86],
   routineNoiseCap: [26, 44],
+  attentionHighFloor: [64, 84],
+  attentionUrgentFloor: [82, 96],
+  securitySuspiciousFloor: [30, 52],
+  securityHarmfulFloor: [60, 82],
+  surfaceAttentionFloor: [48, 72],
+  escalateSecurityFloor: [58, 82],
+  promoSuppressionSensitivity: [30, 80],
+  mustNotMissFloor: [68, 90],
+};
+
+const ADAPTIVE_THRESHOLD_DEFAULTS: Pick<
+  AdaptiveThresholdRecommendation,
+  | "attentionHighFloor"
+  | "attentionUrgentFloor"
+  | "securitySuspiciousFloor"
+  | "securityHarmfulFloor"
+  | "surfaceAttentionFloor"
+  | "escalateSecurityFloor"
+  | "promoSuppressionSensitivity"
+  | "mustNotMissFloor"
+> = {
+  attentionHighFloor: 75,
+  attentionUrgentFloor: 88,
+  securitySuspiciousFloor: 40,
+  securityHarmfulFloor: 70,
+  surfaceAttentionFloor: 58,
+  escalateSecurityFloor: 72,
+  promoSuppressionSensitivity: 50,
+  mustNotMissFloor: 80,
 };
 
 /**
@@ -96,6 +159,69 @@ function finiteNumber(value: unknown): number | null {
 function mean(values: number[]): number {
   if (values.length === 0) return 0;
   return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function recencyWeight(timestamp: Date, now = Date.now()): number {
+  const ageMs = Math.max(0, now - timestamp.getTime());
+  const ageDays = ageMs / 86400000;
+  return clamp(Math.exp(-ageDays / 21), 0.18, 1);
+}
+
+function weightedSum<T>(
+  values: T[],
+  selector: (value: T) => boolean,
+  weightOf: (value: T) => number
+): number {
+  return values.reduce(
+    (sum, value) => sum + (selector(value) ? weightOf(value) : 0),
+    0
+  );
+}
+
+function scaledDelta(
+  rawValue: number,
+  maxMagnitude: number,
+  adaptationStrength: number
+): number {
+  const scaled = Math.round(rawValue * adaptationStrength);
+  return clamp(scaled, -maxMagnitude, maxMagnitude);
+}
+
+function isPromoCategory(primaryCategory: string): boolean {
+  return primaryCategory === "sales_marketing" || primaryCategory === "newsletter";
+}
+
+function isProtectedCategory(primaryCategory: string): boolean {
+  return [
+    "finance_payment",
+    "ops_support",
+    "deadline_scheduling",
+    "legal_contract",
+    "security_phishing",
+  ].includes(primaryCategory);
+}
+
+function isImportantBenignOutcome(
+  entry: AdaptiveThresholdInput["outcomeHistory"][number]
+): boolean {
+  return (
+    entry.outcomeLabel === "actionable_correct" ||
+    entry.outcomeLabel === "spam_false_positive" ||
+    entry.outcomeLabel === "harmful_false_positive" ||
+    (entry.outcomeLabel === "informational_correct" && entry.priorityScore >= 55)
+  );
+}
+
+function isLowAttention(
+  level: AttentionPriorityLevel | undefined
+): boolean {
+  return level === "none" || level === "low";
+}
+
+function isBelowHarmful(
+  level: SecuritySeverityLevel | undefined
+): boolean {
+  return level !== "harmful" && level !== "critical";
 }
 
 /**
@@ -165,6 +291,38 @@ function clampRecommendation(
       recommendation.routineNoiseCap,
       ...THRESHOLD_BOUNDS.routineNoiseCap
     ),
+    attentionHighFloor: clamp(
+      recommendation.attentionHighFloor,
+      ...THRESHOLD_BOUNDS.attentionHighFloor
+    ),
+    attentionUrgentFloor: clamp(
+      recommendation.attentionUrgentFloor,
+      ...THRESHOLD_BOUNDS.attentionUrgentFloor
+    ),
+    securitySuspiciousFloor: clamp(
+      recommendation.securitySuspiciousFloor,
+      ...THRESHOLD_BOUNDS.securitySuspiciousFloor
+    ),
+    securityHarmfulFloor: clamp(
+      recommendation.securityHarmfulFloor,
+      ...THRESHOLD_BOUNDS.securityHarmfulFloor
+    ),
+    surfaceAttentionFloor: clamp(
+      recommendation.surfaceAttentionFloor,
+      ...THRESHOLD_BOUNDS.surfaceAttentionFloor
+    ),
+    escalateSecurityFloor: clamp(
+      recommendation.escalateSecurityFloor,
+      ...THRESHOLD_BOUNDS.escalateSecurityFloor
+    ),
+    promoSuppressionSensitivity: clamp(
+      recommendation.promoSuppressionSensitivity,
+      ...THRESHOLD_BOUNDS.promoSuppressionSensitivity
+    ),
+    mustNotMissFloor: clamp(
+      recommendation.mustNotMissFloor,
+      ...THRESHOLD_BOUNDS.mustNotMissFloor
+    ),
   };
 }
 
@@ -229,23 +387,36 @@ function dominantCategory(
  */
 function buildRecommendedFocus(args: {
   sampleSize: number;
+  effectiveSampleWeight: number;
   falsePositiveRate: number;
   falseNegativeRate: number;
   truePositiveRate: number;
   dominantFPCategory: string;
   fpGuardActivationRate: number;
+  promoPressure: number;
+  protectedLaneMissRate: number;
+  harmfulMissRate: number;
 }): string {
   if (args.sampleSize === 0) {
     return "No labeled outcome history is available yet, so the scanner is still operating on static defaults.";
   }
-  if (args.sampleSize < 12) {
-    return "More labeled outcomes are needed before adaptive calibration should move thresholds.";
+  if (args.effectiveSampleWeight < 6) {
+    return "More labeled outcomes are needed before adaptive calibration should move thresholds aggressively.";
   }
   if (args.fpGuardActivationRate < 0.08) {
     return "Consider lowering FP Guard rule thresholds — guard is underactivating relative to observed false positives.";
   }
   if (args.fpGuardActivationRate > 0.55) {
     return "FP Guard activating on majority of emails — review rule sensitivity before tightening more thresholds.";
+  }
+  if (args.protectedLaneMissRate > 0.18) {
+    return "Important benign mail is still getting buried — lower must-not-miss and attention floors before tightening promo suppression further.";
+  }
+  if (args.promoPressure > 0.2 && args.dominantFPCategory !== "none") {
+    return `Promo fatigue is still leaking through in ${args.dominantFPCategory}; tighten promo suppression without changing harmful thresholds.`;
+  }
+  if (args.harmfulMissRate > 0.08) {
+    return "Missed harmful mail still needs attention — lower security and routing thresholds before loosening user-attention settings.";
   }
   if (args.falsePositiveRate > args.falseNegativeRate && args.dominantFPCategory !== "none") {
     return `False positives are clustering in ${args.dominantFPCategory}; prioritize tuning that lane before widening auto-triage.`;
@@ -271,6 +442,12 @@ export function computeAdaptiveThresholds(
   const sampleSize = input.outcomeHistory.length;
   const adjustments: AdaptiveThresholdResult["adjustments"] = [];
   const current = clampRecommendation(input.currentThresholds);
+  const now = Date.now();
+  const weightedSampleSize = input.outcomeHistory.reduce(
+    (sum, entry) => sum + recencyWeight(entry.timestamp, now),
+    0
+  );
+  const warmStartSampleSize = Math.max(6, Math.floor(input.minSampleSize * 0.5));
 
   const fps = input.outcomeHistory.filter(
     (entry) =>
@@ -306,8 +483,82 @@ export function computeAdaptiveThresholds(
   );
   const fpGuardActivationRate =
     sampleSize > 0 ? fpGuardFired.length / sampleSize : 0;
+  const adaptationStrength =
+    sampleSize < warmStartSampleSize
+      ? 0
+      : clamp(weightedSampleSize / Math.max(input.minSampleSize, 1), 0.35, 1);
 
-  if (sampleSize < input.minSampleSize) {
+  const weightOf = (
+    entry: AdaptiveThresholdInput["outcomeHistory"][number]
+  ): number => recencyWeight(entry.timestamp, now);
+
+  const promoNoiseConfirmed = weightedSum(
+    input.outcomeHistory,
+    (entry) => isPromoCategory(entry.primaryCategory) && entry.outcomeLabel === "spam_true_positive",
+    weightOf
+  );
+  const protectedLaneMisses = weightedSum(
+    input.outcomeHistory,
+    (entry) =>
+      isProtectedCategory(entry.primaryCategory) &&
+      isImportantBenignOutcome(entry) &&
+      (isLowAttention(entry.attentionPriority) ||
+        entry.actionRoute === "suppress" ||
+        entry.routingAction === "human_review"),
+    weightOf
+  );
+  const protectedLaneSamples = weightedSum(
+    input.outcomeHistory,
+    (entry) => isProtectedCategory(entry.primaryCategory) && isImportantBenignOutcome(entry),
+    weightOf
+  );
+  const harmfulSeverityMisses = weightedSum(
+    input.outcomeHistory,
+    (entry) =>
+      entry.outcomeLabel === "harmful_true_positive" &&
+      isBelowHarmful(entry.securitySeverity),
+    weightOf
+  );
+  const harmfulRouteMisses = weightedSum(
+    input.outcomeHistory,
+    (entry) =>
+      entry.outcomeLabel === "harmful_true_positive" &&
+      (entry.actionRoute === "surface" || entry.routingAction === "auto_triage"),
+    weightOf
+  );
+  const harmfulSamples = weightedSum(
+    input.outcomeHistory,
+    (entry) => entry.outcomeLabel === "harmful_true_positive",
+    weightOf
+  );
+  const urgentProtectedMisses = weightedSum(
+    input.outcomeHistory,
+    (entry) =>
+      isProtectedCategory(entry.primaryCategory) &&
+      isImportantBenignOutcome(entry) &&
+      entry.priorityScore >= 80 &&
+      entry.attentionPriority !== "urgent",
+    weightOf
+  );
+  const humanReviewBenignNoise = weightedSum(
+    input.outcomeHistory,
+    (entry) =>
+      isImportantBenignOutcome(entry) &&
+      entry.routingAction === "human_review" &&
+      (entry.securitySeverity === "benign" || entry.securitySeverity === "noisy"),
+    weightOf
+  );
+  const promoPressure =
+    weightedSampleSize > 0 ? promoNoiseConfirmed / weightedSampleSize : 0;
+  const protectedLaneMissRate =
+    protectedLaneSamples > 0 ? protectedLaneMisses / protectedLaneSamples : 0;
+  const harmfulMissRate =
+    harmfulSamples > 0
+      ? (harmfulSeverityMisses + harmfulRouteMisses * 0.7) /
+        Math.max(harmfulSamples, 1)
+      : 0;
+
+  if (sampleSize < warmStartSampleSize) {
     return {
       recommended: current,
       adjustments: [],
@@ -318,13 +569,21 @@ export function computeAdaptiveThresholds(
         fpGuardEffectiveness: Number(fpGuardEffectiveness.toFixed(2)),
         avgUncertaintyAtFP: Number(avgUncertaintyAtFP.toFixed(2)),
         dominantFPCategory,
+        effectiveSampleWeight: Number(weightedSampleSize.toFixed(2)),
+        promoPressure: Number(promoPressure.toFixed(3)),
+        protectedLaneMissRate: Number(protectedLaneMissRate.toFixed(3)),
+        harmfulMissRate: Number(harmfulMissRate.toFixed(3)),
         recommendedFocus: buildRecommendedFocus({
           sampleSize,
+          effectiveSampleWeight: weightedSampleSize,
           falsePositiveRate,
           falseNegativeRate,
           truePositiveRate,
           dominantFPCategory,
           fpGuardActivationRate,
+          promoPressure,
+          protectedLaneMissRate,
+          harmfulMissRate,
         }),
       },
     };
@@ -333,63 +592,189 @@ export function computeAdaptiveThresholds(
   const recommended: AdaptiveThresholdRecommendation = { ...current };
 
   if (falsePositiveRate > 0.18) {
-    recommended.autoTriageConfidenceMin += Math.min(
+    recommended.autoTriageConfidenceMin += scaledDelta(
+      Math.min(
+        6,
+        (falsePositiveRate - 0.18) * 40
+      ),
       6,
-      (falsePositiveRate - 0.18) * 40
+      adaptationStrength
     );
-    recommended.autoTriageUncertaintyMax -= Math.min(
+    recommended.autoTriageUncertaintyMax -= scaledDelta(
+      Math.min(
+        5,
+        (falsePositiveRate - 0.18) * 30
+      ),
       5,
-      (falsePositiveRate - 0.18) * 30
+      adaptationStrength
     );
   } else if (
     falsePositiveRate < 0.06 &&
     sampleSize > 0 &&
     correct.length / sampleSize > 0.72
   ) {
-    recommended.autoTriageConfidenceMin -= Math.min(
+    recommended.autoTriageConfidenceMin -= scaledDelta(
+      Math.min(
+        4,
+        (0.06 - falsePositiveRate) * 30
+      ),
       4,
-      (0.06 - falsePositiveRate) * 30
+      adaptationStrength
     );
-    recommended.autoTriageUncertaintyMax += Math.min(
+    recommended.autoTriageUncertaintyMax += scaledDelta(
+      Math.min(
+        3,
+        (0.06 - falsePositiveRate) * 20
+      ),
       3,
-      (0.06 - falsePositiveRate) * 20
+      adaptationStrength
     );
   }
 
   if (avgPriorityScoreAtFP >= 50 && avgPriorityScoreAtFP < 80) {
-    recommended.riskMediumMin += Math.min(
+    recommended.riskMediumMin += scaledDelta(
+      Math.min(
+        5,
+        (avgPriorityScoreAtFP - 50) * 0.2
+      ),
       5,
-      (avgPriorityScoreAtFP - 50) * 0.2
+      adaptationStrength
     );
   }
 
   if (fns.length > 0 && avgPriorityScoreAtFN < current.riskHighMin) {
-    recommended.riskHighMin -= Math.min(
+    recommended.riskHighMin -= scaledDelta(
+      Math.min(
+        6,
+        (current.riskHighMin - avgPriorityScoreAtFN) * 0.3
+      ),
       6,
-      (current.riskHighMin - avgPriorityScoreAtFN) * 0.3
+      adaptationStrength
     );
   }
 
   if (fps.length > 0 && avgUncertaintyAtFP < 35) {
-    recommended.harmfulPriorityFloor += Math.min(
+    recommended.harmfulPriorityFloor += scaledDelta(
+      Math.min(
+        4,
+        (35 - avgUncertaintyAtFP) * 0.15
+      ),
       4,
-      (35 - avgUncertaintyAtFP) * 0.15
+      adaptationStrength
     );
-    recommended.urgentDecisionFloor += Math.min(
+    recommended.urgentDecisionFloor += scaledDelta(
+      Math.min(
+        3,
+        (35 - avgUncertaintyAtFP) * 0.12
+      ),
       3,
-      (35 - avgUncertaintyAtFP) * 0.12
+      adaptationStrength
     );
   }
 
   if (dominantFPCategory === "deadline_scheduling") {
-    recommended.deadlineHighFloor += 4;
+    recommended.deadlineHighFloor += scaledDelta(4, 4, adaptationStrength);
   }
 
   if (
     dominantFPCategory === "sales_marketing" ||
     dominantFPCategory === "newsletter"
   ) {
-    recommended.routineNoiseCap -= Math.min(4, fps.length * 0.3);
+    recommended.routineNoiseCap -= scaledDelta(
+      Math.min(4, fps.length * 0.3),
+      4,
+      adaptationStrength
+    );
+  }
+
+  if (promoNoiseConfirmed > 0) {
+    const promoTightening = scaledDelta(
+      Math.min(10, promoNoiseConfirmed * 2.6),
+      10,
+      adaptationStrength
+    );
+    recommended.promoSuppressionSensitivity += promoTightening;
+    recommended.routineNoiseCap -= Math.max(1, Math.round(promoTightening * 0.45));
+    recommended.surfaceAttentionFloor += Math.max(0, Math.round(promoTightening * 0.25));
+  }
+
+  if (protectedLaneMisses > 0) {
+    const recoveryDelta = scaledDelta(
+      Math.min(8, protectedLaneMisses * 2.2),
+      8,
+      adaptationStrength
+    );
+    recommended.mustNotMissFloor -= recoveryDelta;
+    recommended.attentionHighFloor -= Math.max(1, Math.round(recoveryDelta * 0.5));
+    recommended.attentionUrgentFloor -= Math.max(1, Math.round(recoveryDelta * 0.4));
+    recommended.surfaceAttentionFloor -= Math.max(1, Math.round(recoveryDelta * 0.35));
+    recommended.promoSuppressionSensitivity -= Math.max(
+      1,
+      Math.round(recoveryDelta * 0.4)
+    );
+  }
+
+  if (urgentProtectedMisses > 0) {
+    const urgentRecovery = scaledDelta(
+      Math.min(6, urgentProtectedMisses * 2),
+      6,
+      adaptationStrength
+    );
+    recommended.attentionUrgentFloor -= urgentRecovery;
+    recommended.mustNotMissFloor -= Math.max(1, Math.round(urgentRecovery * 0.5));
+  }
+
+  if (harmfulSeverityMisses > 0) {
+    const securityRecovery = scaledDelta(
+      Math.min(7, harmfulSeverityMisses * 2.4),
+      7,
+      adaptationStrength
+    );
+    recommended.securitySuspiciousFloor -= Math.max(
+      1,
+      Math.round(securityRecovery * 0.4)
+    );
+    recommended.securityHarmfulFloor -= securityRecovery;
+    recommended.escalateSecurityFloor -= Math.max(
+      1,
+      Math.round(securityRecovery * 0.5)
+    );
+    recommended.riskHighMin -= Math.max(1, Math.round(securityRecovery * 0.4));
+  }
+
+  const harmfulFalsePositiveWeight = weightedSum(
+    input.outcomeHistory,
+    (entry) => entry.outcomeLabel === "harmful_false_positive",
+    weightOf
+  );
+  if (harmfulFalsePositiveWeight > 0) {
+    const securityTightening = scaledDelta(
+      Math.min(6, harmfulFalsePositiveWeight * 2),
+      6,
+      adaptationStrength
+    );
+    recommended.securitySuspiciousFloor += Math.max(
+      1,
+      Math.round(securityTightening * 0.45)
+    );
+    recommended.securityHarmfulFloor += securityTightening;
+    recommended.escalateSecurityFloor += Math.max(
+      1,
+      Math.round(securityTightening * 0.35)
+    );
+  }
+
+  if (humanReviewBenignNoise > 0) {
+    const reviewRelaxation = scaledDelta(
+      Math.min(4, humanReviewBenignNoise * 1.6),
+      4,
+      adaptationStrength
+    );
+    recommended.autoTriageUncertaintyMax += Math.max(
+      1,
+      Math.round(reviewRelaxation * 0.6)
+    );
+    recommended.escalateUncertaintyMax += reviewRelaxation;
   }
 
   const clampedRecommended = clampRecommendation({
@@ -404,6 +789,16 @@ export function computeAdaptiveThresholds(
     urgentDecisionFloor: Math.round(recommended.urgentDecisionFloor),
     deadlineHighFloor: Math.round(recommended.deadlineHighFloor),
     routineNoiseCap: Math.round(recommended.routineNoiseCap),
+    attentionHighFloor: Math.round(recommended.attentionHighFloor),
+    attentionUrgentFloor: Math.round(recommended.attentionUrgentFloor),
+    securitySuspiciousFloor: Math.round(recommended.securitySuspiciousFloor),
+    securityHarmfulFloor: Math.round(recommended.securityHarmfulFloor),
+    surfaceAttentionFloor: Math.round(recommended.surfaceAttentionFloor),
+    escalateSecurityFloor: Math.round(recommended.escalateSecurityFloor),
+    promoSuppressionSensitivity: Math.round(
+      recommended.promoSuppressionSensitivity
+    ),
+    mustNotMissFloor: Math.round(recommended.mustNotMissFloor),
   });
 
   recordAdjustment(
@@ -474,6 +869,70 @@ export function computeAdaptiveThresholds(
     "Promo/newsletter false positives are still leaking through — tightening the routine noise cap.",
     sampleSize
   );
+  recordAdjustment(
+    adjustments,
+    "attentionHighFloor",
+    current.attentionHighFloor,
+    clampedRecommended.attentionHighFloor,
+    "Important benign mail is still being underscored — adjusting the high-attention floor.",
+    sampleSize
+  );
+  recordAdjustment(
+    adjustments,
+    "attentionUrgentFloor",
+    current.attentionUrgentFloor,
+    clampedRecommended.attentionUrgentFloor,
+    "Must-not-miss urgent events are not surfacing fast enough — adjusting the urgent-attention floor.",
+    sampleSize
+  );
+  recordAdjustment(
+    adjustments,
+    "securitySuspiciousFloor",
+    current.securitySuspiciousFloor,
+    clampedRecommended.securitySuspiciousFloor,
+    "Structured harmful outcomes are recalibrating when messages become suspicious enough to warn the user.",
+    sampleSize
+  );
+  recordAdjustment(
+    adjustments,
+    "securityHarmfulFloor",
+    current.securityHarmfulFloor,
+    clampedRecommended.securityHarmfulFloor,
+    "Confirmed harmful outcomes are recalibrating when messages should cross into harmful severity.",
+    sampleSize
+  );
+  recordAdjustment(
+    adjustments,
+    "surfaceAttentionFloor",
+    current.surfaceAttentionFloor,
+    clampedRecommended.surfaceAttentionFloor,
+    "User-relevant events and promo noise are shifting the surface-vs-suppress boundary.",
+    sampleSize
+  );
+  recordAdjustment(
+    adjustments,
+    "escalateSecurityFloor",
+    current.escalateSecurityFloor,
+    clampedRecommended.escalateSecurityFloor,
+    "Structured harmful outcomes are calibrating when surfaced mail should escalate instead.",
+    sampleSize
+  );
+  recordAdjustment(
+    adjustments,
+    "promoSuppressionSensitivity",
+    current.promoSuppressionSensitivity,
+    clampedRecommended.promoSuppressionSensitivity,
+    "Repeated low-value promo outcomes are tuning how aggressively Aegis suppresses commercial noise.",
+    sampleSize
+  );
+  recordAdjustment(
+    adjustments,
+    "mustNotMissFloor",
+    current.mustNotMissFloor,
+    clampedRecommended.mustNotMissFloor,
+    "Feedback on transactional, auth, and workflow mail is tuning the must-not-miss floor.",
+    sampleSize
+  );
 
   return {
     recommended: clampedRecommended,
@@ -485,13 +944,21 @@ export function computeAdaptiveThresholds(
       fpGuardEffectiveness: Number(fpGuardEffectiveness.toFixed(2)),
       avgUncertaintyAtFP: Number(avgUncertaintyAtFP.toFixed(2)),
       dominantFPCategory,
+      effectiveSampleWeight: Number(weightedSampleSize.toFixed(2)),
+      promoPressure: Number(promoPressure.toFixed(3)),
+      protectedLaneMissRate: Number(protectedLaneMissRate.toFixed(3)),
+      harmfulMissRate: Number(harmfulMissRate.toFixed(3)),
       recommendedFocus: buildRecommendedFocus({
         sampleSize,
+        effectiveSampleWeight: weightedSampleSize,
         falsePositiveRate,
         falseNegativeRate,
         truePositiveRate,
         dominantFPCategory,
         fpGuardActivationRate,
+        promoPressure,
+        protectedLaneMissRate,
+        harmfulMissRate,
       }),
     },
   };
@@ -542,6 +1009,30 @@ function sanitizeAdaptiveThresholdResult(
   );
   const deadlineHighFloor = finiteNumber(value.recommended.deadlineHighFloor);
   const routineNoiseCap = finiteNumber(value.recommended.routineNoiseCap);
+  const attentionHighFloor =
+    finiteNumber(value.recommended.attentionHighFloor) ??
+    ADAPTIVE_THRESHOLD_DEFAULTS.attentionHighFloor;
+  const attentionUrgentFloor =
+    finiteNumber(value.recommended.attentionUrgentFloor) ??
+    ADAPTIVE_THRESHOLD_DEFAULTS.attentionUrgentFloor;
+  const securitySuspiciousFloor =
+    finiteNumber(value.recommended.securitySuspiciousFloor) ??
+    ADAPTIVE_THRESHOLD_DEFAULTS.securitySuspiciousFloor;
+  const securityHarmfulFloor =
+    finiteNumber(value.recommended.securityHarmfulFloor) ??
+    ADAPTIVE_THRESHOLD_DEFAULTS.securityHarmfulFloor;
+  const surfaceAttentionFloor =
+    finiteNumber(value.recommended.surfaceAttentionFloor) ??
+    ADAPTIVE_THRESHOLD_DEFAULTS.surfaceAttentionFloor;
+  const escalateSecurityFloor =
+    finiteNumber(value.recommended.escalateSecurityFloor) ??
+    ADAPTIVE_THRESHOLD_DEFAULTS.escalateSecurityFloor;
+  const promoSuppressionSensitivity =
+    finiteNumber(value.recommended.promoSuppressionSensitivity) ??
+    ADAPTIVE_THRESHOLD_DEFAULTS.promoSuppressionSensitivity;
+  const mustNotMissFloor =
+    finiteNumber(value.recommended.mustNotMissFloor) ??
+    ADAPTIVE_THRESHOLD_DEFAULTS.mustNotMissFloor;
 
   if (
     autoTriageConfidenceMin === null ||
@@ -569,6 +1060,14 @@ function sanitizeAdaptiveThresholdResult(
     urgentDecisionFloor,
     deadlineHighFloor,
     routineNoiseCap,
+    attentionHighFloor,
+    attentionUrgentFloor,
+    securitySuspiciousFloor,
+    securityHarmfulFloor,
+    surfaceAttentionFloor,
+    escalateSecurityFloor,
+    promoSuppressionSensitivity,
+    mustNotMissFloor,
   });
 
   const diagnostics = value.diagnostics;
@@ -598,6 +1097,10 @@ function sanitizeAdaptiveThresholdResult(
         typeof diagnostics.dominantFPCategory === "string"
           ? diagnostics.dominantFPCategory
           : "none",
+      effectiveSampleWeight: Number(diagnostics.effectiveSampleWeight) || 0,
+      promoPressure: Number(diagnostics.promoPressure) || 0,
+      protectedLaneMissRate: Number(diagnostics.protectedLaneMissRate) || 0,
+      harmfulMissRate: Number(diagnostics.harmfulMissRate) || 0,
       recommendedFocus:
         typeof diagnostics.recommendedFocus === "string"
           ? diagnostics.recommendedFocus

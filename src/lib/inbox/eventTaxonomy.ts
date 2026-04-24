@@ -10,14 +10,17 @@ export const InboxEventTypeEnum = z.enum([
   "password_changed",
   "account_recovery",
   "new_membership",
+  "subscription_created",
   "new_device_signin",
   "purchase_confirmed",
   "order_shipped",
   "receipt_invoice",
   "billing_issue",
+  "payment_declined",
   "subscription_renewal",
   "refund_update",
   "job_application_update",
+  "interview_update",
   "interview_scheduled",
   "recruiter_reply",
   "deadline_action_required",
@@ -48,12 +51,21 @@ const SensitiveEventFamilyEnum = z.enum([
   "career_workflow",
 ]);
 
+const SensitiveEventTimeSensitivityEnum = z.enum([
+  "low",
+  "medium",
+  "high",
+  "expires_soon",
+]);
+
 const SensitiveEventSignalSchema = z.object({
   detected: z.boolean(),
   family: SensitiveEventFamilyEnum.nullable(),
   confidence: z.number().min(0).max(100),
   attentionBoost: z.number().int().min(0).max(28),
   securityBoost: z.number().int().min(0).max(18),
+  mustNotMissScore: z.number().int().min(0).max(100),
+  timeSensitivity: SensitiveEventTimeSensitivityEnum,
   routeHint: z.enum(["surface", "escalate"]).nullable(),
   rationale: z.string(),
   guardrails: z.array(z.string()).max(6),
@@ -72,6 +84,9 @@ export const InboxEventInferenceSchema = z.object({
 export type InboxEventType = z.infer<typeof InboxEventTypeEnum>;
 export type InboxEventInference = z.infer<typeof InboxEventInferenceSchema>;
 export type SensitiveEventFamily = z.infer<typeof SensitiveEventFamilyEnum>;
+export type SensitiveEventTimeSensitivity = z.infer<
+  typeof SensitiveEventTimeSensitivityEnum
+>;
 
 type EventInferenceArgs = {
   email: {
@@ -176,13 +191,19 @@ const NEW_MEMBERSHIP_PHRASES = [
   "welcome to",
   "membership confirmed",
   "membership activated",
+  "membership has been created",
   "you joined",
   "new member",
+];
+
+const SUBSCRIPTION_CREATED_PHRASES = [
   "subscription created",
   "membership created",
   "trial started",
   "free trial started",
   "plan activated",
+  "subscription activated",
+  "plan started",
 ];
 
 const NEW_DEVICE_PHRASES = [
@@ -216,12 +237,22 @@ const RECEIPT_INVOICE_PHRASES = [
   "payment receipt",
 ];
 
+const PAYMENT_DECLINED_PHRASES = [
+  "payment declined",
+  "card declined",
+  "payment was declined",
+  "declined payment",
+  "could not process your payment",
+  "unable to process payment",
+];
+
 const BILLING_ISSUE_PHRASES = [
   "billing issue",
   "payment failed",
-  "card declined",
   "billing problem",
-  "unable to process payment",
+  "update your billing details",
+  "billing details",
+  "billing details issue",
 ];
 
 const SUBSCRIPTION_RENEWAL_PHRASES = [
@@ -246,11 +277,24 @@ const JOB_APPLICATION_PHRASES = [
   "hiring team",
 ];
 
-const INTERVIEW_PHRASES = [
+const INTERVIEW_UPDATE_PHRASES = [
+  "interview update",
   "interview scheduled",
   "schedule an interview",
   "interview invitation",
   "meet with the team",
+  "interview rescheduled",
+  "next interview round",
+  "schedule the next interview",
+  "share your availability",
+];
+
+const INTERVIEW_SCHEDULE_PHRASES = [
+  "interview scheduled",
+  "schedule an interview",
+  "interview invitation",
+  "schedule the next interview",
+  "share your availability",
 ];
 
 const RECRUITER_REPLY_PHRASES = [
@@ -376,14 +420,17 @@ const HIGH_VALUE_EVENTS = new Set<InboxEventType>([
   "password_changed",
   "account_recovery",
   "new_membership",
+  "subscription_created",
   "new_device_signin",
   "purchase_confirmed",
   "order_shipped",
   "receipt_invoice",
   "billing_issue",
+  "payment_declined",
   "subscription_renewal",
   "refund_update",
   "job_application_update",
+  "interview_update",
   "interview_scheduled",
   "recruiter_reply",
   "deadline_action_required",
@@ -487,11 +534,14 @@ function buildAttentionAdjustments(primaryEventType: InboxEventType): InboxEvent
     case "order_shipped":
     case "receipt_invoice":
     case "billing_issue":
+    case "payment_declined":
+    case "subscription_created":
     case "subscription_renewal":
     case "refund_update":
     case "new_membership":
       return { urgencyDelta: 8, relevanceDelta: 16, noiseDelta: -8 };
     case "job_application_update":
+    case "interview_update":
     case "interview_scheduled":
     case "recruiter_reply":
       return { urgencyDelta: 10, relevanceDelta: 20, noiseDelta: -10 };
@@ -535,6 +585,13 @@ function buildSensitiveEventSignal(args: {
     args.scoring.promotional.lowRiskPromotional ||
     args.scoring.primaryCategory === "sales_marketing" ||
     args.scoring.primaryCategory === "newsletter";
+  const elevatedSecurityContext =
+    args.scoring.decisionImportance.threatScore >= 55 ||
+    args.scoring.riskTags.some((tag) =>
+      ["credential phishing", "bec scam", "impersonation", "malware risk"].includes(
+        tag.toLowerCase()
+      )
+    );
 
   if (
     [
@@ -552,6 +609,8 @@ function buildSensitiveEventSignal(args: {
       confidence: 18,
       attentionBoost: 0,
       securityBoost: 0,
+      mustNotMissScore: 0,
+      timeSensitivity: "low",
       routeHint: null,
       rationale: "Primary event is not part of the must-not-miss sensitive-event families.",
       guardrails,
@@ -571,6 +630,8 @@ function buildSensitiveEventSignal(args: {
       confidence: 22,
       attentionBoost: 0,
       securityBoost: 0,
+      mustNotMissScore: 0,
+      timeSensitivity: "low",
       routeHint: null,
       rationale: "Promotional context was stronger than the candidate sensitive-event signal.",
       guardrails,
@@ -581,6 +642,8 @@ function buildSensitiveEventSignal(args: {
   let confidence = 0;
   let attentionBoost = 0;
   let securityBoost = 0;
+  let mustNotMissScore = 0;
+  let timeSensitivity: SensitiveEventTimeSensitivity = "low";
   let routeHint: "surface" | "escalate" | null = null;
   let rationale = "No sensitive-event boost was applied.";
 
@@ -591,6 +654,8 @@ function buildSensitiveEventSignal(args: {
       confidence = args.hasCode ? 96 : 78;
       attentionBoost = args.hasCode ? 24 : 18;
       securityBoost = 0;
+      mustNotMissScore = args.hasCode ? 96 : 82;
+      timeSensitivity = "expires_soon";
       routeHint = "surface";
       rationale = "Authentication code patterns indicate a short-lived, must-not-miss sign-in event.";
       break;
@@ -602,7 +667,10 @@ function buildSensitiveEventSignal(args: {
       attentionBoost = 20;
       securityBoost =
         args.eventType === "password_changed" || args.eventType === "account_recovery" ? 10 : 8;
-      routeHint = "surface";
+      mustNotMissScore =
+        args.eventType === "password_changed" || args.eventType === "account_recovery" ? 90 : 86;
+      timeSensitivity = "high";
+      routeHint = elevatedSecurityContext ? "escalate" : "surface";
       rationale = "Account recovery or credential-change activity is important even when the message is not clearly malicious.";
       break;
     case "login_alert":
@@ -617,7 +685,9 @@ function buildSensitiveEventSignal(args: {
           : 82;
       attentionBoost = 20;
       securityBoost = 12;
-      routeHint = "surface";
+      mustNotMissScore = 90;
+      timeSensitivity = "high";
+      routeHint = elevatedSecurityContext ? "escalate" : "surface";
       rationale = "Account-access anomaly signals can indicate takeover risk and should be surfaced even from trusted providers.";
       break;
     case "purchase_confirmed":
@@ -633,34 +703,68 @@ function buildSensitiveEventSignal(args: {
           : 80;
       attentionBoost = 16;
       securityBoost = 0;
+      mustNotMissScore =
+        args.eventType === "purchase_confirmed" || args.eventType === "receipt_invoice"
+          ? 84
+          : 78;
+      timeSensitivity = "medium";
       routeHint = "surface";
       rationale = "Transactional commerce updates are benign by default, but still important enough to surface clearly.";
       break;
     case "new_membership":
+    case "subscription_created":
     case "subscription_renewal":
       family = "membership_lifecycle";
-      confidence = hasAnyPhrase(args.preview, NEW_MEMBERSHIP_PHRASES) ? 86 : 80;
+      confidence =
+        hasAnyPhrase(args.preview, SUBSCRIPTION_CREATED_PHRASES) ||
+        hasAnyPhrase(args.preview, NEW_MEMBERSHIP_PHRASES)
+          ? 88
+          : 80;
       attentionBoost = 16;
       securityBoost = 2;
+      mustNotMissScore = args.eventType === "subscription_created" ? 82 : 76;
+      timeSensitivity = args.eventType === "subscription_created" ? "high" : "medium";
       routeHint = "surface";
       rationale = "Membership or subscription lifecycle changes are user-relevant account events.";
       break;
     case "billing_issue":
+    case "payment_declined":
       family = "billing_lifecycle";
-      confidence = hasAnyPhrase(args.preview, BILLING_ISSUE_PHRASES) ? 92 : 82;
+      confidence =
+        hasAnyPhrase(args.preview, PAYMENT_DECLINED_PHRASES) ||
+        hasAnyPhrase(args.preview, BILLING_ISSUE_PHRASES)
+          ? 92
+          : 82;
       attentionBoost = 18;
       securityBoost = 4;
+      mustNotMissScore = args.eventType === "payment_declined" ? 88 : 82;
+      timeSensitivity = args.eventType === "payment_declined" ? "high" : "medium";
       routeHint = "surface";
       rationale = "Billing failures or declined payments are important account problems even when the message is not harmful.";
       break;
     case "job_application_update":
+    case "interview_update":
     case "interview_scheduled":
     case "recruiter_reply":
       family = "career_workflow";
       confidence =
-        args.eventType === "interview_scheduled" ? 92 : args.eventType === "recruiter_reply" ? 84 : 88;
+        args.eventType === "interview_update" || args.eventType === "interview_scheduled"
+          ? 92
+          : args.eventType === "recruiter_reply"
+            ? 84
+            : 88;
       attentionBoost = 18;
       securityBoost = 0;
+      mustNotMissScore =
+        args.eventType === "interview_update" || args.eventType === "interview_scheduled"
+          ? 90
+          : args.eventType === "recruiter_reply"
+            ? 82
+            : 86;
+      timeSensitivity =
+        args.eventType === "interview_update" || args.email.extracted.deadlines.length > 0
+          ? "high"
+          : "medium";
       routeHint = "surface";
       rationale = "Career workflow messages are life-relevant and should not be buried behind harm-based scoring.";
       break;
@@ -676,6 +780,8 @@ function buildSensitiveEventSignal(args: {
       confidence: clamp(confidence, 0, 100),
       attentionBoost: 0,
       securityBoost: 0,
+      mustNotMissScore: 0,
+      timeSensitivity: "low",
       routeHint: null,
       rationale: family
         ? "Sensitive-event confidence did not clear the high-confidence threshold."
@@ -687,6 +793,7 @@ function buildSensitiveEventSignal(args: {
   if (args.scoring.decisionImportance.threatScore >= 78 && family !== "account_security") {
     guardrails.push("dominant_threat_guard");
     attentionBoost = Math.min(attentionBoost, 10);
+    mustNotMissScore = Math.min(mustNotMissScore, 72);
   }
 
   return SensitiveEventSignalSchema.parse({
@@ -695,6 +802,8 @@ function buildSensitiveEventSignal(args: {
     confidence: clamp(confidence, 0, 100),
     attentionBoost: clamp(attentionBoost, 0, 28),
     securityBoost: clamp(securityBoost, 0, 18),
+    mustNotMissScore: clamp(mustNotMissScore, 0, 100),
+    timeSensitivity,
     routeHint,
     rationale,
     guardrails,
@@ -734,11 +843,13 @@ export function inferInboxEvent(args: EventInferenceArgs): InboxEventInference {
     hasAnyPhrase(preview, PURCHASE_CONFIRMED_PHRASES) ||
     hasAnyPhrase(preview, ORDER_SHIPPED_PHRASES) ||
     hasAnyPhrase(preview, RECEIPT_INVOICE_PHRASES) ||
+    hasAnyPhrase(preview, PAYMENT_DECLINED_PHRASES) ||
     hasAnyPhrase(preview, BILLING_ISSUE_PHRASES) ||
+    hasAnyPhrase(preview, SUBSCRIPTION_CREATED_PHRASES) ||
     hasAnyPhrase(preview, SUBSCRIPTION_RENEWAL_PHRASES) ||
     hasAnyPhrase(preview, REFUND_UPDATE_PHRASES);
   const careerWorkflowLike =
-    hasAnyPhrase(preview, INTERVIEW_PHRASES) ||
+    hasAnyPhrase(preview, INTERVIEW_UPDATE_PHRASES) ||
     hasAnyPhrase(preview, JOB_APPLICATION_PHRASES) ||
     hasAnyPhrase(preview, RECRUITER_REPLY_PHRASES);
   const safeOperationalPattern =
@@ -788,6 +899,9 @@ export function inferInboxEvent(args: EventInferenceArgs): InboxEventInference {
   if (hasAnyPhrase(preview, NEW_MEMBERSHIP_PHRASES)) {
     pushCandidate(candidates, "new_membership", 76, "new membership or welcome language");
   }
+  if (hasAnyPhrase(preview, SUBSCRIPTION_CREATED_PHRASES)) {
+    pushCandidate(candidates, "subscription_created", 82, "subscription creation or trial-start language");
+  }
 
   if (hasAnyPhrase(preview, PURCHASE_CONFIRMED_PHRASES)) {
     pushCandidate(candidates, "purchase_confirmed", 84, "purchase confirmation language");
@@ -807,6 +921,9 @@ export function inferInboxEvent(args: EventInferenceArgs): InboxEventInference {
       "receipt or invoice language"
     );
   }
+  if (hasAnyPhrase(preview, PAYMENT_DECLINED_PHRASES)) {
+    pushCandidate(candidates, "payment_declined", 86, "payment declined language");
+  }
   if (hasAnyPhrase(preview, BILLING_ISSUE_PHRASES)) {
     pushCandidate(candidates, "billing_issue", 82, "billing issue language");
   }
@@ -817,7 +934,10 @@ export function inferInboxEvent(args: EventInferenceArgs): InboxEventInference {
     pushCandidate(candidates, "refund_update", 80, "refund update language");
   }
 
-  if (hasAnyPhrase(preview, INTERVIEW_PHRASES)) {
+  if (hasAnyPhrase(preview, INTERVIEW_UPDATE_PHRASES)) {
+    pushCandidate(candidates, "interview_update", 90, "interview update language");
+  }
+  if (hasAnyPhrase(preview, INTERVIEW_SCHEDULE_PHRASES)) {
     pushCandidate(candidates, "interview_scheduled", 90, "interview scheduling language");
   }
   if (hasAnyPhrase(preview, JOB_APPLICATION_PHRASES)) {
@@ -839,6 +959,7 @@ export function inferInboxEvent(args: EventInferenceArgs): InboxEventInference {
     recruitingSenderHint &&
     hasAnyPhrase(preview, ["availability", "schedule", "meeting", "interview", "next round"])
   ) {
+    pushCandidate(candidates, "interview_update", 84, "recruiting sender with interview coordination language");
     pushCandidate(candidates, "interview_scheduled", 84, "recruiting sender with interview coordination language");
   }
 
@@ -906,6 +1027,8 @@ export function inferInboxEvent(args: EventInferenceArgs): InboxEventInference {
         confidence: 15,
         attentionBoost: 0,
         securityBoost: 0,
+        mustNotMissScore: 0,
+        timeSensitivity: "low",
         routeHint: null,
         rationale: "No high-confidence sensitive-event pattern detected.",
         guardrails: ["no_sensitive_candidate"],
@@ -965,6 +1088,8 @@ export function inferInboxEvent(args: EventInferenceArgs): InboxEventInference {
         ? [
             `event:sensitive:${sensitiveEvent.family}`,
             `event:sensitive_attention_boost:${sensitiveEvent.attentionBoost}`,
+            `event:sensitive_must_not_miss:${sensitiveEvent.mustNotMissScore}`,
+            `event:sensitive_time:${sensitiveEvent.timeSensitivity}`,
             ...(sensitiveEvent.securityBoost > 0
               ? [`event:sensitive_security_boost:${sensitiveEvent.securityBoost}`]
               : []),
@@ -1028,9 +1153,39 @@ export function applySensitiveEventBoosts(
     return profile;
   }
 
-  const urgencyDelta = Math.round(event.sensitiveEvent.attentionBoost * 0.7);
-  const relevanceDelta = Math.round(event.sensitiveEvent.attentionBoost * 0.6);
-  const noiseDelta = Math.round(event.sensitiveEvent.attentionBoost * 0.45);
+  const timeUrgencyBonus =
+    event.sensitiveEvent.timeSensitivity === "expires_soon"
+      ? 4
+      : event.sensitiveEvent.timeSensitivity === "high"
+        ? 2
+        : event.sensitiveEvent.timeSensitivity === "medium"
+          ? 1
+          : 0;
+  const urgencyDelta = clamp(
+    Math.round(
+      event.sensitiveEvent.attentionBoost * 0.6 +
+        event.sensitiveEvent.mustNotMissScore * 0.04 +
+        timeUrgencyBonus
+    ),
+    0,
+    24
+  );
+  const relevanceDelta = clamp(
+    Math.round(
+      event.sensitiveEvent.attentionBoost * 0.5 +
+        event.sensitiveEvent.mustNotMissScore * 0.03
+    ),
+    0,
+    22
+  );
+  const noiseDelta = clamp(
+    Math.round(
+      event.sensitiveEvent.attentionBoost * 0.35 +
+        event.sensitiveEvent.mustNotMissScore * 0.02
+    ),
+    0,
+    18
+  );
 
   return {
     ...profile,

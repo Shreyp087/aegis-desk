@@ -1,4 +1,8 @@
 import { z } from "zod";
+import type {
+  AttentionPriorityLevel,
+  SecuritySeverityLevel,
+} from "./decisionAxes";
 
 export const InboxDecisionActionEnum = z.enum(["auto_triage", "escalate", "human_review"]);
 export const InboxRiskLevelEnum = z.enum(["low", "medium", "high"]);
@@ -25,6 +29,9 @@ type RouteInboxDecisionArgs = {
   confidencePct: number;
   uncertaintyPercent: number;
   riskScore: number;
+  attentionPriorityLevel?: AttentionPriorityLevel;
+  securitySeverityLevel?: SecuritySeverityLevel;
+  trustedAction?: "allow" | "escalate" | "quarantine" | "block";
   disagreementFlags?: string[];
   config?: InboxDecisionPolicyConfig;
 };
@@ -127,12 +134,60 @@ function formatFlags(flags: string[]): string {
   return flags.join(", ");
 }
 
+function isHighAttention(level: AttentionPriorityLevel | undefined): boolean {
+  return level === "high" || level === "urgent";
+}
+
+function isMediumOrHigherAttention(
+  level: AttentionPriorityLevel | undefined
+): boolean {
+  return level === "medium" || level === "high" || level === "urgent";
+}
+
+function isLowAttention(level: AttentionPriorityLevel | undefined): boolean {
+  return level === "none" || level === "low";
+}
+
+function isDangerousSeverity(
+  level: SecuritySeverityLevel | undefined
+): boolean {
+  return level === "harmful" || level === "critical";
+}
+
 export function routeInboxDecision(args: RouteInboxDecisionArgs): InboxDecision {
   const config = args.config ?? DEFAULT_POLICY_CONFIG;
   const disagreementFlags = args.disagreementFlags ?? [];
   const hardFlags = disagreementFlags.filter((flag) => HARD_REVIEW_FLAGS.has(flag));
   const moderateFlags = disagreementFlags.filter((flag) => MODERATE_DISAGREEMENT_FLAGS.has(flag));
   const riskLevel = deriveRiskLevel(args.riskScore, config);
+  const trustedAction = args.trustedAction ?? "allow";
+  const containmentVerb =
+    trustedAction === "quarantine"
+      ? "QUARANTINED"
+      : trustedAction === "block"
+        ? "BLOCKED"
+        : trustedAction.toUpperCase();
+  const reviewableSurfaceEligible =
+    trustedAction === "allow" &&
+    isMediumOrHigherAttention(args.attentionPriorityLevel) &&
+    !isDangerousSeverity(args.securitySeverityLevel) &&
+    args.confidencePct >= Math.min(config.autoTriageConfidenceMinPct, 70) &&
+    args.uncertaintyPercent <= Math.max(config.autoTriageUncertaintyMaxPct, 42) &&
+    moderateFlags.length === 0;
+  const suspiciousSurfaceEligible =
+    trustedAction === "allow" &&
+    args.securitySeverityLevel === "suspicious" &&
+    isHighAttention(args.attentionPriorityLevel) &&
+    args.confidencePct >= Math.max(70, config.escalateConfidenceMinPct) &&
+    args.uncertaintyPercent <= 42 &&
+    moderateFlags.length === 0;
+  const containedThreatAutoHandled =
+    (trustedAction === "quarantine" || trustedAction === "block") &&
+    isDangerousSeverity(args.securitySeverityLevel) &&
+    isLowAttention(args.attentionPriorityLevel) &&
+    args.confidencePct >= config.escalateConfidenceMinPct &&
+    args.uncertaintyPercent <= config.escalateUncertaintyMaxPct &&
+    moderateFlags.length === 0;
 
   if (hardFlags.length > 0) {
     return InboxDecisionSchema.parse({
@@ -147,12 +202,19 @@ export function routeInboxDecision(args: RouteInboxDecisionArgs): InboxDecision 
     args.uncertaintyPercent <= config.autoTriageUncertaintyMaxPct &&
     moderateFlags.length === 0;
 
-  if (autoTriageEligible) {
+  if (autoTriageEligible || reviewableSurfaceEligible || suspiciousSurfaceEligible || containedThreatAutoHandled) {
+    const axisAwareReason = containedThreatAutoHandled
+      ? `Auto-triage: dangerous message is already being ${containmentVerb}, so no additional user review is needed.`
+      : suspiciousSurfaceEligible
+        ? "Auto-triage: surface directly because the message is suspicious but personally relevant and confidence is strong enough for user-led review."
+        : reviewableSurfaceEligible
+          ? "Auto-triage: surface directly because the message is important to the user without needing extra security review."
+          : `Auto-triage: confidence ${Math.round(args.confidencePct)}%, uncertainty ${Math.round(
+              args.uncertaintyPercent
+            )}%, no blocking disagreement.`;
     return InboxDecisionSchema.parse({
       final_action: "auto_triage",
-      reason: `Auto-triage: confidence ${Math.round(args.confidencePct)}%, uncertainty ${Math.round(
-        args.uncertaintyPercent
-      )}%, no blocking disagreement.`,
+      reason: axisAwareReason,
       risk_level: riskLevel,
     });
   }

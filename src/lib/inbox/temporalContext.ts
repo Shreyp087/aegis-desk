@@ -2,6 +2,7 @@ import {
   computeGapsHours,
   getClusterRecords,
   getSenderRecords,
+  getSubjectPatternRecords,
   getThreadRecords,
   median,
 } from "./sessionStore";
@@ -32,9 +33,12 @@ function clamp(value: number, min: number, max: number): number {
 function defaultSilenceBreakSignal(): SilenceBreakSignal {
   return {
     detected: false,
+    source: null,
     gapHours: 0,
     expectedGapHours: 0,
     deviationFactor: 0,
+    priorCadenceSamples: 0,
+    novelSubjectPattern: false,
     urgencyBoost: 0,
     confidence: 0,
     rationale: "No meaningful silence break detected.",
@@ -52,9 +56,11 @@ function defaultUnresolvedThreadSignal(threadKeyHash: string): UnresolvedThreadS
     detected: false,
     threadKeyHash,
     priorScoredCount: 0,
+    actionablePriorCount: 0,
     hoursApart: 0,
     priorMaxBand: null,
     priorMaxAction: null,
+    novelSubjectPattern: false,
     urgencyBoost: 0,
     routingOverride: null,
     rationale: "No unresolved thread follow-up detected.",
@@ -74,6 +80,9 @@ function defaultConvergingSignalSignal(
     detected: false,
     clusterKey,
     distinctDomains: 0,
+    matchedRecordCount: 0,
+    matchingSubjectDomains: 0,
+    windowSpanHours: 0,
     signalStrength: 0,
     urgencyBoost: 0,
     threatElevation: 0,
@@ -93,6 +102,25 @@ function bandRank(value: "high" | "medium" | "low" | null): number {
   if (value === "medium") return 2;
   if (value === "low") return 1;
   return 0;
+}
+
+/**
+ * Computes the time span in hours across a record set.
+ *
+ * Pipeline step: convergence detection uses this to tell tight coordinated bursts apart from looser routine clustering.
+ * False-positive scenario addressed: prevents wide, low-pressure batches from looking like concentrated campaigns.
+ */
+function computeWindowSpanHours(
+  records: Array<{
+    receivedAt: number;
+  }>
+): number {
+  if (records.length < 2) {
+    return 0;
+  }
+
+  const receivedTimes = records.map((record) => record.receivedAt);
+  return (Math.max(...receivedTimes) - Math.min(...receivedTimes)) / 3_600_000;
 }
 
 /**
@@ -116,69 +144,97 @@ function detectSilenceBreak(input: TemporalContextInput): SilenceBreakSignal {
   if (senderRecords.length >= 3) {
     const currentIndex = senderRecords.findIndex(
       (record) =>
-        record.receivedAt === input.receivedAt && record.threadKeyHash === input.threadKeyHash
+        record.receivedAt === input.receivedAt &&
+        record.threadKeyHash === input.threadKeyHash &&
+        record.subjectPatternHash === input.subjectPatternHash
     );
-    if (currentIndex <= 0) {
-      return empty;
-    }
+    if (currentIndex >= 2) {
+      const historyRecords = senderRecords.slice(0, currentIndex);
+      const priorRecord = historyRecords[historyRecords.length - 1];
+      if (!priorRecord) {
+        return empty;
+      }
 
-    const gaps = computeGapsHours(senderRecords);
-    const expectedGapHours = median(gaps);
-    if (expectedGapHours <= 0) {
-      return empty;
-    }
+      const historicalGaps = computeGapsHours(historyRecords);
+      const firstHistoryRecord = historyRecords[0];
+      const expectedGapHours =
+        historicalGaps.length > 0
+          ? median(historicalGaps)
+          : firstHistoryRecord
+            ? (priorRecord.receivedAt - firstHistoryRecord.receivedAt) / 3_600_000
+            : 0;
+      if (expectedGapHours <= 0) {
+        return empty;
+      }
 
-    const priorRecord = senderRecords[currentIndex - 1];
-    const gapHours = (input.receivedAt - priorRecord.receivedAt) / 3_600_000;
-    const deviationFactor = gapHours / Math.max(0.5, expectedGapHours);
+      const gapHours = (input.receivedAt - priorRecord.receivedAt) / 3_600_000;
+      const deviationFactor = gapHours / Math.max(0.5, expectedGapHours);
+      const priorPatternSeen = historyRecords.some(
+        (record) => record.subjectPatternHash === input.subjectPatternHash
+      );
+      const novelSubjectPattern = !priorPatternSeen;
 
-    let confidence = 40;
-    if (senderRecords.length >= 6) confidence += 18;
-    else if (senderRecords.length >= 4) confidence += 10;
-    if (deviationFactor >= 3.5) confidence += 8;
-    if (expectedGapHours <= 4) confidence += 8;
-    if (senderRecords.length < 4) confidence -= 15;
-    confidence = clamp(confidence, 0, 100);
+      let confidence = 40;
+      if (historyRecords.length >= 5) confidence += 18;
+      else if (historyRecords.length >= 3) confidence += 10;
+      if (deviationFactor >= 3.5) confidence += 8;
+      if (expectedGapHours <= 4) confidence += 8;
+      if (novelSubjectPattern) confidence += 6;
+      if (historyRecords.length < 3) confidence -= 15;
+      confidence = clamp(confidence, 0, 100);
 
-    if (
-      deviationFactor < 2.2 ||
-      gapHours < 1.5 ||
-      confidence < 38 ||
-      input.decisionProfile.attentionType === "verify_now"
-    ) {
+      if (
+        deviationFactor < 2.2 ||
+        gapHours < 1.5 ||
+        confidence < 38 ||
+        input.decisionProfile.attentionType === "verify_now"
+      ) {
+        return {
+          ...empty,
+          source: "intra_batch",
+          gapHours: Number(gapHours.toFixed(2)),
+          expectedGapHours: Number(expectedGapHours.toFixed(2)),
+          deviationFactor: Number(deviationFactor.toFixed(2)),
+          priorCadenceSamples: historyRecords.length,
+          novelSubjectPattern,
+          confidence,
+        };
+      }
+
+      let urgencyBoost = deviationFactor > 5 ? 18 : deviationFactor >= 3.5 ? 13 : 8;
+      const priorScored = historyRecords.filter((record) => record.scored);
+      if (priorScored.length >= 2) {
+        const avgPrior =
+          priorScored.reduce((sum, record) => sum + record.priorityScore, 0) /
+          priorScored.length;
+        if (avgPrior >= 60) {
+          urgencyBoost += 3;
+        }
+      }
+      if (novelSubjectPattern) {
+        urgencyBoost += 2;
+      }
+      if (input.decisionProfile.threat >= 55) {
+        urgencyBoost += 2;
+      }
+
+      const noveltyNote = novelSubjectPattern
+        ? " A new hashed subject pattern also appeared after the silence."
+        : "";
+
       return {
-        ...empty,
+        detected: true,
+        source: "intra_batch",
         gapHours: Number(gapHours.toFixed(2)),
         expectedGapHours: Number(expectedGapHours.toFixed(2)),
         deviationFactor: Number(deviationFactor.toFixed(2)),
+        priorCadenceSamples: historyRecords.length,
+        novelSubjectPattern,
+        urgencyBoost: clamp(urgencyBoost, 0, 18),
         confidence,
+        rationale: `Sender broke an intra-batch cadence of ${expectedGapHours.toFixed(1)}h after ${gapHours.toFixed(1)}h of silence.${noveltyNote}`.trim(),
       };
     }
-
-    let urgencyBoost = deviationFactor > 5 ? 18 : deviationFactor >= 3.5 ? 13 : 8;
-    const priorScored = senderRecords
-      .slice(0, currentIndex)
-      .filter((record) => record.scored);
-    if (priorScored.length >= 2) {
-      const avgPrior =
-        priorScored.reduce((sum, record) => sum + record.priorityScore, 0) / priorScored.length;
-      if (avgPrior >= 60) {
-        urgencyBoost += 3;
-      }
-    }
-    if (input.decisionProfile.threat >= 55) {
-      urgencyBoost += 2;
-    }
-
-    return {
-      detected: true,
-      gapHours: Number(gapHours.toFixed(2)),
-      expectedGapHours: Number(expectedGapHours.toFixed(2)),
-      deviationFactor: Number(deviationFactor.toFixed(2)),
-      urgencyBoost: clamp(urgencyBoost, 0, 18),
-      confidence,
-      rationale: `Sender broke an intra-batch cadence of ${expectedGapHours.toFixed(1)}h after ${gapHours.toFixed(1)}h of silence.`,
-    };
   }
 
   if (
@@ -205,9 +261,11 @@ function detectSilenceBreak(input: TemporalContextInput): SilenceBreakSignal {
   if (deviationFactor < 2.5 || crossSessionGapHours < 4 || confidence < 38) {
     return {
       ...empty,
+      source: "cross_session",
       gapHours: Number(crossSessionGapHours.toFixed(2)),
       expectedGapHours: Number(estimatedCadenceHours.toFixed(2)),
       deviationFactor: Number(deviationFactor.toFixed(2)),
+      priorCadenceSamples: 0,
       confidence,
     };
   }
@@ -219,9 +277,12 @@ function detectSilenceBreak(input: TemporalContextInput): SilenceBreakSignal {
 
   return {
     detected: true,
+    source: "cross_session",
     gapHours: Number(crossSessionGapHours.toFixed(2)),
     expectedGapHours: Number(estimatedCadenceHours.toFixed(2)),
     deviationFactor: Number(deviationFactor.toFixed(2)),
+    priorCadenceSamples: 0,
+    novelSubjectPattern: false,
     urgencyBoost: clamp(urgencyBoost, 0, 18),
     confidence,
     rationale: `Cross-session silence break: sender reappeared after ${crossSessionGapHours.toFixed(1)}h against an estimated ${estimatedCadenceHours.toFixed(1)}h cadence.`,
@@ -245,12 +306,23 @@ function detectUnresolvedThread(input: TemporalContextInput): UnresolvedThreadSi
   }
 
   const mostRecent = priorScored[priorScored.length - 1];
-  const hoursApart = (input.receivedAt - mostRecent.receivedAt) / 3_600_000;
-  const wasActionable =
-    mostRecent.priorityBand === "high" ||
-    mostRecent.priorityBand === "medium" ||
-    mostRecent.trustedAction === "escalate" ||
-    mostRecent.trustedAction === "quarantine";
+  const actionablePrior = priorScored.filter(
+    (record) =>
+      record.priorityBand === "high" ||
+      record.priorityBand === "medium" ||
+      record.trustedAction === "escalate" ||
+      record.trustedAction === "quarantine" ||
+      record.urgencyScore >= 62
+  );
+  const anchorRecord =
+    actionablePrior.length > 0
+      ? actionablePrior[actionablePrior.length - 1]
+      : mostRecent;
+  const hoursApart = (input.receivedAt - anchorRecord.receivedAt) / 3_600_000;
+  const wasActionable = actionablePrior.length > 0;
+  const novelSubjectPattern = !priorScored.some(
+    (record) => record.subjectPatternHash === input.subjectPatternHash
+  );
 
   if (
     (mostRecent.routingAction === "auto_triage" && mostRecent.priorityBand === "low") ||
@@ -261,9 +333,11 @@ function detectUnresolvedThread(input: TemporalContextInput): UnresolvedThreadSi
     return {
       ...empty,
       priorScoredCount: priorScored.length,
+      actionablePriorCount: actionablePrior.length,
       hoursApart: Number(hoursApart.toFixed(2)),
-      priorMaxBand: mostRecent.priorityBand,
-      priorMaxAction: mostRecent.trustedAction || null,
+      priorMaxBand: anchorRecord.priorityBand,
+      priorMaxAction: anchorRecord.trustedAction || null,
+      novelSubjectPattern,
     };
   }
 
@@ -272,26 +346,35 @@ function detectUnresolvedThread(input: TemporalContextInput): UnresolvedThreadSi
   else if (hoursApart < 4) urgencyBoost += 8;
   else if (hoursApart < 12) urgencyBoost += 5;
   else urgencyBoost += 2;
-  if (mostRecent.priorityBand === "high") urgencyBoost += 4;
+  if (anchorRecord.priorityBand === "high") urgencyBoost += 4;
   if (
-    mostRecent.trustedAction === "escalate" ||
-    mostRecent.trustedAction === "quarantine"
+    anchorRecord.trustedAction === "escalate" ||
+    anchorRecord.trustedAction === "quarantine"
   ) {
     urgencyBoost += 3;
   }
   if (priorScored.length >= 3) {
     urgencyBoost += 2;
   }
+  if (novelSubjectPattern) {
+    urgencyBoost += 2;
+  }
   urgencyBoost = clamp(urgencyBoost, 0, 22);
 
   let routingOverride: "escalate" | "human_review" | null = null;
-  let rationale = `Follow-up to unresolved thread ${hoursApart.toFixed(1)}h after the last scored email.`;
-  if (urgencyBoost >= 18 && hoursApart <= 4) {
+  let rationale = `Follow-up to unresolved thread ${hoursApart.toFixed(1)}h after the last actionable item.`;
+  if (urgencyBoost >= 18 && hoursApart <= 6) {
     routingOverride = "escalate";
-    rationale = `Follow-up to unresolved ${mostRecent.priorityBand} priority thread from ${hoursApart.toFixed(1)}h ago - escalating.`;
-  } else if (urgencyBoost >= 12 && input.decisionProfile.threat >= 55) {
+    rationale = `Follow-up to unresolved ${anchorRecord.priorityBand} priority thread from ${hoursApart.toFixed(1)}h ago - escalating.`;
+  } else if (
+    urgencyBoost >= 12 &&
+    (input.decisionProfile.threat >= 55 ||
+      (novelSubjectPattern && input.decisionProfile.threat >= 40))
+  ) {
     routingOverride = "human_review";
-    rationale = `Unresolved thread with elevated threat (${input.decisionProfile.threat.toFixed(0)}) - human review.`;
+    rationale = novelSubjectPattern
+      ? `Unresolved thread shifted into a new hashed subject pattern with elevated threat (${input.decisionProfile.threat.toFixed(0)}) - human review.`
+      : `Unresolved thread with elevated threat (${input.decisionProfile.threat.toFixed(0)}) - human review.`;
   }
 
   const priorMaxBand = priorScored.reduce<"high" | "medium" | "low" | null>(
@@ -304,12 +387,16 @@ function detectUnresolvedThread(input: TemporalContextInput): UnresolvedThreadSi
     detected: true,
     threadKeyHash: input.threadKeyHash,
     priorScoredCount: priorScored.length,
+    actionablePriorCount: actionablePrior.length,
     hoursApart: Number(hoursApart.toFixed(2)),
     priorMaxBand,
-    priorMaxAction: mostRecent.trustedAction || null,
+    priorMaxAction: anchorRecord.trustedAction || null,
+    novelSubjectPattern,
     urgencyBoost,
     routingOverride,
-    rationale,
+    rationale: novelSubjectPattern && !rationale.includes("new hashed subject pattern")
+      ? `${rationale} The follow-up also introduced a new hashed subject pattern on the open thread.`
+      : rationale,
   };
 }
 
@@ -333,11 +420,26 @@ function detectConvergingSignals(input: TemporalContextInput): ConvergingSignalS
   const clusterRecords = getClusterRecords(input.store, input.clusterKey, input.senderDomainHash)
     .filter((record) => record.scored || record.receivedAt < input.receivedAt);
   const distinctDomains = new Set(clusterRecords.map((record) => record.senderDomainHash)).size;
+  const samePatternRecords = getSubjectPatternRecords(
+    input.store,
+    input.subjectPatternHash,
+    input.senderDomainHash
+  ).filter((record) => record.receivedAt < input.receivedAt);
+  const matchingSubjectDomains = new Set(
+    samePatternRecords.map((record) => record.senderDomainHash)
+  ).size;
+  const windowSpanHours = computeWindowSpanHours([
+    ...clusterRecords,
+    { receivedAt: input.receivedAt },
+  ]);
 
   if (distinctDomains < 2) {
     return {
       ...empty,
       distinctDomains,
+      matchedRecordCount: clusterRecords.length,
+      matchingSubjectDomains,
+      windowSpanHours: Number(windowSpanHours.toFixed(2)),
     };
   }
 
@@ -361,6 +463,12 @@ function detectConvergingSignals(input: TemporalContextInput): ConvergingSignalS
   if (clusterRecords.length >= 4) {
     signalStrength += 10;
   }
+  if (matchingSubjectDomains >= 1) {
+    signalStrength += 12;
+  }
+  if (windowSpanHours <= 12) {
+    signalStrength += 8;
+  }
   signalStrength = clamp(signalStrength, 0, 100);
 
   const urgencyBoost = clamp(Math.round(signalStrength * 0.28), 0, 24);
@@ -376,12 +484,12 @@ function detectConvergingSignals(input: TemporalContextInput): ConvergingSignalS
 
   let campaignType: ConvergingSignalSignal["campaignType"] = "ambiguous";
   if (
-    distinctDomains >= 3 &&
+    distinctDomains + 1 >= 3 &&
     ["financial_transaction", "payment_request", "executive_impersonation"].includes(
       input.clusterKey
     ) &&
-    scoredRecords.length >= 2 &&
-    avgScore >= 55
+    (scoredRecords.length >= 2 || matchingSubjectDomains >= 1) &&
+    (avgScore >= 55 || matchingSubjectDomains >= 2 || windowSpanHours <= 8)
   ) {
     campaignType = "coordinated_attack";
   } else if (
@@ -396,11 +504,17 @@ function detectConvergingSignals(input: TemporalContextInput): ConvergingSignalS
     detected: true,
     clusterKey: input.clusterKey,
     distinctDomains,
+    matchedRecordCount: clusterRecords.length,
+    matchingSubjectDomains,
+    windowSpanHours: Number(windowSpanHours.toFixed(2)),
     signalStrength,
     urgencyBoost,
     threatElevation,
     campaignType,
-    rationale: `${distinctDomains} other sender domain(s) converged on ${input.clusterKey.replace(/_/g, " ")} in this batch.`,
+    rationale:
+      matchingSubjectDomains > 0
+        ? `${distinctDomains} other sender domain(s) converged on ${input.clusterKey.replace(/_/g, " ")} in this batch, including ${matchingSubjectDomains} domain(s) sharing the same hashed subject pattern within ${windowSpanHours.toFixed(1)}h.`
+        : `${distinctDomains} other sender domain(s) converged on ${input.clusterKey.replace(/_/g, " ")} in this batch within ${windowSpanHours.toFixed(1)}h.`,
   };
 }
 
@@ -457,6 +571,25 @@ export function buildTemporalContext(input: TemporalContextInput): TemporalConte
     temporalFlags.push(`temporal:routing:${routingOverride}`);
   }
 
+  const dominantTemporalSignal =
+    unresolvedThread.detected && unresolvedThread.urgencyBoost >= silenceBreak.urgencyBoost
+      ? unresolvedThread.urgencyBoost >= convergingSignal.urgencyBoost
+        ? "unresolved_thread"
+        : "converging_signal"
+      : silenceBreak.detected && silenceBreak.urgencyBoost >= convergingSignal.urgencyBoost
+        ? "silence_break"
+        : convergingSignal.detected
+          ? "converging_signal"
+          : null;
+  const explanationNotes = [
+    ...(silenceBreak.detected ? [silenceBreak.rationale] : []),
+    ...(unresolvedThread.detected ? [unresolvedThread.rationale] : []),
+    ...(convergingSignal.detected ? [convergingSignal.rationale] : []),
+    ...(routingOverride
+      ? [`Temporal routing override applied: ${routingOverride}.`]
+      : []),
+  ].slice(0, 4);
+
   return {
     silenceBreak,
     unresolvedThread,
@@ -465,5 +598,7 @@ export function buildTemporalContext(input: TemporalContextInput): TemporalConte
     totalThreatDelta,
     routingOverride,
     temporalFlags,
+    dominantTemporalSignal,
+    explanationNotes,
   };
 }

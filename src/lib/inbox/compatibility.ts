@@ -4,6 +4,7 @@ import {
   ConsensusAgreementScoresSchema,
   defaultAgreementScores,
 } from "./consensus";
+import type { InboxDecision } from "./decision";
 import type { InboxDecisionAxes } from "./decisionAxes";
 import type { InboxEventInference } from "./eventTaxonomy";
 import type { InboxAttentionType } from "./importance";
@@ -96,14 +97,65 @@ export const InboxSignalGroupsSchema = z.object({
   }),
 });
 
+export const InboxExplanationReasonTypeEnum = z.enum([
+  "event_detected",
+  "category_signal",
+  "sensitive_event",
+  "pattern_novelty",
+  "security_signal",
+  "trust_gap",
+  "stale_urgency_decay",
+  "promo_suppression",
+  "silence_break",
+  "unresolved_thread",
+  "converging_signals",
+  "user_feedback_history",
+  "false_positive_guard",
+  "uncertainty_trigger",
+  "route_change",
+]);
+
+export const InboxExplanationReasonDirectionEnum = z.enum([
+  "increase_attention",
+  "reduce_attention",
+  "increase_security",
+  "change_route",
+  "reduce_confidence",
+  "context",
+]);
+
+export const InboxExplanationReasonFragmentSchema = z.object({
+  type: InboxExplanationReasonTypeEnum,
+  direction: InboxExplanationReasonDirectionEnum,
+  title: z.string(),
+  detail: z.string(),
+  evidence: z.array(z.string()).max(4),
+  weight: z.number().min(0).max(100),
+});
+
+export const InboxExplanationAuditTrailSchema = z.object({
+  topSignals: z.array(z.string()).max(4),
+  scoreReducers: z.array(z.string()).max(4),
+  attentionDrivers: z.array(z.string()).max(4),
+  routeDrivers: z.array(z.string()).max(4),
+});
+
 export const InboxExplanationSchema = z.object({
   keyFactors: z.array(z.string()).min(1).max(5),
   summary: z.string(),
+  reasonFragments: z.array(InboxExplanationReasonFragmentSchema).min(1).max(12),
+  auditTrail: InboxExplanationAuditTrailSchema,
 });
 
 export type InboxUncertainty = z.infer<typeof InboxUncertaintySchema>;
 export type InboxSignalGroups = z.infer<typeof InboxSignalGroupsSchema>;
 export type InboxExplanation = z.infer<typeof InboxExplanationSchema>;
+export type InboxExplanationReasonFragment = z.infer<
+  typeof InboxExplanationReasonFragmentSchema
+>;
+export type InboxExplanationAuditTrail = z.infer<
+  typeof InboxExplanationAuditTrailSchema
+>;
 
 type ProbabilityMap = z.infer<typeof ProbabilitySchema>;
 
@@ -194,7 +246,47 @@ type ExplanationArgs = {
   signalGroups: InboxSignalGroups;
   uncertainty: InboxUncertainty;
   decisionAxes?: InboxDecisionAxes;
-  eventContext?: Pick<InboxEventInference, "primaryEventType" | "secondaryTags" | "confidence">;
+  decision?: InboxDecision;
+  eventContext?: Pick<
+    InboxEventInference,
+    "primaryEventType" | "secondaryTags" | "confidence" | "sensitiveEvent"
+  >;
+  falsePositiveGuard?: {
+    guardActivated: boolean;
+    corrections: Array<{
+      rule: string;
+      delta: number;
+      reason: string;
+    }>;
+  };
+  temporalContext?: {
+    temporalFlags: string[];
+    totalUrgencyDelta: number;
+    totalThreatDelta: number;
+    routingOverride: "escalate" | "human_review" | null;
+    silenceBreak?: {
+      detected: boolean;
+      rationale: string;
+    };
+    unresolvedThread?: {
+      detected: boolean;
+      rationale: string;
+    };
+    convergingSignal?: {
+      detected: boolean;
+      rationale: string;
+    };
+  };
+  urgencyPrediction?: {
+    temporalContext: "operational_window" | "close_window" | "async_context" | "standard";
+    predictionConfidence: number;
+    predictionFactors: Array<{
+      factor: string;
+      direction: "boost" | "suppress";
+      magnitude: number;
+      rationale: string;
+    }>;
+  };
 };
 
 function clamp(value: number, min: number, max: number): number {
@@ -211,6 +303,11 @@ function humanizeToken(value: string): string {
     .replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
+function toSentenceCase(value: string): string {
+  const humanized = value.replace(/_/g, " ");
+  return humanized.charAt(0).toUpperCase() + humanized.slice(1);
+}
+
 function maxProbability(probabilities: ProbabilityMap): number {
   return Math.max(
     probabilities.spam,
@@ -218,6 +315,100 @@ function maxProbability(probabilities: ProbabilityMap): number {
     probabilities.actionable,
     probabilities.informational
   );
+}
+
+function hasAnyRule(rules: string[], prefix: string): boolean {
+  return rules.some((rule) => rule === prefix || rule.startsWith(prefix));
+}
+
+function uniqueList(values: string[], limit: number): string[] {
+  return Array.from(
+    new Set(
+      values
+        .map((value) => value.trim())
+        .filter(Boolean)
+    )
+  ).slice(0, limit);
+}
+
+function buildRouteLead(args: ExplanationArgs): string {
+  if (args.decision?.final_action === "human_review") {
+    return "Held for human review";
+  }
+
+  switch (args.decisionAxes?.actionRoute.route) {
+    case "suppress":
+      return "Suppressed";
+    case "quarantine":
+      return "Quarantined";
+    case "block":
+      return "Blocked";
+    case "escalate":
+      return "Escalated";
+    case "surface":
+      return "Surfaced";
+    default:
+      return "Explained";
+  }
+}
+
+function buildRelationshipSummary(args: ExplanationArgs): string {
+  if (!args.decisionAxes) {
+    return args.signalGroups.deterministic.decisionImportance.rationale;
+  }
+
+  const attention = args.decisionAxes.attentionPriority.level;
+  const security = args.decisionAxes.securitySeverity.level;
+  const route = args.decisionAxes.actionRoute.route;
+
+  if (args.decision?.final_action === "human_review") {
+    return "Aegis kept a human in the loop because uncertainty or disagreement made automatic handling unsafe.";
+  }
+
+  if (
+    (route === "quarantine" || route === "block") &&
+    (attention === "none" || attention === "low")
+  ) {
+    return "Dangerous, but user attention was not requested because Aegis already contained it.";
+  }
+
+  if (route === "suppress") {
+    return security === "benign" || security === "noisy"
+      ? "Noisy or repetitive mail was suppressed so it would not waste attention."
+      : "Attention was suppressed because stronger noise controls outweighed direct action value.";
+  }
+
+  if (
+    (security === "benign" || security === "noisy") &&
+    (attention === "high" || attention === "urgent")
+  ) {
+    return "Safe but important, so Aegis surfaced it for the user.";
+  }
+
+  if (
+    (security === "suspicious" ||
+      security === "harmful" ||
+      security === "critical") &&
+    (attention === "high" || attention === "urgent")
+  ) {
+    return "User attention and security review both mattered for this message.";
+  }
+
+  if (attention === "none" || attention === "low") {
+    return "User attention was not requested because stronger noise or containment signals outweighed action value.";
+  }
+
+  return args.signalGroups.deterministic.decisionImportance.rationale;
+}
+
+function createReasonFragment(
+  fragment: InboxExplanationReasonFragment
+): InboxExplanationReasonFragment {
+  return {
+    ...fragment,
+    evidence: uniqueList(fragment.evidence, 4),
+    weight: clamp(Math.round(fragment.weight), 0, 100),
+  };
 }
 
 function buildSignalConflict(args: {
@@ -365,198 +556,627 @@ export function buildStructuredUncertainty(
 }
 
 export function buildExplanation(args: ExplanationArgs): InboxExplanation {
-  const factors: string[] = [];
-  const factorSet = new Set<string>();
+  const fragments: InboxExplanationReasonFragment[] = [];
+  const fragmentKeys = new Set<string>();
   const topCategory = args.signalGroups.deterministic.topCategoryScores[0];
-  const topRiskTags = args.signalGroups.deterministic.riskTags.slice(0, 2);
+  const topRiskTags = args.signalGroups.deterministic.riskTags.slice(0, 3);
   const classifier = args.signalGroups.learned.classifier;
   const consensus = args.signalGroups.learned.consensus;
   const importance = args.signalGroups.deterministic.decisionImportance;
-  const topClassifierProb = Math.round(maxProbability(classifier.probabilities) * 100);
+  const guardrailRules = args.signalGroups.deterministic.guardrails.ruleHits;
+  const falsePositiveCorrections = args.falsePositiveGuard?.corrections ?? [];
+  const falsePositiveRules = falsePositiveCorrections.map((correction) => correction.rule);
+  const allRules = Array.from(new Set([...guardrailRules, ...falsePositiveRules]));
 
-  const pushFactor = (value: string | null) => {
+  const auditTrail: InboxExplanationAuditTrail = {
+    topSignals: [],
+    scoreReducers: [],
+    attentionDrivers: [],
+    routeDrivers: [],
+  };
+
+  const pushAudit = (
+    bucket: keyof InboxExplanationAuditTrail,
+    value: string | null
+  ) => {
     if (!value) return;
     const normalized = value.trim();
-    if (!normalized || factorSet.has(normalized)) return;
-    factorSet.add(normalized);
-    factors.push(normalized);
+    if (!normalized) return;
+    if (auditTrail[bucket].includes(normalized)) return;
+    auditTrail[bucket].push(normalized);
+  };
+
+  const pushFragment = (
+    fragment: InboxExplanationReasonFragment,
+    buckets: Array<keyof InboxExplanationAuditTrail> = []
+  ) => {
+    const normalized = createReasonFragment(fragment);
+    const key = `${normalized.type}:${normalized.title}`;
+    if (fragmentKeys.has(key)) return;
+    fragmentKeys.add(key);
+    fragments.push(normalized);
+    for (const bucket of buckets) {
+      pushAudit(bucket, normalized.title);
+    }
   };
 
   if (topCategory) {
-    pushFactor(
-      `${humanizeToken(topCategory.category)} scored ${Math.round(topCategory.score)}/100`
-    );
-  }
-  if (args.decisionAxes) {
-    pushFactor(
-      `Attention ${args.decisionAxes.attentionPriority.level.toUpperCase()} / Security ${args.decisionAxes.securitySeverity.level.toUpperCase()} / Route ${args.decisionAxes.actionRoute.route.toUpperCase()}`
-    );
-  }
-  if (args.eventContext) {
-    pushFactor(
-      `Event ${humanizeToken(args.eventContext.primaryEventType)} (${args.eventContext.confidence}% confidence)${
-        args.eventContext.secondaryTags.length > 0
-          ? ` with tags ${args.eventContext.secondaryTags
-              .slice(0, 2)
-              .map(humanizeToken)
-              .join(", ")}`
-          : ""
-      }`
-    );
-  }
-  if (importance.attentionType === "act_now") {
-    pushFactor(
-      `Urgency ${importance.urgencyScore}/100 with relevance ${importance.relevanceScore}/100`
-    );
-  } else if (importance.attentionType === "verify_now") {
-    pushFactor(
-      `Threat ${importance.threatScore}/100 with trust gap ${importance.trustGapScore}/100`
-    );
-  } else if (importance.attentionType === "review_later") {
-    pushFactor(
-      `Opportunity ${importance.opportunityScore}/100 with relevance ${importance.relevanceScore}/100`
-    );
-  } else {
-    pushFactor(
-      `Noise ${importance.noiseScore}/100 outweighs urgency ${importance.urgencyScore}/100`
-    );
-  }
-  pushFactor(`Aegis action ${args.trustedDecision.action.toUpperCase()} at ${args.trustedDecision.riskScore}/100 risk`);
-  if (topRiskTags.length > 0) {
-    pushFactor(`Risk tags: ${topRiskTags.join(", ")}`);
-  }
-  if (
-    args.signalGroups.deterministic.trustScore <= 45 ||
-    args.signalGroups.deterministic.reputationScore <= 45
-  ) {
-    pushFactor(
-      `Trust ${args.signalGroups.deterministic.trustScore}/100 and reputation ${args.signalGroups.deterministic.reputationScore}/100`
-    );
-  }
-  if (args.signalGroups.deterministic.extractedCounts.attachmentRiskScore >= 30) {
-    pushFactor(
-      `${args.signalGroups.deterministic.extractedCounts.attachments} attachment(s) with ${args.signalGroups.deterministic.extractedCounts.attachmentRiskScore}/100 attachment risk`
-    );
-  } else if (args.signalGroups.deterministic.extractedCounts.urls > 0) {
-    pushFactor(
-      `${args.signalGroups.deterministic.extractedCounts.urls} extracted URL(s)`
-    );
-  }
-  pushFactor(
-      `Classifier predicted ${classifier.predictedClass.toUpperCase()} (${topClassifierProb}% probability)`
-  );
-  if (importance.affinityScore >= 35) {
-    pushFactor(`Historical affinity ${importance.affinityScore}/100 from past inbox outcomes`);
-  }
-  if (
-    consensus.disagreementFlags.length > 0 ||
-    consensus.strength < 0.58
-  ) {
-    pushFactor(
-      `Consensus strength ${Math.round(consensus.strength * 100)}%${consensus.disagreementFlags.length > 0 ? ` with flags ${consensus.disagreementFlags.slice(0, 2).join(", ")}` : ""}`
-    );
-  }
-  if (args.uncertainty.type.length > 0) {
-    pushFactor(
-      `Uncertainty ${Math.round(args.uncertainty.score * 100)}% due to ${args.uncertainty.type
-        .map(humanizeToken)
-        .join(", ")}`
-    );
-  }
-  if (args.signalGroups.deterministic.guardrails.ruleHits.length > 0) {
-    pushFactor(
-      `Policy hits: ${args.signalGroups.deterministic.guardrails.ruleHits
-        .slice(0, 2)
-        .join(", ")}`
-    );
-  }
-  const learningRuleHits = args.signalGroups.deterministic.guardrails.ruleHits.filter((rule) =>
-    rule.startsWith("learning_")
-  );
-  if (learningRuleHits.length > 0) {
-    pushFactor(
-      `Learning correction: ${learningRuleHits
-        .slice(0, 2)
-        .map(humanizeToken)
-        .join(", ")}`
+    pushFragment(
+      {
+        type: "category_signal",
+        direction: "context",
+        title: `Category signal: ${humanizeToken(topCategory.category)}`,
+        detail: `Top deterministic category score was ${Math.round(topCategory.score)}/100 for ${humanizeToken(
+          topCategory.category
+        )}.`,
+        evidence: [topCategory.reason],
+        weight: topCategory.score,
+      },
+      ["topSignals"]
     );
   }
 
-  while (factors.length < 3) {
-    if (factors.length === 0) {
-      pushFactor(`Primary category ${humanizeToken(args.primaryCategory)}`);
-    } else if (factors.length === 1) {
-      pushFactor(`Priority ${args.priorityScore}/100`);
-    } else {
-      pushFactor(
-        `Thread depth ${args.signalGroups.deterministic.thread.depth} with risk density ${args.signalGroups.deterministic.thread.riskDensity}`
+  if (args.eventContext) {
+    pushFragment(
+      {
+        type: "event_detected",
+        direction:
+          args.decisionAxes?.attentionPriority.level === "high" ||
+          args.decisionAxes?.attentionPriority.level === "urgent"
+            ? "increase_attention"
+            : "context",
+        title: `Event detected: ${humanizeToken(args.eventContext.primaryEventType)}`,
+        detail: `Aegis classified the message as ${toSentenceCase(
+          args.eventContext.primaryEventType
+        )} with ${args.eventContext.confidence}% confidence.`,
+        evidence: [
+          `confidence ${args.eventContext.confidence}%`,
+          args.eventContext.secondaryTags.length > 0
+            ? `secondary tags: ${args.eventContext.secondaryTags
+                .slice(0, 3)
+                .map(humanizeToken)
+                .join(", ")}`
+            : "",
+        ],
+        weight: args.eventContext.confidence,
+      },
+      ["topSignals"]
+    );
+
+    if (args.eventContext.sensitiveEvent.detected) {
+      pushFragment(
+        {
+          type: "sensitive_event",
+          direction: "increase_attention",
+          title: `Sensitive-event boost: ${humanizeToken(
+            args.eventContext.sensitiveEvent.family ?? "unknown"
+          )}`,
+          detail: `A high-confidence must-not-miss pattern raised attention without automatically treating the message as harmful.`,
+          evidence: [
+            `confidence ${args.eventContext.sensitiveEvent.confidence}%`,
+            `must-not-miss ${args.eventContext.sensitiveEvent.mustNotMissScore}/100`,
+            `time sensitivity ${humanizeToken(
+              args.eventContext.sensitiveEvent.timeSensitivity
+            )}`,
+            args.eventContext.sensitiveEvent.routeHint
+              ? `route hint ${args.eventContext.sensitiveEvent.routeHint}`
+              : "",
+          ],
+          weight: Math.max(
+            args.eventContext.sensitiveEvent.mustNotMissScore,
+            args.eventContext.sensitiveEvent.confidence
+          ),
+        },
+        ["topSignals", "attentionDrivers"]
       );
     }
   }
 
-  const keyFactors = factors.slice(0, 5);
-  let summaryLead = "Review later";
-  let summaryRationale = importance.rationale;
-  if (importance.attentionType === "act_now") {
-    summaryLead = "Act now";
-  } else if (importance.attentionType === "verify_now") {
-    summaryLead = "Verify before acting";
-  } else if (importance.attentionType === "ignore_routine") {
-    summaryLead = "Low-attention routine";
+  const noveltyFactor = args.urgencyPrediction?.predictionFactors.find(
+    (factor) =>
+      factor.factor === "P4_subject_trajectory" ||
+      factor.factor === "P3_conversation_gap"
+  );
+  if (noveltyFactor) {
+    pushFragment(
+      {
+        type: "pattern_novelty",
+        direction:
+          noveltyFactor.direction === "boost"
+            ? "increase_attention"
+            : "reduce_attention",
+        title:
+          noveltyFactor.factor === "P3_conversation_gap"
+            ? "Conversation timing pattern"
+            : "Subject-pattern novelty",
+        detail: noveltyFactor.rationale,
+        evidence: [
+          `prediction confidence ${args.urgencyPrediction?.predictionConfidence ?? 0}/100`,
+          `temporal mode ${humanizeToken(
+            args.urgencyPrediction?.temporalContext ?? "standard"
+          )}`,
+          `${noveltyFactor.direction} ${noveltyFactor.magnitude}`,
+        ],
+        weight: Math.min(
+          88,
+          36 +
+            (args.urgencyPrediction?.predictionConfidence ?? 0) * 0.35 +
+            noveltyFactor.magnitude * 3
+        ),
+      },
+      [
+        noveltyFactor.direction === "boost"
+          ? "attentionDrivers"
+          : "scoreReducers",
+      ]
+    );
   }
-  if (args.primaryCategory === "deadline_scheduling" && args.priorityScore >= 80) {
-    summaryLead = "Act now";
-    summaryRationale = "Time-sensitive message with a deadline or scheduling consequence if ignored.";
-  }
+
+  const harmfulProbability = Math.round(classifier.probabilities.harmful * 100);
+  const securityLevel = args.decisionAxes?.securitySeverity.level;
+  const shouldExplainSecurity =
+    securityLevel === "suspicious" ||
+    securityLevel === "harmful" ||
+    securityLevel === "critical";
   if (
-    (args.primaryCategory === "newsletter" || args.primaryCategory === "sales_marketing") &&
-    args.priorityScore < 40 &&
-    args.trustedDecision.action === "allow"
+    shouldExplainSecurity ||
+    topRiskTags.length > 0 ||
+    args.signalGroups.deterministic.extractedCounts.attachmentRiskScore >= 30 ||
+    harmfulProbability >= 40 ||
+    args.trustedDecision.action === "quarantine" ||
+    args.trustedDecision.action === "block"
   ) {
-    summaryLead = "Low-attention routine";
-    summaryRationale = "Promotional or routine noise signals outweigh any likely action value.";
+    pushFragment(
+      {
+        type: "security_signal",
+        direction: "increase_security",
+        title: shouldExplainSecurity
+          ? `Security signal: ${humanizeToken(securityLevel ?? "suspicious")} severity`
+          : "Security signal detected",
+        detail: args.decisionAxes
+          ? args.decisionAxes.securitySeverity.rationale
+          : `Security signals increased scrutiny and produced a ${args.trustedDecision.action.toUpperCase()} trusted action.`,
+        evidence: [
+          topRiskTags.length > 0 ? `risk tags: ${topRiskTags.join(", ")}` : "",
+          harmfulProbability > 0 ? `harmful probability ${harmfulProbability}%` : "",
+          args.signalGroups.deterministic.extractedCounts.attachmentRiskScore >= 30
+            ? `attachment risk ${args.signalGroups.deterministic.extractedCounts.attachmentRiskScore}/100`
+            : "",
+          args.decisionAxes?.securitySeverity.drivers[0] ?? "",
+        ],
+        weight: Math.max(
+          args.decisionAxes?.securitySeverity.score ?? 0,
+          args.trustedDecision.riskScore,
+          harmfulProbability,
+          args.signalGroups.deterministic.extractedCounts.attachmentRiskScore
+        ),
+      },
+      [
+        "topSignals",
+        ...(args.decisionAxes?.actionRoute.route === "quarantine" ||
+        args.decisionAxes?.actionRoute.route === "block"
+          ? (["routeDrivers"] as Array<keyof InboxExplanationAuditTrail>)
+          : []),
+      ]
+    );
   }
-  if (learningRuleHits.includes("learning_promo_fatigue")) {
-    summaryLead = "Low-attention routine";
-    summaryRationale =
-      "Repeated low-value promo history for this sender/category pushed Aegis to suppress the message as noise rather than treat it as harmful.";
-  } else if (learningRuleHits.includes("learning_transactional_protection")) {
-    summaryLead =
-      summaryLead === "Low-attention routine" ? "Review later" : summaryLead;
-    summaryRationale =
-      "Aegis protected this transactional or account-critical message from promo-history suppression because it still looks user-relevant.";
+
+  if (
+    args.signalGroups.deterministic.trustScore <= 45 ||
+    args.signalGroups.deterministic.reputationScore <= 45 ||
+    importance.trustGapScore >= 40
+  ) {
+    pushFragment(
+      {
+        type: "trust_gap",
+        direction: shouldExplainSecurity ? "increase_security" : "context",
+        title: "Trust gap",
+        detail: "Low sender trust, weak reputation, or a large trust gap increased scrutiny.",
+        evidence: [
+          `trust ${args.signalGroups.deterministic.trustScore}/100`,
+          `reputation ${args.signalGroups.deterministic.reputationScore}/100`,
+          `trust gap ${importance.trustGapScore}/100`,
+        ],
+        weight: Math.max(
+          importance.trustGapScore,
+          100 - args.signalGroups.deterministic.trustScore,
+          100 - args.signalGroups.deterministic.reputationScore
+        ),
+      },
+      ["topSignals"]
+    );
   }
-  const summary = `${summaryLead}: ${summaryRationale} Aegis recommends ${args.trustedDecision.action.toUpperCase()} with ${args.trustedDecision.riskScore}/100 risk. Drivers: ${keyFactors
-    .slice(0, 3)
-    .join("; ")}.`;
-  const eventSummary = args.eventContext
-    ? ` Primary event type is ${humanizeToken(args.eventContext.primaryEventType)}${
-        args.eventContext.secondaryTags.length > 0
-          ? ` with secondary tags ${args.eventContext.secondaryTags
-              .slice(0, 3)
-              .map(humanizeToken)
-              .join(", ")}`
-          : ""
-      }.`
-    : "";
-  const axisRelationshipSummary = args.decisionAxes
-    ? args.decisionAxes.attentionPriority.level === "none" ||
-      args.decisionAxes.attentionPriority.level === "low"
-      ? args.decisionAxes.securitySeverity.level === "harmful" ||
-        args.decisionAxes.securitySeverity.level === "critical"
-        ? "Dangerous, but no user attention is needed because Aegis is containing it automatically."
-        : "Low user attention is appropriate because the message is routine noise."
-      : args.decisionAxes.securitySeverity.level === "benign" ||
-          args.decisionAxes.securitySeverity.level === "noisy"
-        ? "Safe, but user attention is required because the message looks operational or personally relevant."
-        : "User attention and security review are both warranted for this message."
-    : "";
-  const summaryWithAxes = args.decisionAxes
-    ? `${summary}${eventSummary} Attention is ${args.decisionAxes.attentionPriority.level.toUpperCase()}, security severity is ${args.decisionAxes.securitySeverity.level.toUpperCase()}, and action route is ${args.decisionAxes.actionRoute.route.toUpperCase()}. ${axisRelationshipSummary}`
-    : `${summary}${eventSummary}`;
+
+  const staleUrgencyCorrections = falsePositiveCorrections.filter((correction) =>
+    correction.rule.startsWith("stale_urgency_decay")
+  );
+  if (
+    staleUrgencyCorrections.length > 0 ||
+    hasAnyRule(allRules, "stale_urgency_decay")
+  ) {
+    pushFragment(
+      {
+        type: "stale_urgency_decay",
+        direction: "reduce_attention",
+        title: "Stale urgency decay",
+        detail:
+          staleUrgencyCorrections[0]?.reason ||
+          "Expired deadline language reduced urgency instead of keeping the message elevated.",
+        evidence: [
+          staleUrgencyCorrections.map((correction) => correction.rule).join(", "),
+          ...staleUrgencyCorrections
+            .slice(0, 2)
+            .map((correction) => `${correction.delta} score: ${correction.reason}`),
+        ],
+        weight: Math.min(
+          90,
+          45 +
+            staleUrgencyCorrections.reduce(
+              (total, correction) => total + Math.abs(correction.delta),
+              0
+            ) *
+              2
+        ),
+      },
+      ["scoreReducers"]
+    );
+  }
+
+  const promoRules = allRules.filter(
+    (rule) =>
+      rule === "learning_promo_fatigue" ||
+      rule === "trusted_bulk_bleed_correction" ||
+      rule === "thread_fatigue_promo_boost"
+  );
+  if (
+    promoRules.length > 0 ||
+    (args.decisionAxes?.actionRoute.route === "suppress" &&
+      (args.primaryCategory === "newsletter" ||
+        args.primaryCategory === "sales_marketing"))
+  ) {
+    pushFragment(
+      {
+        type: "promo_suppression",
+        direction: "reduce_attention",
+        title: "Promotional suppression",
+        detail: promoRules.includes("learning_promo_fatigue")
+          ? "Repeated low-value promo history pushed Aegis to suppress attention without treating the message as harmful."
+          : promoRules.includes("trusted_bulk_bleed_correction")
+            ? "Trusted-sender familiarity was discounted because the message still looked like bulk promotional noise."
+            : "Promotional noise signals outweighed action value.",
+        evidence: [
+          promoRules.length > 0 ? `rules: ${promoRules.join(", ")}` : "",
+          `noise ${importance.noiseScore}/100`,
+          `urgency ${importance.urgencyScore}/100`,
+        ],
+        weight: Math.max(importance.noiseScore, 55),
+      },
+      ["scoreReducers", "routeDrivers"]
+    );
+  }
+
+  const silenceFlags =
+    args.temporalContext?.temporalFlags.filter((flag) =>
+      flag === "temporal:silence_break" || flag === "temporal:silence_cross_session"
+    ) ?? [];
+  if (
+    silenceFlags.length > 0 ||
+    args.temporalContext?.silenceBreak?.detected
+  ) {
+    pushFragment(
+      {
+        type: "silence_break",
+        direction: "increase_attention",
+        title: silenceFlags.includes("temporal:silence_cross_session")
+          ? "Cross-session silence break"
+          : "Silence break",
+        detail:
+          args.temporalContext?.silenceBreak?.rationale ||
+          "A sender broke their normal contact pattern, which raised attention.",
+        evidence: [
+          `temporal flags: ${silenceFlags.join(", ")}`,
+          `urgency delta ${args.temporalContext?.totalUrgencyDelta ?? 0}`,
+        ],
+        weight: Math.min(85, 48 + (args.temporalContext?.totalUrgencyDelta ?? 0) * 2),
+      },
+      ["attentionDrivers"]
+    );
+  }
+
+  const unresolvedFlags =
+    args.temporalContext?.temporalFlags.filter((flag) => flag === "temporal:unresolved_thread") ??
+    [];
+  if (
+    unresolvedFlags.length > 0 ||
+    args.temporalContext?.unresolvedThread?.detected
+  ) {
+    pushFragment(
+      {
+        type: "unresolved_thread",
+        direction:
+          args.temporalContext?.routingOverride ? "change_route" : "increase_attention",
+        title: "Unresolved thread follow-up",
+        detail:
+          args.temporalContext?.unresolvedThread?.rationale ||
+          "A follow-up arrived on a thread that already looked unresolved or actionable.",
+        evidence: [
+          `temporal flags: ${unresolvedFlags.join(", ")}`,
+          `urgency delta ${args.temporalContext?.totalUrgencyDelta ?? 0}`,
+          args.temporalContext?.routingOverride
+            ? `routing override ${args.temporalContext.routingOverride}`
+            : "",
+        ],
+        weight: Math.min(90, 55 + (args.temporalContext?.totalUrgencyDelta ?? 0) * 2),
+      },
+      ["topSignals", "attentionDrivers", "routeDrivers"]
+    );
+  }
+
+  const convergingFlags =
+    args.temporalContext?.temporalFlags.filter((flag) =>
+      flag.startsWith("temporal:converging:") || flag.startsWith("temporal:campaign:")
+    ) ?? [];
+  if (
+    convergingFlags.length > 0 ||
+    args.temporalContext?.convergingSignal?.detected
+  ) {
+    pushFragment(
+      {
+        type: "converging_signals",
+        direction:
+          (args.temporalContext?.totalThreatDelta ?? 0) > 0
+            ? "increase_security"
+            : "increase_attention",
+        title: "Converging cross-email signals",
+        detail:
+          args.temporalContext?.convergingSignal?.rationale ||
+          "Multiple messages in the session pointed at the same cluster of signals.",
+        evidence: [
+          convergingFlags.length > 0 ? `temporal flags: ${convergingFlags.slice(0, 2).join(", ")}` : "",
+          `urgency delta ${args.temporalContext?.totalUrgencyDelta ?? 0}`,
+          `threat delta ${args.temporalContext?.totalThreatDelta ?? 0}`,
+        ],
+        weight: Math.min(
+          92,
+          52 +
+            (args.temporalContext?.totalUrgencyDelta ?? 0) +
+            (args.temporalContext?.totalThreatDelta ?? 0) * 2
+        ),
+      },
+      ["topSignals", "attentionDrivers"]
+    );
+  }
+
+  const feedbackRules = allRules.filter(
+    (rule) =>
+      rule.startsWith("learning_") || rule.startsWith("feedback_memory_")
+  );
+  if (
+    feedbackRules.length > 0 ||
+    (classifier.memorySampleCount > 0 && importance.affinityScore >= 35)
+  ) {
+    const supportiveHistory =
+      feedbackRules.includes("learning_transactional_protection") ||
+      feedbackRules.includes("learning_harmful_reinforcement");
+    pushFragment(
+      {
+        type: "user_feedback_history",
+        direction: supportiveHistory ? "increase_attention" : "reduce_attention",
+        title: "User feedback history",
+        detail: feedbackRules.includes("learning_transactional_protection")
+          ? "Historical feedback protected this message from being buried by sender or promo history."
+          : feedbackRules.includes("learning_harmful_reinforcement")
+            ? "Historical feedback reinforced that similar messages have been dangerous before."
+            : feedbackRules.includes("learning_promo_fatigue")
+              ? "Historical outcomes showed repeated low-value patterns for this sender or category."
+              : "Historical inbox outcomes influenced the current decision.",
+        evidence: [
+          feedbackRules.length > 0 ? `rules: ${feedbackRules.slice(0, 3).join(", ")}` : "",
+          classifier.memorySampleCount > 0 ? `memory samples ${classifier.memorySampleCount}` : "",
+          `affinity ${importance.affinityScore}/100`,
+        ],
+        weight: Math.min(
+          88,
+          40 +
+            importance.affinityScore +
+            Math.min(classifier.memorySampleCount, 10) * 2
+        ),
+      },
+      [supportiveHistory ? "attentionDrivers" : "scoreReducers"]
+    );
+  }
+
+  if (args.falsePositiveGuard?.guardActivated && falsePositiveCorrections.length > 0) {
+    pushFragment(
+      {
+        type: "false_positive_guard",
+        direction: "reduce_attention",
+        title: "False-positive guard correction",
+        detail: `Aegis applied ${falsePositiveCorrections.length} correction(s) to avoid over-escalating the message.`,
+        evidence: [
+          `rules: ${falsePositiveCorrections
+            .slice(0, 3)
+            .map((correction) => correction.rule)
+            .join(", ")}`,
+          ...falsePositiveCorrections
+            .slice(0, 2)
+            .map((correction) => correction.reason),
+        ],
+        weight: Math.min(
+          90,
+          38 +
+            falsePositiveCorrections.reduce(
+              (total, correction) => total + Math.abs(correction.delta),
+              0
+            ) *
+              2
+        ),
+      },
+      ["scoreReducers"]
+    );
+  }
+
+  const lowConsensus =
+    consensus.disagreementFlags.length > 0 || consensus.strength < 0.58;
+  if (
+    args.uncertainty.type.length > 0 ||
+    lowConsensus ||
+    args.decision?.final_action === "human_review"
+  ) {
+    pushFragment(
+      {
+        type: "uncertainty_trigger",
+        direction:
+          args.decision?.final_action === "human_review"
+            ? "change_route"
+            : "reduce_confidence",
+        title: "Uncertainty trigger",
+        detail:
+          args.decision?.final_action === "human_review"
+            ? "Uncertainty or disagreement forced a human review workflow."
+            : "Aegis lowered confidence because the evidence was incomplete or conflicting.",
+        evidence: [
+          `uncertainty ${Math.round(args.uncertainty.score * 100)}%`,
+          args.uncertainty.type.length > 0
+            ? `types: ${args.uncertainty.type.map(humanizeToken).join(", ")}`
+            : "",
+          `consensus strength ${Math.round(consensus.strength * 100)}%`,
+          consensus.disagreementFlags.length > 0
+            ? `flags: ${consensus.disagreementFlags.slice(0, 2).join(", ")}`
+            : "",
+        ],
+        weight: Math.max(
+          Math.round(args.uncertainty.score * 100),
+          100 - Math.round(consensus.strength * 100)
+        ),
+      },
+      [
+        ...(args.decision?.final_action === "human_review"
+          ? (["routeDrivers"] as Array<keyof InboxExplanationAuditTrail>)
+          : []),
+        "topSignals",
+      ]
+    );
+  }
+
+  if (
+    args.decisionAxes ||
+    args.decision?.final_action ||
+    args.temporalContext?.routingOverride
+  ) {
+    const routeTitle =
+      args.decision?.final_action === "human_review"
+        ? "Workflow route: human review"
+        : args.decisionAxes
+          ? `Route: ${humanizeToken(args.decisionAxes.actionRoute.route)}`
+          : "Workflow route decided";
+
+    pushFragment(
+      {
+        type: "route_change",
+        direction: "change_route",
+        title: routeTitle,
+        detail:
+          args.temporalContext?.routingOverride
+            ? `Temporal context changed the workflow route to ${args.temporalContext.routingOverride}.`
+            : args.decision?.reason ||
+              args.decisionAxes?.actionRoute.rationale ||
+              `Aegis chose ${args.trustedDecision.action.toUpperCase()} as the safest next action.`,
+        evidence: [
+          args.decisionAxes
+            ? `action route ${args.decisionAxes.actionRoute.route}`
+            : "",
+          args.decision ? `workflow ${args.decision.final_action}` : "",
+          args.temporalContext?.routingOverride
+            ? `temporal override ${args.temporalContext.routingOverride}`
+            : "",
+          args.decisionAxes?.actionRoute.source
+            ? `source ${args.decisionAxes.actionRoute.source}`
+            : "",
+        ],
+        weight: Math.max(
+          args.trustedDecision.riskScore,
+          args.decision?.final_action === "human_review" ? 78 : 52
+        ),
+      },
+      ["routeDrivers"]
+    );
+  }
+
+  if (fragments.length === 0) {
+    pushFragment(
+      {
+        type: "category_signal",
+        direction: "context",
+        title: `Category signal: ${humanizeToken(args.primaryCategory)}`,
+        detail: `Aegis fell back to the primary category ${humanizeToken(
+          args.primaryCategory
+        )} because no stronger structured rationale was available.`,
+        evidence: [`priority ${args.priorityScore}/100`],
+        weight: Math.max(20, args.priorityScore),
+      },
+      ["topSignals"]
+    );
+  }
+
+  fragments.sort((left, right) => right.weight - left.weight);
+
+  if (auditTrail.attentionDrivers.length === 0 && args.decisionAxes) {
+    for (const driver of args.decisionAxes.attentionPriority.drivers.slice(0, 2)) {
+      pushAudit("attentionDrivers", toSentenceCase(driver));
+    }
+  }
+  if (auditTrail.routeDrivers.length === 0 && args.decisionAxes) {
+    pushAudit("routeDrivers", args.decisionAxes.actionRoute.rationale);
+  }
+  if (auditTrail.topSignals.length === 0 && args.decisionAxes) {
+    for (const driver of args.decisionAxes.securitySeverity.drivers.slice(0, 2)) {
+      pushAudit("topSignals", toSentenceCase(driver));
+    }
+  }
+  if (auditTrail.scoreReducers.length === 0 && importance.noiseScore >= 65) {
+    pushAudit("scoreReducers", `Noise ${importance.noiseScore}/100 outweighed urgency ${importance.urgencyScore}/100`);
+  }
+
+  const keyFactors = uniqueList(
+    [
+      ...auditTrail.topSignals,
+      ...auditTrail.attentionDrivers,
+      ...auditTrail.routeDrivers,
+      ...auditTrail.scoreReducers,
+      ...fragments.slice(0, 5).map((fragment) => fragment.title),
+      `Priority ${args.priorityScore}/100`,
+    ],
+    5
+  );
+
+  const summaryParts = [
+    `${buildRouteLead(args)}: ${buildRelationshipSummary(args)}`,
+  ];
+  if (args.decisionAxes) {
+    summaryParts.push(
+      `Attention ${args.decisionAxes.attentionPriority.level.toUpperCase()}, security ${args.decisionAxes.securitySeverity.level.toUpperCase()}, action route ${args.decisionAxes.actionRoute.route.toUpperCase()}.`
+    );
+  }
+  if (auditTrail.topSignals.length > 0) {
+    summaryParts.push(`Top signals: ${auditTrail.topSignals.slice(0, 2).join("; ")}.`);
+  }
+  if (auditTrail.scoreReducers.length > 0) {
+    summaryParts.push(`Score reducers: ${auditTrail.scoreReducers.slice(0, 2).join("; ")}.`);
+  }
+  if (auditTrail.routeDrivers.length > 0) {
+    summaryParts.push(`Route drivers: ${auditTrail.routeDrivers.slice(0, 2).join("; ")}.`);
+  }
 
   return {
     keyFactors,
-    summary: summaryWithAxes,
+    summary: summaryParts.join(" "),
+    reasonFragments: fragments.slice(0, 12),
+    auditTrail: {
+      topSignals: auditTrail.topSignals.slice(0, 4),
+      scoreReducers: auditTrail.scoreReducers.slice(0, 4),
+      attentionDrivers: auditTrail.attentionDrivers.slice(0, 4),
+      routeDrivers: auditTrail.routeDrivers.slice(0, 4),
+    },
   };
 }

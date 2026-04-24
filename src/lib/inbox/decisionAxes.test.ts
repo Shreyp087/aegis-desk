@@ -37,6 +37,16 @@ function buildExample(args: {
   temporalFlags?: string[];
   eventType?: InboxEventType;
   secondaryEventTags?: InboxEventType[];
+  adaptiveCalibration?: {
+    attentionHighFloor: number;
+    attentionUrgentFloor: number;
+    securitySuspiciousFloor: number;
+    securityHarmfulFloor: number;
+    surfaceAttentionFloor: number;
+    escalateSecurityFloor: number;
+    promoSuppressionSensitivity: number;
+    mustNotMissFloor: number;
+  };
 }) {
   return buildDecisionAxes({
     primaryCategory: args.primaryCategory,
@@ -82,6 +92,7 @@ function buildExample(args: {
     subject: args.subject,
     bodyPreview: args.bodyPreview,
     temporalFlags: args.temporalFlags ?? [],
+    adaptiveCalibration: args.adaptiveCalibration,
     eventContext: args.eventType
       ? {
           primaryEventType: args.eventType,
@@ -93,6 +104,8 @@ function buildExample(args: {
             confidence: 0,
             attentionBoost: 0,
             securityBoost: 0,
+            mustNotMissScore: 0,
+            timeSensitivity: "low",
             routeHint: null,
             rationale: "test default",
             guardrails: [],
@@ -206,6 +219,72 @@ test("purchase confirmation is high attention, benign severity, and surfaced", (
   assert.equal(axes.actionRoute.route, "surface");
 });
 
+test("high-confidence sensitive account-security hints can escalate the action route", () => {
+  const axes = buildDecisionAxes({
+    primaryCategory: "security_phishing",
+    priorityScore: 52,
+    priorityBand: "medium",
+    mailClass: "actionable",
+    decisionImportance: {
+      threatScore: 58,
+      urgencyScore: 64,
+      relevanceScore: 70,
+      opportunityScore: 0,
+      noiseScore: 10,
+      trustGapScore: 34,
+      affinityScore: 14,
+      attentionType: "act_now",
+      rationale: "test rationale",
+    },
+    trustedDecision: {
+      action: "allow",
+      riskScore: 44,
+    },
+    decision: {
+      final_action: "auto_triage",
+      reason: "test route reason",
+      risk_level: "medium",
+    },
+    threatType: "none",
+    classifier: {
+      probabilities: {
+        harmful: 0.34,
+        actionable: 0.46,
+        informational: 0.14,
+        spam: 0.06,
+      },
+    },
+    extracted: {
+      attachmentRiskScore: 0,
+      urls: ["https://provider.example/security"],
+      deadlines: [],
+    },
+    riskTags: ["Security"],
+    subject: "Security alert: suspicious sign-in detected",
+    bodyPreview: "We noticed a new sign-in attempt from a device we do not recognize.",
+    eventContext: {
+      primaryEventType: "login_alert",
+      secondaryTags: ["new_device_signin", "security_warning"],
+      confidence: 94,
+      sensitiveEvent: {
+        detected: true,
+        family: "account_security",
+        confidence: 94,
+        attentionBoost: 20,
+        securityBoost: 12,
+        mustNotMissScore: 90,
+        timeSensitivity: "high",
+        routeHint: "escalate",
+        rationale: "account anomaly with elevated security context",
+        guardrails: [],
+      },
+    },
+  });
+
+  assert.equal(axes.securitySeverity.level, "suspicious");
+  assert.equal(axes.actionRoute.route, "escalate");
+});
+
 test("Temu promotional sale email is low attention, noisy severity, and suppressed", () => {
   const axes = buildExample({
     primaryCategory: "sales_marketing",
@@ -301,7 +380,7 @@ test("job application status update is high attention, benign severity, and surf
     actionableProbability: 0.72,
     informationalProbability: 0.25,
     eventType: "job_application_update",
-    secondaryEventTags: ["interview_scheduled"],
+    secondaryEventTags: ["interview_update"],
   });
 
   assert.equal(axes.attentionPriority.level, "high");
@@ -336,8 +415,131 @@ test("feedback label preserves the new three-axis model", () => {
 
   assert.equal(
     buildDecisionAxesFeedbackLabel(axes),
-    "attention:low|security:noisy|route:suppress|trusted:allow"
+    "attention:none|security:noisy|route:suppress|trusted:allow"
   );
+});
+
+test("adaptive promo suppression sensitivity keeps promo mail suppressed aggressively", () => {
+  const axes = buildExample({
+    primaryCategory: "sales_marketing",
+    priorityScore: 28,
+    priorityBand: "low",
+    mailClass: "spam",
+    threatType: "none",
+    trustedAction: "allow",
+    finalAction: "auto_triage",
+    riskLevel: "low",
+    subject: "Weekend Temu coupon blast",
+    bodyPreview: "Flash sale, coupon inside, shop now for 70% off.",
+    threatScore: 8,
+    urgencyScore: 16,
+    relevanceScore: 12,
+    opportunityScore: 10,
+    noiseScore: 84,
+    trustGapScore: 10,
+    attentionType: "ignore_routine",
+    harmfulProbability: 0.04,
+    spamProbability: 0.72,
+    eventType: "promotional_commerce",
+    secondaryEventTags: ["bulk_marketing"],
+    adaptiveCalibration: {
+      attentionHighFloor: 75,
+      attentionUrgentFloor: 88,
+      securitySuspiciousFloor: 40,
+      securityHarmfulFloor: 70,
+      surfaceAttentionFloor: 60,
+      escalateSecurityFloor: 72,
+      promoSuppressionSensitivity: 76,
+      mustNotMissFloor: 80,
+    },
+  });
+
+  assert.ok(
+    axes.attentionPriority.level === "none" ||
+      axes.attentionPriority.level === "low"
+  );
+  assert.equal(axes.actionRoute.route, "suppress");
+  assert.ok(
+    axes.attentionPriority.drivers.some((driver) =>
+      driver.includes("suppression sensitivity 76/100")
+    )
+  );
+});
+
+test("adaptive must-not-miss floor protects benign operational mail faster", () => {
+  const axes = buildDecisionAxes({
+    primaryCategory: "ops_support",
+    priorityScore: 52,
+    priorityBand: "medium",
+    mailClass: "informational",
+    decisionImportance: {
+      threatScore: 14,
+      urgencyScore: 40,
+      relevanceScore: 52,
+      opportunityScore: 8,
+      noiseScore: 12,
+      trustGapScore: 10,
+      affinityScore: 16,
+      attentionType: "review_later",
+      rationale: "test rationale",
+    },
+    trustedDecision: {
+      action: "allow",
+      riskScore: 18,
+    },
+    decision: {
+      final_action: "auto_triage",
+      reason: "test route reason",
+      risk_level: "low",
+    },
+    threatType: "none",
+    classifier: {
+      probabilities: {
+        harmful: 0.06,
+        actionable: 0.54,
+        informational: 0.34,
+        spam: 0.06,
+      },
+    },
+    extracted: {
+      attachmentRiskScore: 0,
+      urls: [],
+      deadlines: [],
+    },
+    riskTags: [],
+    subject: "Welcome to your new membership",
+    bodyPreview: "Your membership is active and ready to use.",
+    adaptiveCalibration: {
+      attentionHighFloor: 70,
+      attentionUrgentFloor: 86,
+      securitySuspiciousFloor: 40,
+      securityHarmfulFloor: 70,
+      surfaceAttentionFloor: 54,
+      escalateSecurityFloor: 72,
+      promoSuppressionSensitivity: 42,
+      mustNotMissFloor: 72,
+    },
+    eventContext: {
+      primaryEventType: "new_membership",
+      secondaryTags: ["subscription_created"],
+      confidence: 90,
+      sensitiveEvent: {
+        detected: true,
+        family: "membership_lifecycle",
+        confidence: 90,
+        attentionBoost: 16,
+        securityBoost: 2,
+        mustNotMissScore: 78,
+        timeSensitivity: "high",
+        routeHint: "surface",
+        rationale: "membership lifecycle event",
+        guardrails: [],
+      },
+    },
+  });
+
+  assert.equal(axes.attentionPriority.level, "high");
+  assert.equal(axes.actionRoute.route, "surface");
 });
 
 test("OTP stays high attention even in a promo-heavy mailbox", () => {
@@ -393,6 +595,8 @@ test("OTP stays high attention even in a promo-heavy mailbox", () => {
         confidence: 96,
         attentionBoost: 24,
         securityBoost: 0,
+        mustNotMissScore: 96,
+        timeSensitivity: "expires_soon",
         routeHint: "surface",
         rationale: "short-lived auth flow",
         guardrails: [],
@@ -458,6 +662,8 @@ test("known-provider security alert is surfaced with suspicious severity", () =>
         confidence: 92,
         attentionBoost: 20,
         securityBoost: 12,
+        mustNotMissScore: 90,
+        timeSensitivity: "high",
         routeHint: "surface",
         rationale: "account anomaly",
         guardrails: [],
@@ -473,7 +679,7 @@ test("known-provider security alert is surfaced with suspicious severity", () =>
   assert.equal(axes.actionRoute.route, "surface");
 });
 
-test("new membership email becomes high attention without being harmful", () => {
+test("subscription-created membership email becomes high attention without being harmful", () => {
   const axes = buildDecisionAxes({
     primaryCategory: "general",
     priorityScore: 34,
@@ -517,8 +723,8 @@ test("new membership email becomes high attention without being harmful", () => 
     subject: "Welcome, your trial started",
     bodyPreview: "Your membership has been created and your plan is now active.",
     eventContext: {
-      primaryEventType: "new_membership",
-      secondaryTags: ["subscription_renewal"],
+      primaryEventType: "subscription_created",
+      secondaryTags: ["new_membership"],
       confidence: 86,
       sensitiveEvent: {
         detected: true,
@@ -526,6 +732,8 @@ test("new membership email becomes high attention without being harmful", () => 
         confidence: 86,
         attentionBoost: 16,
         securityBoost: 2,
+        mustNotMissScore: 82,
+        timeSensitivity: "high",
         routeHint: "surface",
         rationale: "membership lifecycle",
         guardrails: [],

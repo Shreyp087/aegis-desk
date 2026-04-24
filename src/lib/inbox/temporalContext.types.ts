@@ -2,9 +2,12 @@ import type { ClusterKey, SessionStore } from "./sessionStore.types";
 
 export type SilenceBreakSignal = {
   detected: boolean;
+  source: "intra_batch" | "cross_session" | null;
   gapHours: number;
   expectedGapHours: number;
   deviationFactor: number;
+  priorCadenceSamples: number;
+  novelSubjectPattern: boolean;
   urgencyBoost: number;
   confidence: number;
   rationale: string;
@@ -14,9 +17,11 @@ export type UnresolvedThreadSignal = {
   detected: boolean;
   threadKeyHash: string;
   priorScoredCount: number;
+  actionablePriorCount: number;
   hoursApart: number;
   priorMaxBand: "high" | "medium" | "low" | null;
   priorMaxAction: string | null;
+  novelSubjectPattern: boolean;
   urgencyBoost: number;
   routingOverride: "escalate" | "human_review" | null;
   rationale: string;
@@ -26,6 +31,9 @@ export type ConvergingSignalSignal = {
   detected: boolean;
   clusterKey: ClusterKey;
   distinctDomains: number;
+  matchedRecordCount: number;
+  matchingSubjectDomains: number;
+  windowSpanHours: number;
   signalStrength: number;
   urgencyBoost: number;
   threatElevation: number;
@@ -41,12 +49,15 @@ export type TemporalContextResult = {
   totalThreatDelta: number;
   routingOverride: "escalate" | "human_review" | null;
   temporalFlags: string[];
+  dominantTemporalSignal: "silence_break" | "unresolved_thread" | "converging_signal" | null;
+  explanationNotes: string[];
 };
 
 export type TemporalContextInput = {
   senderDomainHash: string;
   threadKeyHash: string;
   clusterKey: ClusterKey;
+  subjectPatternHash: string;
   receivedAt: number;
   trustGraph: {
     senderScore: number;

@@ -21,6 +21,10 @@ export type UrgencyPredictorInput = {
     avgResponseGapHours: number | null;
     lastEmailFromSender: Date | null;
   };
+  batchContext?: {
+    currentSubjectPatternHash: string;
+    priorSenderSubjectPatternHashes: string[];
+  };
   currentDecisionProfile: {
     urgency: number;
     relevance: number;
@@ -58,32 +62,14 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 /**
- * Normalizes a subject line into a stable digest key before hashing.
+ * Hashes the exact stored subject form used by incident memory.
  *
  * Pipeline step: subject-trajectory analysis inside predictive urgency.
- * False-positive scenario addressed: recurring digest-style subjects should suppress urgency even when wording shifts slightly.
+ * False-positive scenario addressed: keeps recurring exact-subject history comparable with the hashes already persisted in evaluation memory.
  */
-function normalizeSubject(subject: string): string {
-  return subject
-    .toLowerCase()
-    .replace(/^(re|fw|fwd)\s*:\s*/g, "")
-    .replace(/[^\w\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .split(" ")
-    .slice(0, 6)
-    .join(" ");
-}
-
-/**
- * Hashes the normalized subject into a compact comparison token.
- *
- * Pipeline step: subject-line trajectory scoring for predictive urgency.
- * False-positive scenario addressed: lets the predictor distinguish novel one-off subjects from recurring low-value threads.
- */
-function hashNormalizedSubject(subject: string): string {
+function hashStoredSubject(subject: string): string {
   return createHash("sha256")
-    .update(normalizeSubject(subject))
+    .update(`subject:${subject}`)
     .digest("hex")
     .slice(0, 20);
 }
@@ -256,7 +242,7 @@ function scoreConversationGap(
 function scoreSubjectTrajectory(
   input: UrgencyPredictorInput
 ): PredictionFactor | null {
-  const currentHash = hashNormalizedSubject(input.email.subject);
+  const currentHash = hashStoredSubject(input.email.subject);
   const matchingPriorityScores = input.history.subjectHashes.flatMap(
     (subjectHash, index) =>
       subjectHash === currentHash &&
@@ -265,6 +251,18 @@ function scoreSubjectTrajectory(
         : []
   );
   const novelSubject = !input.history.subjectHashes.includes(currentHash);
+  const repeatedBatchPattern =
+    input.batchContext?.priorSenderSubjectPatternHashes.includes(
+      input.batchContext.currentSubjectPatternHash
+    ) ?? false;
+  const priorBatchPatternCount = input.batchContext?.priorSenderSubjectPatternHashes.filter(
+    (subjectPatternHash) =>
+      subjectPatternHash === input.batchContext?.currentSubjectPatternHash
+  ).length ?? 0;
+  const novelBatchPattern =
+    Boolean(input.batchContext?.currentSubjectPatternHash) &&
+    !repeatedBatchPattern &&
+    (input.batchContext?.priorSenderSubjectPatternHashes.length ?? 0) > 0;
 
   if (novelSubject && input.trust.seen >= 4) {
     return {
@@ -272,6 +270,16 @@ function scoreSubjectTrajectory(
       direction: "boost",
       magnitude: 11,
       rationale: "Novel subject from an established sender is more likely to indicate a real change in importance.",
+    };
+  }
+
+  if (novelBatchPattern && input.trust.seen >= 3) {
+    return {
+      factor: "P4_subject_trajectory",
+      direction: "boost",
+      magnitude: 7,
+      rationale:
+        "Novel hashed subject pattern within the current batch suggests a meaningful change from this sender.",
     };
   }
 
@@ -287,6 +295,16 @@ function scoreSubjectTrajectory(
       direction: "suppress",
       magnitude: 9,
       rationale: "Recurring low-value subject pattern detected for this sender.",
+    };
+  }
+
+  if (repeatedBatchPattern && priorBatchPatternCount >= 2 && input.currentDecisionProfile.urgency < 55) {
+    return {
+      factor: "P4_subject_trajectory",
+      direction: "suppress",
+      magnitude: 6,
+      rationale:
+        "Repeated hashed subject pattern within the current batch looks routine rather than newly urgent.",
     };
   }
 

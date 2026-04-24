@@ -15,6 +15,26 @@ export function hashSignal(input: string): string {
 }
 
 /**
+ * Produces a normalized subject-pattern hash for safe novelty and repetition checks.
+ *
+ * Pipeline step: used during session-store construction so batch-level novelty can be reasoned about without retaining subject text.
+ * False-positive scenario addressed: allows repeat-pattern suppression and novel-pattern boosts using hashed patterns rather than raw subject lines.
+ */
+export function hashSubjectPattern(subject: string): string {
+  const normalized = subject
+    .toLowerCase()
+    .replace(/^(re|fw|fwd)\s*:\s*/g, "")
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .slice(0, 6)
+    .join(" ");
+
+  return hashSignal(`subject-pattern:${normalized || "none"}`);
+}
+
+/**
  * Derives one of the six allowed cluster labels from already-available pipeline signals.
  *
  * Pipeline step: used during session-store construction so convergence detection works on coarse signal buckets instead of raw text.
@@ -82,6 +102,7 @@ export function buildSessionStore(
     senderDomain: string;
     threadKey: string;
     receivedAt: Date | null;
+    subjectPatternHash: string;
     moneyMentions: string[];
     deadlines: string[];
     primaryCategory: string;
@@ -101,6 +122,7 @@ export function buildSessionStore(
       email.primaryCategory,
       email.body
     ),
+    subjectPatternHash: email.subjectPatternHash,
     receivedAt: email.receivedAt?.getTime() ?? 0,
     priorityScore: 0,
     priorityBand: "low",
@@ -118,6 +140,7 @@ export function buildSessionStore(
   const bySenderDomain = new Map<string, SessionEmailRecord[]>();
   const byThreadKey = new Map<string, SessionEmailRecord[]>();
   const byCluster = new Map<string, SessionEmailRecord[]>();
+  const bySubjectPattern = new Map<string, SessionEmailRecord[]>();
 
   /**
    * Inserts a record into one of the pre-sorted index maps.
@@ -142,12 +165,14 @@ export function buildSessionStore(
     pushToIndex(bySenderDomain, record.senderDomainHash, record);
     pushToIndex(byThreadKey, record.threadKeyHash, record);
     pushToIndex(byCluster, record.clusterKey, record);
+    pushToIndex(bySubjectPattern, record.subjectPatternHash, record);
   }
 
   return {
     bySenderDomain,
     byThreadKey,
     byCluster,
+    bySubjectPattern,
     allRecords,
     sessionId: randomUUID(),
     emailCount: allRecords.length,
@@ -242,6 +267,24 @@ export function getClusterRecords(
   return (store.byCluster.get(clusterKey) ?? []).filter(
     (record) => record.senderDomainHash !== excludeDomainHash
   );
+}
+
+/**
+ * Returns all records matching one hashed subject pattern, optionally excluding one sender domain.
+ *
+ * Pipeline step: temporal novelty and convergence logic uses this O(1) pattern view to detect repeated or coordinated hashed subject families.
+ * False-positive scenario addressed: lets the pipeline reason about novelty and repetition without ever storing raw subject text.
+ */
+export function getSubjectPatternRecords(
+  store: SessionStore,
+  subjectPatternHash: string,
+  excludeDomainHash?: string
+): SessionEmailRecord[] {
+  const records = store.bySubjectPattern.get(subjectPatternHash) ?? [];
+  if (!excludeDomainHash) {
+    return records;
+  }
+  return records.filter((record) => record.senderDomainHash !== excludeDomainHash);
 }
 
 /**

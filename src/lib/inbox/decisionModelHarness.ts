@@ -1,6 +1,8 @@
 import { buildExplanation, buildSignalGroups } from "./compatibility";
 import {
   buildDecisionAxes,
+  deriveAttentionPriority,
+  deriveSecuritySeverity,
   type AttentionPriorityLevel,
   type InboxDecisionAxes,
   type SecuritySeverityLevel,
@@ -141,6 +143,8 @@ const TRANSACTIONAL_EVENTS = new Set<InboxEventType>([
   "order_shipped",
   "receipt_invoice",
   "billing_issue",
+  "payment_declined",
+  "subscription_created",
   "subscription_renewal",
   "refund_update",
   "new_membership",
@@ -148,6 +152,7 @@ const TRANSACTIONAL_EVENTS = new Set<InboxEventType>([
 
 const JOB_EVENTS = new Set<InboxEventType>([
   "job_application_update",
+  "interview_update",
   "interview_scheduled",
   "recruiter_reply",
 ]);
@@ -284,10 +289,76 @@ export function runDecisionBenchmarkFixture(
     },
   });
 
+  const precomputedAttentionPriority = deriveAttentionPriority({
+    primaryCategory: fixture.scoring.primaryCategory,
+    priorityScore: fixture.legacy.priorityScore,
+    priorityBand: fixture.legacy.priorityBand,
+    mailClass: fixture.legacy.mailClass,
+    decisionImportance: fixture.scoring.decisionImportance,
+    trustedDecision: {
+      action: fixture.legacy.trustedAction,
+      riskScore: fixture.legacy.riskScore,
+    },
+    legacyRiskLevel:
+      fixture.legacy.riskScore >= 70
+        ? "high"
+        : fixture.legacy.riskScore >= 40
+          ? "medium"
+          : "low",
+    threatType: fixture.legacy.threatType,
+    classifier: {
+      probabilities: fixture.legacy.classifier,
+    },
+    extracted: {
+      attachmentRiskScore: fixture.email.extracted.attachmentRiskScore,
+      urls: fixture.email.extracted.urls,
+      deadlines: fixture.email.extracted.deadlines,
+    },
+    riskTags: fixture.scoring.riskTags,
+    subject: fixture.email.subject,
+    bodyPreview: fixture.email.body,
+    temporalFlags: fixture.scoring.temporalFlags ?? [],
+    eventContext,
+  });
+  const precomputedSecuritySeverity = deriveSecuritySeverity({
+    primaryCategory: fixture.scoring.primaryCategory,
+    priorityScore: fixture.legacy.priorityScore,
+    priorityBand: fixture.legacy.priorityBand,
+    mailClass: fixture.legacy.mailClass,
+    decisionImportance: fixture.scoring.decisionImportance,
+    trustedDecision: {
+      action: fixture.legacy.trustedAction,
+      riskScore: fixture.legacy.riskScore,
+    },
+    legacyRiskLevel:
+      fixture.legacy.riskScore >= 70
+        ? "high"
+        : fixture.legacy.riskScore >= 40
+          ? "medium"
+          : "low",
+    threatType: fixture.legacy.threatType,
+    classifier: {
+      probabilities: fixture.legacy.classifier,
+    },
+    extracted: {
+      attachmentRiskScore: fixture.email.extracted.attachmentRiskScore,
+      urls: fixture.email.extracted.urls,
+      deadlines: fixture.email.extracted.deadlines,
+    },
+    riskTags: fixture.scoring.riskTags,
+    subject: fixture.email.subject,
+    bodyPreview: fixture.email.body,
+    temporalFlags: fixture.scoring.temporalFlags ?? [],
+    eventContext,
+  });
+
   const decision = routeInboxDecision({
     confidencePct: fixture.legacy.confidencePct,
     uncertaintyPercent: fixture.legacy.uncertaintyPercent,
     riskScore: fixture.legacy.riskScore,
+    attentionPriorityLevel: precomputedAttentionPriority.level,
+    securitySeverityLevel: precomputedSecuritySeverity.level,
+    trustedAction: fixture.legacy.trustedAction,
     disagreementFlags: fixture.legacy.disagreementFlags ?? [],
   });
 
@@ -316,6 +387,8 @@ export function runDecisionBenchmarkFixture(
     bodyPreview: fixture.email.body,
     temporalFlags: fixture.scoring.temporalFlags ?? [],
     eventContext,
+    precomputedAttentionPriority,
+    precomputedSecuritySeverity,
   });
 
   const signalGroups = buildSignalGroups({
@@ -361,6 +434,7 @@ export function runDecisionBenchmarkFixture(
     signalGroups,
     uncertainty,
     decisionAxes,
+    decision,
     eventContext,
   });
 
@@ -1070,7 +1144,7 @@ export function buildDecisionBenchmarkFixtures(): BenchmarkFixture[] {
         jobUpdate: false,
         promoNoise: false,
         importantBenign: true,
-        expectedEventTypes: ["billing_issue"],
+        expectedEventTypes: ["payment_declined", "billing_issue"],
       },
     },
     {
@@ -1421,8 +1495,8 @@ export function buildDecisionBenchmarkFixtures(): BenchmarkFixture[] {
       },
     },
     {
-      id: "interview-schedule",
-      label: "Interview schedule",
+      id: "interview-update",
+      label: "Interview update",
       email: {
         subject: "Schedule your interview",
         body: "Please share your availability so we can schedule the next interview round.",
@@ -1487,12 +1561,12 @@ export function buildDecisionBenchmarkFixtures(): BenchmarkFixture[] {
         jobUpdate: true,
         promoNoise: false,
         importantBenign: true,
-        expectedEventTypes: ["interview_scheduled"],
+        expectedEventTypes: ["interview_update", "interview_scheduled"],
       },
     },
     {
       id: "temu-promo",
-      label: "Temu promo",
+      label: "Temu-style promo",
       email: {
         subject: "Temu flash sale ends tonight",
         body: "Limited time deal. Shop now and save 80% with this coupon.",
@@ -1562,7 +1636,7 @@ export function buildDecisionBenchmarkFixtures(): BenchmarkFixture[] {
     },
     {
       id: "rakuten-promo",
-      label: "Rakuten promo",
+      label: "Rakuten-style promo",
       email: {
         subject: "Cash back bonus this weekend",
         body: "Exclusive offer, limited-time shopping bonus, and featured deals just for you.",

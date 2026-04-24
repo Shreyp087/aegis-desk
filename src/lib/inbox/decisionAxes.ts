@@ -12,6 +12,7 @@ import {
   type InboxThreatType,
 } from "./schemas";
 import type { InboxEventInference, InboxEventType } from "./eventTaxonomy";
+import type { TemporalContextResult } from "./temporalContext.types";
 
 const PriorityEnum = z.enum(["high", "medium", "low"]);
 const TrustedActionEnum = z.enum(["allow", "escalate", "quarantine", "block"]);
@@ -76,7 +77,18 @@ export type SecuritySeverityLevel = z.infer<typeof SecuritySeverityLevelEnum>;
 export type ActionRoute = z.infer<typeof ActionRouteEnum>;
 export type InboxDecisionAxes = z.infer<typeof InboxDecisionAxesSchema>;
 
-type BuildDecisionAxesArgs = {
+type AdaptiveDecisionCalibration = {
+  attentionHighFloor: number;
+  attentionUrgentFloor: number;
+  securitySuspiciousFloor: number;
+  securityHarmfulFloor: number;
+  surfaceAttentionFloor: number;
+  escalateSecurityFloor: number;
+  promoSuppressionSensitivity: number;
+  mustNotMissFloor: number;
+};
+
+type SharedDecisionAxesArgs = {
   primaryCategory: string;
   priorityScore: number;
   priorityBand: "high" | "medium" | "low";
@@ -86,7 +98,8 @@ type BuildDecisionAxesArgs = {
     action: "allow" | "escalate" | "quarantine" | "block";
     riskScore: number;
   };
-  decision: InboxDecision;
+  decision?: InboxDecision;
+  legacyRiskLevel?: z.infer<typeof InboxRiskLevelEnum>;
   threatType: InboxThreatType;
   classifier: {
     probabilities: {
@@ -105,10 +118,18 @@ type BuildDecisionAxesArgs = {
   subject: string;
   bodyPreview: string;
   temporalFlags?: string[];
+  temporalContext?: TemporalContextResult;
   eventContext?: Pick<
     InboxEventInference,
     "primaryEventType" | "secondaryTags" | "confidence" | "sensitiveEvent"
   >;
+  adaptiveCalibration?: AdaptiveDecisionCalibration;
+};
+
+type BuildDecisionAxesArgs = SharedDecisionAxesArgs & {
+  decision: InboxDecision;
+  precomputedAttentionPriority?: InboxDecisionAxes["attentionPriority"];
+  precomputedSecuritySeverity?: InboxDecisionAxes["securitySeverity"];
 };
 
 type MessageIntent = {
@@ -124,6 +145,18 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
+function deriveLegacyRiskLevelFromScore(
+  riskScore: number
+): z.infer<typeof InboxRiskLevelEnum> {
+  if (riskScore >= 70) {
+    return "high";
+  }
+  if (riskScore >= 40) {
+    return "medium";
+  }
+  return "low";
+}
+
 /**
  * Checks whether the canonical event inference already tagged the email with one of the requested event types.
  *
@@ -131,7 +164,7 @@ function clamp(value: number, min: number, max: number): number {
  * False-positive scenario addressed: reuses the structured event layer so safe operational mail is not reclassified by ad hoc text heuristics.
  */
 function hasEventType(
-  eventContext: BuildDecisionAxesArgs["eventContext"],
+  eventContext: SharedDecisionAxesArgs["eventContext"],
   values: InboxEventType[]
 ): boolean {
   if (!eventContext) {
@@ -169,7 +202,7 @@ function pushDriver(drivers: string[], value: string, max = 4): void {
  * Pipeline step: translation layer only, using the already-parsed email content before serialization.
  * False-positive scenario addressed: lets the system keep OTPs, confirmations, and job updates high-attention without inflating their security severity.
  */
-function deriveMessageIntent(args: BuildDecisionAxesArgs): MessageIntent {
+function deriveMessageIntent(args: SharedDecisionAxesArgs): MessageIntent {
   const preview = `${args.subject} ${args.bodyPreview.slice(0, 400)}`.toLowerCase();
   const primaryThreatEvent = args.eventContext?.primaryEventType === "phishing_or_impersonation";
   const otpLikeEvent = hasEventType(args.eventContext, ["auth_otp", "login_code"]);
@@ -183,12 +216,15 @@ function deriveMessageIntent(args: BuildDecisionAxesArgs): MessageIntent {
     "order_shipped",
     "receipt_invoice",
     "billing_issue",
+    "payment_declined",
+    "subscription_created",
     "subscription_renewal",
     "refund_update",
     "new_membership",
   ]);
   const jobEvent = hasEventType(args.eventContext, [
     "job_application_update",
+    "interview_update",
     "interview_scheduled",
     "recruiter_reply",
   ]);
@@ -257,8 +293,11 @@ function deriveMessageIntent(args: BuildDecisionAxesArgs): MessageIntent {
  * Pipeline step: translation layer after scoring and before response serialization.
  * False-positive scenario addressed: stops harmful mail from automatically consuming the same attention budget as safe-but-important operational mail.
  */
-function buildAttentionPriority(args: BuildDecisionAxesArgs): InboxDecisionAxes["attentionPriority"] {
+export function deriveAttentionPriority(
+  args: SharedDecisionAxesArgs
+): InboxDecisionAxes["attentionPriority"] {
   const intent = deriveMessageIntent(args);
+  const adaptiveCalibration = args.adaptiveCalibration;
   const drivers: string[] = [];
   const operationalAttention =
     intent.otpLike ||
@@ -274,6 +313,42 @@ function buildAttentionPriority(args: BuildDecisionAxesArgs): InboxDecisionAxes[
     args.eventContext?.sensitiveEvent.detected === true
       ? args.eventContext.sensitiveEvent.attentionBoost
       : 0;
+  const sensitiveMustNotMiss =
+    args.eventContext?.sensitiveEvent.detected === true
+      ? args.eventContext.sensitiveEvent.mustNotMissScore
+      : 0;
+  const sensitiveTimeSensitivity =
+    args.eventContext?.sensitiveEvent.detected === true
+      ? args.eventContext.sensitiveEvent.timeSensitivity
+      : "low";
+  const temporalUrgencyBoost = args.temporalContext?.totalUrgencyDelta ?? 0;
+  const temporalThreatBoost = args.temporalContext?.totalThreatDelta ?? 0;
+  const unresolvedThreadDetected =
+    args.temporalContext?.unresolvedThread.detected === true;
+  const silenceBreakDetected =
+    args.temporalContext?.silenceBreak.detected === true;
+  const coordinatedAttack =
+    args.temporalContext?.convergingSignal.campaignType === "coordinated_attack";
+  const attentionHighFloor = adaptiveCalibration?.attentionHighFloor ?? 75;
+  const attentionUrgentFloor = adaptiveCalibration?.attentionUrgentFloor ?? 88;
+  const mustNotMissFloor = adaptiveCalibration?.mustNotMissFloor ?? 80;
+  const promoSuppressionSensitivity =
+    adaptiveCalibration?.promoSuppressionSensitivity ?? 50;
+  const promoAttentionCap = clamp(
+    Math.round(34 - (promoSuppressionSensitivity - 50) * 0.28),
+    16,
+    42
+  );
+  const mustNotMissHighFloor = clamp(
+    Math.max(attentionHighFloor, mustNotMissFloor),
+    68,
+    92
+  );
+  const mustNotMissUrgentFloor = clamp(
+    Math.max(attentionUrgentFloor - 4, mustNotMissFloor + 6),
+    82,
+    96
+  );
 
   let level: AttentionPriorityLevel;
   let score = clamp(Math.round(args.priorityScore), 0, 100);
@@ -285,7 +360,13 @@ function buildAttentionPriority(args: BuildDecisionAxesArgs): InboxDecisionAxes[
     args.eventContext?.sensitiveEvent.detected &&
     args.eventContext.sensitiveEvent.family === "auth_flow"
   ) {
-    score = Math.max(score, 88);
+    score = Math.max(
+      score,
+      sensitiveTimeSensitivity === "expires_soon" ||
+        sensitiveMustNotMiss >= mustNotMissUrgentFloor
+        ? Math.max(92, attentionUrgentFloor)
+        : mustNotMissHighFloor
+    );
     level = "urgent";
   } else if (
     args.eventContext?.sensitiveEvent.detected &&
@@ -296,8 +377,18 @@ function buildAttentionPriority(args: BuildDecisionAxesArgs): InboxDecisionAxes[
       "billing_lifecycle",
     ].includes(args.eventContext.sensitiveEvent.family ?? "")
   ) {
-    score = Math.max(score, 78);
-    level = score >= 90 ? "urgent" : "high";
+    score = Math.max(
+      score,
+      sensitiveMustNotMiss >= mustNotMissUrgentFloor ||
+        sensitiveTimeSensitivity === "high"
+        ? mustNotMissHighFloor
+        : Math.max(72, mustNotMissHighFloor - 4)
+    );
+    level =
+      sensitiveMustNotMiss >= mustNotMissUrgentFloor &&
+      sensitiveTimeSensitivity === "high"
+        ? "urgent"
+        : "high";
   } else if (
     args.eventContext?.sensitiveEvent.detected &&
     [
@@ -305,29 +396,51 @@ function buildAttentionPriority(args: BuildDecisionAxesArgs): InboxDecisionAxes[
       "membership_lifecycle",
     ].includes(args.eventContext.sensitiveEvent.family ?? "")
   ) {
-    score = Math.max(score, 68);
+    score = Math.max(
+      score,
+      sensitiveMustNotMiss >= mustNotMissFloor
+        ? Math.max(68, mustNotMissHighFloor - 8)
+        : 68
+    );
     level = "high";
   } else if (
     intent.promotionalBulk &&
     args.trustedDecision.action === "allow" &&
     args.decisionImportance.threatScore < 40
   ) {
-    score = Math.min(score, 24);
-    level = score < 18 ? "none" : "low";
+    score = Math.min(score, promoAttentionCap);
+    level = score < Math.max(14, promoAttentionCap - 8) ? "none" : "low";
   } else if (intent.otpLike || intent.passwordReset || intent.suspiciousLoginAlert) {
-    score = Math.max(score, args.decisionImportance.urgencyScore >= 78 ? 88 : 74);
-    level = score >= 88 ? "urgent" : "high";
+    score = Math.max(
+      score,
+      args.decisionImportance.urgencyScore >= 78
+        ? attentionUrgentFloor
+        : Math.max(72, attentionHighFloor)
+    );
+    level = score >= attentionUrgentFloor ? "urgent" : "high";
   } else if (intent.purchaseConfirmation || intent.jobApplicationUpdate) {
-    score = Math.max(score, 68);
-    level = score >= 86 ? "urgent" : "high";
+    score = Math.max(score, Math.max(68, attentionHighFloor - 6));
+    level = score >= Math.max(86, attentionUrgentFloor - 2) ? "urgent" : "high";
+  } else if (unresolvedThreadDetected) {
+    score = Math.max(score, Math.max(76, attentionHighFloor));
+    level =
+      args.temporalContext?.unresolvedThread.routingOverride === "escalate"
+        ? "urgent"
+        : "high";
+  } else if (coordinatedAttack && !containedThreat) {
+    score = Math.max(score, Math.max(74, attentionHighFloor - 2));
+    level = temporalThreatBoost >= 12 ? "high" : "medium";
+  } else if (silenceBreakDetected) {
+    score = Math.max(score, Math.min(72, Math.max(60, attentionHighFloor - 8)));
+    level = score >= attentionHighFloor ? "high" : "medium";
   } else if (
     args.decisionImportance.attentionType === "act_now" &&
-    (args.decisionImportance.urgencyScore >= 82 || score >= 88)
+    (args.decisionImportance.urgencyScore >= 82 || score >= attentionUrgentFloor)
   ) {
     level = "urgent";
   } else if (
     args.decisionImportance.attentionType === "act_now" ||
-    score >= 75
+    score >= attentionHighFloor
   ) {
     level = "high";
   } else if (
@@ -352,14 +465,44 @@ function buildAttentionPriority(args: BuildDecisionAxesArgs): InboxDecisionAxes[
   if (sensitiveAttention > 0) {
     pushDriver(drivers, `Sensitive-event boost ${sensitiveAttention}`);
   }
+  if (sensitiveMustNotMiss > 0) {
+    pushDriver(
+      drivers,
+      `Must-not-miss ${sensitiveMustNotMiss}/100 (${humanize(sensitiveTimeSensitivity)})`
+    );
+  }
   if (operationalAttention) {
     pushDriver(drivers, "Operational or personally relevant message");
   }
   if ((args.temporalFlags ?? []).some((flag) => flag.startsWith("temporal:"))) {
-    pushDriver(drivers, "Temporal context increased attention pressure");
+    if (unresolvedThreadDetected) {
+      pushDriver(drivers, "Unresolved thread follow-up");
+    } else if (coordinatedAttack) {
+      pushDriver(
+        drivers,
+        `Cross-email convergence on ${humanize(
+          args.temporalContext?.convergingSignal.clusterKey ?? "coordinated pattern"
+        )}`
+      );
+    } else if (silenceBreakDetected) {
+      pushDriver(
+        drivers,
+        args.temporalContext?.silenceBreak.novelSubjectPattern
+          ? "Silence break plus new hashed subject pattern"
+          : "Silence break from sender cadence"
+      );
+    } else {
+      pushDriver(drivers, "Temporal context increased attention pressure");
+    }
+  }
+  if (temporalUrgencyBoost > 0) {
+    pushDriver(drivers, `Temporal urgency +${temporalUrgencyBoost}`);
   }
   if (intent.promotionalBulk) {
-    pushDriver(drivers, "Promotional bulk pattern detected");
+    pushDriver(
+      drivers,
+      `Promotional bulk pattern detected (suppression sensitivity ${promoSuppressionSensitivity}/100)`
+    );
   }
   if (containedThreat) {
     pushDriver(drivers, `Danger is contained via ${args.trustedDecision.action.toUpperCase()}`);
@@ -370,6 +513,24 @@ function buildAttentionPriority(args: BuildDecisionAxesArgs): InboxDecisionAxes[
   if (containedThreat) {
     rationale =
       "The message appears dangerous, but user attention stays low because Aegis is already containing it via enforcement.";
+  } else if (unresolvedThreadDetected && (level === "high" || level === "urgent")) {
+    rationale =
+      "User attention is high because this looks like a follow-up on an unresolved earlier item in the current batch.";
+  } else if (coordinatedAttack && (level === "high" || level === "medium")) {
+    rationale =
+      "User attention increased because multiple domains converged on the same high-pressure theme inside the current batch.";
+  } else if (silenceBreakDetected && level === "medium") {
+    rationale =
+      "User attention increased because the sender broke their normal timing pattern inside this batch.";
+  } else if (
+    args.eventContext?.sensitiveEvent.detected &&
+    sensitiveMustNotMiss >= mustNotMissFloor &&
+    (level === "high" || level === "urgent")
+  ) {
+    rationale =
+      `User attention is ${level} because Aegis matched a high-confidence must-not-miss ${humanize(
+        args.eventContext.sensitiveEvent.family ?? "event"
+      )} pattern with ${humanize(sensitiveTimeSensitivity)} time sensitivity.`;
   } else if (intent.promotionalBulk && level !== "medium" && level !== "high" && level !== "urgent") {
     rationale =
       "User attention stays low because this looks like promotional bulk mail rather than a personally important task.";
@@ -409,8 +570,11 @@ function buildAttentionPriority(args: BuildDecisionAxesArgs): InboxDecisionAxes[
  * Pipeline step: translation layer after scoring, classification, and trusted-action selection.
  * False-positive scenario addressed: separates harmless-but-important operational mail from genuinely dangerous content, and demotes routine promos to noisy instead of suspicious.
  */
-function buildSecuritySeverity(args: BuildDecisionAxesArgs): InboxDecisionAxes["securitySeverity"] {
+export function deriveSecuritySeverity(
+  args: SharedDecisionAxesArgs
+): InboxDecisionAxes["securitySeverity"] {
   const intent = deriveMessageIntent(args);
+  const adaptiveCalibration = args.adaptiveCalibration;
   const harmfulProbabilityPct = Math.round(args.classifier.probabilities.harmful * 100);
   const spamProbabilityPct = Math.round(args.classifier.probabilities.spam * 100);
   const urlsCount = args.extracted.urls.length;
@@ -424,6 +588,13 @@ function buildSecuritySeverity(args: BuildDecisionAxesArgs): InboxDecisionAxes["
     args.eventContext?.sensitiveEvent.detected === true
       ? args.eventContext.sensitiveEvent.securityBoost
       : 0;
+  const temporalThreatBoost = args.temporalContext?.totalThreatDelta ?? 0;
+  const convergingSignal = args.temporalContext?.convergingSignal;
+  const coordinatedAttack = convergingSignal?.campaignType === "coordinated_attack";
+  const suspiciousFloor = adaptiveCalibration?.securitySuspiciousFloor ?? 40;
+  const harmfulFloor = adaptiveCalibration?.securityHarmfulFloor ?? 70;
+  const promoSuppressionSensitivity =
+    adaptiveCalibration?.promoSuppressionSensitivity ?? 50;
 
   let score = Math.round(
     args.decisionImportance.threatScore * 0.52 +
@@ -433,7 +604,8 @@ function buildSecuritySeverity(args: BuildDecisionAxesArgs): InboxDecisionAxes["
       Math.min(12, urlsCount * 3) +
       (explicitThreat ? 10 : 0) +
       (criticalTagHit ? 8 : 0) +
-      sensitiveSecurityBoost
+      sensitiveSecurityBoost +
+      temporalThreatBoost * 1.6
   );
 
   if (args.trustedDecision.action === "block") {
@@ -490,10 +662,24 @@ function buildSecuritySeverity(args: BuildDecisionAxesArgs): InboxDecisionAxes["
     harmfulProbabilityPct < 35 &&
     args.decisionImportance.threatScore < 40
   ) {
-    score = Math.min(score, Math.max(20, spamProbabilityPct > 30 ? 32 : 26));
+    const promoSecurityCap = clamp(
+      Math.round(30 - (promoSuppressionSensitivity - 50) * 0.12),
+      18,
+      34
+    );
+    score = Math.min(
+      score,
+      Math.max(20, spamProbabilityPct > 30 ? promoSecurityCap + 4 : promoSecurityCap)
+    );
   }
 
   score = clamp(score, 0, 100);
+  if (coordinatedAttack && convergingSignal) {
+    score = Math.max(
+      score,
+      convergingSignal.threatElevation >= 12 ? harmfulFloor - 4 : suspiciousFloor + 8
+    );
+  }
 
   let level: SecuritySeverityLevel;
   if (
@@ -505,9 +691,14 @@ function buildSecuritySeverity(args: BuildDecisionAxesArgs): InboxDecisionAxes["
     level = "benign";
   } else if (args.trustedDecision.action === "block" || score >= 90) {
     level = "critical";
-  } else if (args.trustedDecision.action === "quarantine" || score >= 70) {
+  } else if (args.trustedDecision.action === "quarantine" || score >= harmfulFloor) {
     level = "harmful";
-  } else if (score >= 40 || intent.suspiciousLoginAlert || explicitThreat) {
+  } else if (
+    score >= suspiciousFloor ||
+    intent.suspiciousLoginAlert ||
+    explicitThreat ||
+    coordinatedAttack
+  ) {
     level = "suspicious";
   } else if (
     intent.promotionalBulk ||
@@ -529,8 +720,17 @@ function buildSecuritySeverity(args: BuildDecisionAxesArgs): InboxDecisionAxes["
   if (sensitiveSecurityBoost > 0) {
     pushDriver(drivers, `Sensitive security boost ${sensitiveSecurityBoost}`);
   }
+  if (temporalThreatBoost > 0) {
+    pushDriver(drivers, `Temporal threat +${temporalThreatBoost}`);
+  }
   if (explicitThreat) {
     pushDriver(drivers, `Threat type ${humanize(args.threatType)}`);
+  }
+  if (coordinatedAttack) {
+    pushDriver(
+      drivers,
+      `Coordinated batch pattern ${humanize(convergingSignal?.clusterKey ?? "detected")}`
+    );
   }
   if (intent.promotionalBulk && level === "noisy") {
     pushDriver(drivers, "Promotional bulk noise");
@@ -554,8 +754,9 @@ function buildSecuritySeverity(args: BuildDecisionAxesArgs): InboxDecisionAxes["
     rationale =
       "Security severity is harmful because the message presents credible malicious behavior even if the user does not need to personally focus on it.";
   } else if (level === "suspicious") {
-    rationale =
-      "Security severity is suspicious because the message has trust, access, or threat signals that warrant caution but not immediate containment.";
+    rationale = coordinatedAttack
+      ? "Security severity is suspicious because the current batch shows a coordinated pattern that warrants caution and review."
+      : "Security severity is suspicious because the message has trust, access, or threat signals that warrant caution but not immediate containment.";
   } else if (level === "noisy") {
     rationale =
       "Security severity is noisy because the message is low-risk bulk or spam-like traffic rather than a dangerous attack.";
@@ -565,7 +766,10 @@ function buildSecuritySeverity(args: BuildDecisionAxesArgs): InboxDecisionAxes["
     level,
     score,
     threatType: args.threatType,
-    legacyRiskLevel: args.decision.risk_level,
+    legacyRiskLevel:
+      args.decision?.risk_level ??
+      args.legacyRiskLevel ??
+      deriveLegacyRiskLevelFromScore(args.trustedDecision.riskScore),
     rationale,
     drivers: drivers.slice(0, 4),
   };
@@ -581,11 +785,23 @@ function buildActionRoute(args: BuildDecisionAxesArgs): InboxDecisionAxes["actio
   const temporalOverrideApplied = (args.temporalFlags ?? []).some((flag) =>
     flag.startsWith("temporal:routing:")
   );
+  const coordinatedAttack =
+    args.temporalContext?.convergingSignal.campaignType === "coordinated_attack";
+  const unresolvedThreadDetected =
+    args.temporalContext?.unresolvedThread.detected === true;
   const sensitiveSurfaceHint =
     args.eventContext?.sensitiveEvent.detected === true &&
     args.eventContext.sensitiveEvent.routeHint === "surface";
-  const attention = buildAttentionPriority(args);
-  const severity = buildSecuritySeverity(args);
+  const sensitiveEscalateHint =
+    args.eventContext?.sensitiveEvent.detected === true &&
+    args.eventContext.sensitiveEvent.routeHint === "escalate";
+  const attention =
+    args.precomputedAttentionPriority ?? deriveAttentionPriority(args);
+  const severity =
+    args.precomputedSecuritySeverity ?? deriveSecuritySeverity(args);
+  const adaptiveCalibration = args.adaptiveCalibration;
+  const surfaceAttentionFloor = adaptiveCalibration?.surfaceAttentionFloor ?? 58;
+  const escalateSecurityFloor = adaptiveCalibration?.escalateSecurityFloor ?? 72;
 
   let route: ActionRoute;
   if (args.trustedDecision.action === "block") {
@@ -609,9 +825,44 @@ function buildActionRoute(args: BuildDecisionAxesArgs): InboxDecisionAxes["actio
 
   if (
     route === "suppress" &&
+    args.trustedDecision.action === "allow" &&
+    attention.score >= surfaceAttentionFloor &&
+    (severity.level === "benign" || severity.level === "noisy")
+  ) {
+    route = "surface";
+  }
+  if (
+    route === "suppress" &&
     sensitiveSurfaceHint
   ) {
     route = "surface";
+  }
+  if (
+    route === "surface" &&
+    severity.score >= escalateSecurityFloor &&
+    (severity.level === "suspicious" ||
+      severity.level === "harmful" ||
+      severity.level === "critical")
+  ) {
+    route = "escalate";
+  }
+  if (
+    route === "surface" &&
+    sensitiveEscalateHint &&
+    (severity.level === "suspicious" ||
+      severity.level === "harmful" ||
+      severity.level === "critical")
+  ) {
+    route = "escalate";
+  }
+  if (
+    route === "surface" &&
+    coordinatedAttack &&
+    (severity.level === "suspicious" ||
+      severity.level === "harmful" ||
+      severity.level === "critical")
+  ) {
+    route = "escalate";
   }
 
   let rationale = `Route ${route.toUpperCase()} derived from legacy routing ${args.decision.final_action.toUpperCase()} and trusted action ${args.trustedDecision.action.toUpperCase()}.`;
@@ -620,13 +871,21 @@ function buildActionRoute(args: BuildDecisionAxesArgs): InboxDecisionAxes["actio
       "Route SUPPRESS because the message is neither dangerous enough nor important enough to warrant human attention.";
   } else if (route === "surface") {
     rationale =
-      sensitiveSurfaceHint
+      unresolvedThreadDetected
+        ? "Route SURFACE because a follow-up on an unresolved thread should stay visible to the user."
+        : sensitiveSurfaceHint
         ? "Route SURFACE because a high-confidence sensitive event should be shown directly even though the message is not primarily harmful."
         : "Route SURFACE because the message appears safe enough to show directly while still needing user attention.";
   } else if (route === "escalate") {
     rationale =
       temporalOverrideApplied
         ? `Route ESCALATE because temporal context forced the workflow upward. ${args.decision.reason}`
+        : coordinatedAttack
+          ? `Route ESCALATE because the current batch shows a coordinated ${humanize(
+              args.temporalContext?.convergingSignal.clusterKey ?? "pattern"
+            )} pattern with elevated security pressure.`
+        : sensitiveEscalateHint
+          ? "Route ESCALATE because a high-confidence sensitive account-security event also carried elevated security signals."
         : `Route ESCALATE because the workflow policy or trusted action requires review. ${args.decision.reason}`;
   } else if (route === "quarantine") {
     rationale =
@@ -654,8 +913,10 @@ function buildActionRoute(args: BuildDecisionAxesArgs): InboxDecisionAxes["actio
  * False-positive scenario addressed: keeps “important” and “dangerous” from collapsing into the same scalar, so the UI can show safe-urgent mail and harmful-contained mail correctly.
  */
 export function buildDecisionAxes(args: BuildDecisionAxesArgs): InboxDecisionAxes {
-  const attentionPriority = buildAttentionPriority(args);
-  const securitySeverity = buildSecuritySeverity(args);
+  const attentionPriority =
+    args.precomputedAttentionPriority ?? deriveAttentionPriority(args);
+  const securitySeverity =
+    args.precomputedSecuritySeverity ?? deriveSecuritySeverity(args);
   const actionRoute = buildActionRoute(args);
 
   return InboxDecisionAxesSchema.parse({

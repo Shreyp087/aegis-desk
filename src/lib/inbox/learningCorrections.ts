@@ -66,14 +66,17 @@ const TRANSACTIONAL_EVENTS = new Set<InboxEventType>([
   "password_changed",
   "account_recovery",
   "new_membership",
+  "subscription_created",
   "new_device_signin",
   "purchase_confirmed",
   "order_shipped",
   "receipt_invoice",
   "billing_issue",
+  "payment_declined",
   "subscription_renewal",
   "refund_update",
   "job_application_update",
+  "interview_update",
   "interview_scheduled",
   "recruiter_reply",
   "deadline_action_required",
@@ -331,7 +334,8 @@ export function applyLearningCorrections(
       const urgencyDelta = Math.min(
         12,
         4 +
-          Math.round(input.eventContext.sensitiveEvent.attentionBoost * 0.3) +
+          Math.round(input.eventContext.sensitiveEvent.attentionBoost * 0.25) +
+          Math.round(input.eventContext.sensitiveEvent.mustNotMissScore * 0.03) +
           Math.min(3, falsePositiveProtectionCount)
       );
       const noiseDelta = -Math.min(

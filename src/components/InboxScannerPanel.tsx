@@ -9,8 +9,13 @@ import type {
   InboxUncertainty,
 } from "@/lib/inbox/compatibility";
 import type { AgentEscalationScannerContext } from "@/lib/agent/prefill";
+import {
+  restoreAlertsFromBrowserSession,
+  sanitizeAlertsForBrowserSession,
+} from "@/lib/inbox/browserSessionCache";
 import type { DecisionCapsule } from "@/lib/inbox/decisionCapsule";
 import type { InboxDecision } from "@/lib/inbox/decision";
+import type { InboxTrustSurface } from "@/lib/inbox/privacySurface";
 
 import PanelFrame from "@/components/PanelFrame";
 import {
@@ -160,6 +165,7 @@ type InboxAlert = {
     riskDensity: number;
   };
   rawEmail: string;
+  rawEmailAvailable: boolean;
   baseUncertaintyPercent: number;
   extracted: {
     deadlines: string[];
@@ -168,6 +174,10 @@ type InboxAlert = {
     attachments: string[];
     attachmentRiskScore: number;
   };
+};
+
+type PersistedInboxAlert = Omit<InboxAlert, "rawEmail"> & {
+  rawEmail?: string;
 };
 
 type InboxMeta = {
@@ -186,6 +196,7 @@ type InboxMeta = {
   consensusMode?: "single" | "multi";
   consensusMaxModels?: number;
   consensusSource?: "env_default" | "admin_override";
+  trustSurface?: InboxTrustSurface;
 };
 
 type InboxResponse = {
@@ -221,7 +232,7 @@ type PersistedInboxScannerSession = {
   orgDomainsInput: string;
   gmailQuery: string;
   gmailMaxResults: number;
-  alerts: InboxAlert[];
+  alerts: PersistedInboxAlert[];
   meta: InboxMeta | null;
   activeFilter: PrimaryFilter;
   focusCategory: VisibleCategory | "all";
@@ -233,6 +244,10 @@ type PersistedInboxScannerSession = {
   escalationNotes: Record<string, string>;
   feedbackStatusById: Record<string, string>;
   lastCreatedTicketId: string | null;
+};
+
+type RestoredInboxScannerSession = Omit<PersistedInboxScannerSession, "alerts"> & {
+  alerts: InboxAlert[];
 };
 
 type QuotedBlock = {
@@ -377,7 +392,7 @@ function buildEscalationScannerContext(alert: InboxAlert): AgentEscalationScanne
   };
 }
 
-function readInboxScannerSession(): PersistedInboxScannerSession | null {
+function readInboxScannerSession(): RestoredInboxScannerSession | null {
   if (typeof window === "undefined") return null;
 
   try {
@@ -402,7 +417,7 @@ function readInboxScannerSession(): PersistedInboxScannerSession | null {
       orgDomainsInput: typeof parsed.orgDomainsInput === "string" ? parsed.orgDomainsInput : "",
       gmailQuery: typeof parsed.gmailQuery === "string" ? parsed.gmailQuery : "in:inbox",
       gmailMaxResults: Math.max(1, Math.min(50, Number(parsed.gmailMaxResults) || 20)),
-      alerts: parsed.alerts as InboxAlert[],
+      alerts: restoreAlertsFromBrowserSession(parsed.alerts as PersistedInboxAlert[]),
       meta: (parsed.meta as InboxMeta | null | undefined) ?? null,
       activeFilter:
         parsed.activeFilter === "high" ||
@@ -429,11 +444,19 @@ function readInboxScannerSession(): PersistedInboxScannerSession | null {
   }
 }
 
-function persistInboxScannerSession(session: PersistedInboxScannerSession) {
+function persistInboxScannerSession(
+  session: Omit<PersistedInboxScannerSession, "alerts"> & { alerts: InboxAlert[] }
+) {
   if (typeof window === "undefined") return;
 
   try {
-    window.sessionStorage.setItem(INBOX_SCANNER_SESSION_KEY, JSON.stringify(session));
+    window.sessionStorage.setItem(
+      INBOX_SCANNER_SESSION_KEY,
+      JSON.stringify({
+        ...session,
+        alerts: sanitizeAlertsForBrowserSession(session.alerts),
+      })
+    );
   } catch {
     // Ignore storage failures for oversize/private browsing cases.
   }
@@ -497,6 +520,16 @@ function capsuleActionTone(
 ): "risk" | "caution" | "clear" | "info" | "muted" {
   if (value === "yes") return "caution";
   if (value === "maybe") return "info";
+  return "clear";
+}
+
+function capsuleRouteTone(
+  value?: DecisionCapsule["actionRoute"]
+): "risk" | "caution" | "clear" | "info" | "muted" {
+  if (value === "block" || value === "quarantine") return "risk";
+  if (value === "escalate") return "caution";
+  if (value === "surface") return "info";
+  if (value === "suppress") return "muted";
   return "clear";
 }
 
@@ -734,7 +767,12 @@ export default function InboxScannerPanel({
       setLastCreatedTicketId(session.lastCreatedTicketId);
 
       if (session.alerts.length > 0) {
-        setSessionNotice("Restored the inbox queue from this browser session.");
+        const rawEmailMissing = session.alerts.some((alert) => !alert.rawEmailAvailable);
+        setSessionNotice(
+          rawEmailMissing
+            ? "Restored the inbox queue from this browser session. Raw email bodies were not cached; run a fresh scan to inspect or copy them again."
+            : "Restored the inbox queue from this browser session."
+        );
       }
     }
 
@@ -831,7 +869,7 @@ export default function InboxScannerPanel({
         throw new Error(data.detail || data.error || "Scan failed.");
       }
 
-      setAlerts(data.alerts);
+      setAlerts(data.alerts.map((alert) => ({ ...alert, rawEmailAvailable: true })));
       setMeta(data.meta);
       setExpandedId(data.alerts[0]?.id || null);
       setActiveFilter("all");
@@ -951,7 +989,13 @@ export default function InboxScannerPanel({
     if (!normalizedQuery) return next;
 
     return next.filter((alert) =>
-      [alert.subject, alert.senderEmail, alert.from, alert.senderDomain, alert.rawEmail]
+      [
+        alert.subject,
+        alert.senderEmail,
+        alert.from,
+        alert.senderDomain,
+        alert.rawEmailAvailable ? alert.rawEmail : "",
+      ]
         .filter(Boolean)
         .some((value) => value.toLowerCase().includes(normalizedQuery))
     );
@@ -959,7 +1003,7 @@ export default function InboxScannerPanel({
 
   const selected = alerts.find((alert) => alert.id === expandedId) || null;
   const selectedNote = selected ? escalationNotes[selected.id] || "" : "";
-  const selectedBlocks = selected ? buildBodyBlocks(selected.rawEmail) : [];
+  const selectedBlocks = selected && selected.rawEmailAvailable ? buildBodyBlocks(selected.rawEmail) : [];
   const selectedSignals = selected?.signalGroups?.deterministic.signals || selected?.signals || [];
   const selectedEvidenceItems = selected
     ? [
@@ -1297,6 +1341,97 @@ export default function InboxScannerPanel({
               ))}
             </div>
           ) : null}
+
+          {meta?.trustSurface ? (
+            <details className="mt-4 rounded-xl border border-aegis-border bg-aegis-elevated/40 p-4">
+              <summary className="cursor-pointer list-none">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-aegis-text">What Aegis stores</div>
+                    <div className="mt-1 text-sm text-aegis-dim">
+                      Raw email is available during the live scan, while persisted storage stays hashed or derived wherever the current code allows it.
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <StatusBadge tone="info">Local-first</StatusBadge>
+                    <StatusBadge tone={meta.trustSurface.summary.browserSessionStoresRawEmail ? "risk" : "clear"}>
+                      {meta.trustSurface.summary.browserSessionStoresRawEmail
+                        ? "Browser cache stores raw email"
+                        : "Browser cache strips raw email"}
+                    </StatusBadge>
+                    <StatusBadge
+                      tone={meta.trustSurface.summary.optionalRemoteModelProcessing ? "risk" : "clear"}
+                    >
+                      {meta.trustSurface.summary.optionalRemoteModelProcessing
+                        ? "Optional remote model path"
+                        : "Offline-only critical path"}
+                    </StatusBadge>
+                  </div>
+                </div>
+              </summary>
+
+              <div className="mt-4 grid gap-3 lg:grid-cols-2">
+                {meta.trustSurface.layers.map((layer) => (
+                  <div
+                    key={layer.id}
+                    className="rounded-lg border border-aegis-border bg-aegis-base/70 p-3"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="text-sm font-semibold text-aegis-text">{layer.label}</div>
+                      <StatusBadge tone={layer.containsRawEmailContent ? "risk" : "clear"}>
+                        {layer.containsRawEmailContent ? "Raw content" : "Derived only"}
+                      </StatusBadge>
+                    </div>
+                    <div className="mt-2 text-xs text-aegis-dim">
+                      <div>Where: {layer.location}</div>
+                      <div>Retention: {layer.retention}</div>
+                    </div>
+                    <div className="mt-3 text-sm text-aegis-dim">{layer.purpose}</div>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {layer.dataForm.map((item) => (
+                        <span
+                          key={`${layer.id}-${item}`}
+                          className="rounded border border-aegis-border bg-aegis-elevated px-2 py-1 text-[11px] uppercase tracking-[0.06em] text-aegis-dim"
+                        >
+                          {item}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {meta.trustSurface.flags.length > 0 ? (
+                <div className="mt-4 grid gap-3">
+                  <SectionLabel>Current caveats</SectionLabel>
+                  {meta.trustSurface.flags.map((flag) => (
+                    <div
+                      key={flag.id}
+                      className="rounded-lg border border-aegis-border bg-aegis-base/70 p-3"
+                    >
+                      <div className="flex flex-wrap items-center gap-2">
+                        <StatusBadge tone={flag.severity === "warning" ? "risk" : "info"}>
+                          {flag.severity}
+                        </StatusBadge>
+                        <div className="text-sm font-semibold text-aegis-text">{flag.title}</div>
+                      </div>
+                      <div className="mt-2 text-sm text-aegis-dim">{flag.detail}</div>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {flag.codepaths.map((codepath) => (
+                          <span
+                            key={`${flag.id}-${codepath}`}
+                            className="rounded border border-aegis-border bg-aegis-elevated px-2 py-1 font-mono text-[11px] text-aegis-dim"
+                          >
+                            {codepath}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </details>
+          ) : null}
         </PanelFrame>
       </section>
 
@@ -1495,18 +1630,24 @@ export default function InboxScannerPanel({
                         <SectionLabel>Message Body</SectionLabel>
                         <div className="max-h-96 overflow-auto rounded-lg border border-aegis-border bg-aegis-elevated/70 px-4 py-4">
                           <div className="grid gap-3 font-mono text-sm leading-7 text-aegis-text">
-                            {selectedBlocks.map((block, index) => (
-                              <div
-                                key={`${block.kind}-${index}`}
-                                className={
-                                  block.kind === "quoted"
-                                    ? "rounded-lg border-l-2 border-aegis-border bg-aegis-elevated px-3 py-2 text-aegis-muted"
-                                    : ""
-                                }
-                              >
-                                <pre className="whitespace-pre-wrap break-words font-mono">{block.text}</pre>
+                            {selected.rawEmailAvailable ? (
+                              selectedBlocks.map((block, index) => (
+                                <div
+                                  key={`${block.kind}-${index}`}
+                                  className={
+                                    block.kind === "quoted"
+                                      ? "rounded-lg border-l-2 border-aegis-border bg-aegis-elevated px-3 py-2 text-aegis-muted"
+                                      : ""
+                                  }
+                                >
+                                  <pre className="whitespace-pre-wrap break-words font-mono">{block.text}</pre>
+                                </div>
+                              ))
+                            ) : (
+                              <div className="rounded-lg border border-dashed border-aegis-border bg-aegis-elevated px-4 py-4 text-sm leading-6 text-aegis-muted">
+                                Raw email content was intentionally omitted from browser session storage. Run a fresh scan if you need to inspect the full message body again.
                               </div>
-                            ))}
+                            )}
                           </div>
                         </div>
                       </div>
@@ -1544,7 +1685,10 @@ export default function InboxScannerPanel({
                             <>
                               <div className="flex flex-wrap gap-2">
                                 <StatusBadge tone="info">
-                                  {humanizeFlag(selected.decisionCapsule.eventType).toUpperCase()}
+                                  {humanizeFlag(
+                                    selected.decisionCapsule.primaryEventType ||
+                                      selected.decisionCapsule.eventType
+                                  ).toUpperCase()}
                                 </StatusBadge>
                                 <StatusBadge tone={capsuleAttentionTone(selected.decisionCapsule.attentionPriority)}>
                                   ATTENTION {selected.decisionCapsule.attentionPriority.toUpperCase()}
@@ -1552,8 +1696,11 @@ export default function InboxScannerPanel({
                                 <StatusBadge tone={capsuleSecurityTone(selected.decisionCapsule.securitySeverity)}>
                                   SECURITY {selected.decisionCapsule.securitySeverity.toUpperCase()}
                                 </StatusBadge>
+                                <StatusBadge tone={capsuleRouteTone(selected.decisionCapsule.actionRoute)}>
+                                  ROUTE {selected.decisionCapsule.actionRoute.toUpperCase()}
+                                </StatusBadge>
                                 <StatusBadge tone={capsuleActionTone(selected.decisionCapsule.userActionNeeded)}>
-                                  ACTION {selected.decisionCapsule.userActionNeeded.toUpperCase()}
+                                  USER ACTION {selected.decisionCapsule.userActionNeeded.toUpperCase()}
                                 </StatusBadge>
                               </div>
 
@@ -1578,7 +1725,18 @@ export default function InboxScannerPanel({
                                 </div>
                               ) : null}
 
-                              {selected.decisionCapsule.confidenceNote ? (
+                              {selected.decisionCapsule.confidenceNotes?.length ? (
+                                <ul className="grid gap-2">
+                                  {selected.decisionCapsule.confidenceNotes.map((note) => (
+                                    <li
+                                      key={note}
+                                      className="rounded-lg border border-aegis-border bg-aegis-base px-3 py-3 text-sm leading-6 text-aegis-muted"
+                                    >
+                                      {note}
+                                    </li>
+                                  ))}
+                                </ul>
+                              ) : selected.decisionCapsule.confidenceNote ? (
                                 <div className="rounded-lg border border-aegis-border bg-aegis-base px-3 py-3 text-sm leading-6 text-aegis-muted">
                                   {selected.decisionCapsule.confidenceNote}
                                 </div>
@@ -1596,6 +1754,53 @@ export default function InboxScannerPanel({
                               selected.decisionTrace?.explanation ||
                               "No structured explanation was returned for this message."}
                           </div>
+                          {selected.explanation?.auditTrail ? (
+                            <div className="grid gap-3 md:grid-cols-2">
+                              {[
+                                {
+                                  label: "What Mattered Most",
+                                  items: selected.explanation.auditTrail.topSignals,
+                                },
+                                {
+                                  label: "What Reduced The Score",
+                                  items: selected.explanation.auditTrail.scoreReducers,
+                                },
+                                {
+                                  label: "What Increased Attention",
+                                  items: selected.explanation.auditTrail.attentionDrivers,
+                                },
+                                {
+                                  label: "What Changed The Route",
+                                  items: selected.explanation.auditTrail.routeDrivers,
+                                },
+                              ].map((section) => (
+                                <div
+                                  key={section.label}
+                                  className="rounded-lg border border-aegis-border bg-aegis-base px-3 py-3"
+                                >
+                                  <div className="text-xs font-mono uppercase tracking-widest text-foreground/40">
+                                    {section.label}
+                                  </div>
+                                  {section.items.length > 0 ? (
+                                    <ul className="mt-3 grid gap-2">
+                                      {section.items.map((item) => (
+                                        <li
+                                          key={`${section.label}-${item}`}
+                                          className="text-sm leading-6 text-aegis-muted"
+                                        >
+                                          {item}
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  ) : (
+                                    <div className="mt-3 text-sm leading-6 text-aegis-muted">
+                                      No strong signal in this bucket.
+                                    </div>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          ) : null}
                           {selected.explanation?.keyFactors?.length ? (
                             <ul className="grid gap-2">
                               {selected.explanation.keyFactors.slice(0, 5).map((factor) => (
@@ -1607,6 +1812,48 @@ export default function InboxScannerPanel({
                                 </li>
                               ))}
                             </ul>
+                          ) : null}
+                          {selected.explanation?.reasonFragments?.length ? (
+                            <div className="grid gap-3">
+                              <div className="text-xs font-mono uppercase tracking-widest text-foreground/40">
+                                Reason Fragments
+                              </div>
+                              <div className="grid gap-3">
+                                {selected.explanation.reasonFragments.slice(0, 6).map((fragment) => (
+                                  <div
+                                    key={`${fragment.type}-${fragment.title}`}
+                                    className="rounded-lg border border-aegis-border bg-aegis-base px-3 py-3"
+                                  >
+                                    <div className="flex flex-wrap items-center gap-2">
+                                      <StatusBadge tone="muted">
+                                        {humanizeFlag(fragment.type).toUpperCase()}
+                                      </StatusBadge>
+                                      <StatusBadge tone="info">
+                                        {humanizeFlag(fragment.direction).toUpperCase()}
+                                      </StatusBadge>
+                                      <span className="text-xs font-mono uppercase tracking-widest text-foreground/40">
+                                        {fragment.weight}/100
+                                      </span>
+                                    </div>
+                                    <div className="mt-3 text-sm font-medium text-aegis-text">
+                                      {fragment.title}
+                                    </div>
+                                    <div className="mt-2 text-sm leading-6 text-aegis-muted">
+                                      {fragment.detail}
+                                    </div>
+                                    {fragment.evidence.length > 0 ? (
+                                      <div className="mt-3 flex flex-wrap gap-2">
+                                        {fragment.evidence.map((evidence) => (
+                                          <StatusBadge key={`${fragment.title}-${evidence}`} tone="muted">
+                                            {evidence}
+                                          </StatusBadge>
+                                        ))}
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
                           ) : null}
                         </div>
                       </div>
@@ -1804,15 +2051,18 @@ export default function InboxScannerPanel({
                     <button
                       type="button"
                       onClick={() =>
-                        onEscalate({
-                          rawEmail: selected.rawEmail,
-                          command: escalationCommandWithNote(selected),
-                          scannerContext: buildEscalationScannerContext(selected),
-                        })
+                        selected.rawEmailAvailable
+                          ? onEscalate({
+                              rawEmail: selected.rawEmail,
+                              command: escalationCommandWithNote(selected),
+                              scannerContext: buildEscalationScannerContext(selected),
+                            })
+                          : undefined
                       }
+                      disabled={!selected.rawEmailAvailable}
                       className={buttonClassName("primary", false, "justify-center")}
                     >
-                      Escalate to Agent Desk
+                      {selected.rawEmailAvailable ? "Escalate to Agent Desk" : "Rescan To Escalate Raw Email"}
                     </button>
                     <button type="button" onClick={() => toggleReviewed(selected.id)} className={buttonClassName("secondary", false, "justify-center")}>
                       {reviewedIds[selected.id] ? "Undo Reviewed" : "Mark Reviewed"}
@@ -1848,13 +2098,23 @@ export default function InboxScannerPanel({
                       onCreated={(localTicketId) => setLastCreatedTicketId(localTicketId)}
                     />
                     <div className="flex flex-wrap gap-2">
-                      <button type="button" onClick={() => navigator.clipboard.writeText(selected.rawEmail)} className={buttonClassName("secondary")}>
+                      <button
+                        type="button"
+                        onClick={() => navigator.clipboard.writeText(selected.rawEmail)}
+                        disabled={!selected.rawEmailAvailable}
+                        className={buttonClassName("secondary")}
+                      >
                         Copy Raw Email
                       </button>
                       <button type="button" onClick={() => navigator.clipboard.writeText(selected.draftReply)} className={buttonClassName("secondary")}>
                         Copy Draft
                       </button>
                     </div>
+                    {!selected.rawEmailAvailable ? (
+                      <div className="text-sm leading-6 text-aegis-muted">
+                        Raw email is available only in the live scan response. The browser session cache keeps the derived decision state but strips the message body.
+                      </div>
+                    ) : null}
                     <TicketLinkForEmail sourceEmailId={selected.id} />
                     {lastCreatedTicketId ? (
                       <Link href={`/tickets/${lastCreatedTicketId}`} className="font-mono text-xs uppercase tracking-[0.08em] text-aegis-accent">

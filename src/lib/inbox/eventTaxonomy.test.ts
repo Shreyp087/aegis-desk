@@ -172,7 +172,7 @@ test("suspicious login alert maps to login_alert with security_warning or new_de
   );
 });
 
-test("job application status update maps to interview_scheduled with job context", () => {
+test("job application status update maps to interview_update with job context", () => {
   const event = inferExample({
     subject: "Application status update",
     body: "The hiring team has updated your application status and invited you to schedule an interview.",
@@ -181,7 +181,7 @@ test("job application status update maps to interview_scheduled with job context
     relevanceScore: 84,
   });
 
-  expectPrimary(event, "interview_scheduled");
+  expectPrimary(event, "interview_update");
   assert.ok(
     event.secondaryTags.includes("job_application_update") ||
       event.secondaryTags.includes("recruiter_reply")
@@ -270,6 +270,8 @@ test("OTP still wins in a promo-heavy mailbox and triggers a sensitive auth-flow
   assert.equal(event.sensitiveEvent.detected, true);
   assert.equal(event.sensitiveEvent.family, "auth_flow");
   assert.ok(event.sensitiveEvent.attentionBoost >= 20);
+  assert.ok(event.sensitiveEvent.mustNotMissScore >= 90);
+  assert.equal(event.sensitiveEvent.timeSensitivity, "expires_soon");
 });
 
 test("purchase confirmation from a trusted sender triggers commerce sensitivity without promo collision", () => {
@@ -287,6 +289,7 @@ test("purchase confirmation from a trusted sender triggers commerce sensitivity 
   assert.equal(event.sensitiveEvent.detected, true);
   assert.equal(event.sensitiveEvent.family, "commerce_transaction");
   assert.equal(event.sensitiveEvent.securityBoost, 0);
+  assert.ok(event.sensitiveEvent.mustNotMissScore >= 80);
 });
 
 test("security alert from a known provider raises both sensitive attention and security lift", () => {
@@ -305,6 +308,23 @@ test("security alert from a known provider raises both sensitive attention and s
   assert.equal(event.sensitiveEvent.detected, true);
   assert.equal(event.sensitiveEvent.family, "account_security");
   assert.ok(event.sensitiveEvent.securityBoost >= 10);
+  assert.equal(event.sensitiveEvent.timeSensitivity, "high");
+});
+
+test("elevated account-security context can request escalation without collapsing into harmful classification", () => {
+  const event = inferExample({
+    subject: "Security alert: suspicious sign-in detected",
+    body: "We noticed a new sign-in attempt from a device we do not recognize.",
+    primaryCategory: "security_phishing",
+    threatScore: 56,
+    urgencyScore: 72,
+    attentionType: "act_now",
+  });
+
+  expectPrimary(event, "login_alert");
+  assert.equal(event.sensitiveEvent.detected, true);
+  assert.equal(event.sensitiveEvent.routeHint, "escalate");
+  assert.equal(event.sensitiveEvent.timeSensitivity, "high");
 });
 
 test("recruiter reply without explicit recruiter keyword can still be inferred from sender and workflow cues", () => {
@@ -320,11 +340,13 @@ test("recruiter reply without explicit recruiter keyword can still be inferred f
 
   assert.ok(
     event.primaryEventType === "recruiter_reply" ||
+      event.primaryEventType === "interview_update" ||
       event.primaryEventType === "interview_scheduled" ||
       event.primaryEventType === "job_application_update"
   );
   assert.equal(event.sensitiveEvent.detected, true);
   assert.equal(event.sensitiveEvent.family, "career_workflow");
+  assert.ok(event.sensitiveEvent.mustNotMissScore >= 80);
 });
 
 test("new membership email becomes a sensitive lifecycle event", () => {
@@ -334,6 +356,38 @@ test("new membership email becomes a sensitive lifecycle event", () => {
     primaryCategory: "general",
     threatScore: 6,
     relevanceScore: 58,
+  });
+
+  expectPrimary(event, "subscription_created");
+  assert.equal(event.sensitiveEvent.detected, true);
+  assert.equal(event.sensitiveEvent.family, "membership_lifecycle");
+  assert.ok(event.secondaryTags.includes("new_membership"));
+  assert.ok(event.sensitiveEvent.mustNotMissScore >= 80);
+});
+
+test("payment declined becomes a billing-lifecycle event without collapsing into generic promo or harm", () => {
+  const event = inferExample({
+    subject: "Payment declined for your subscription",
+    body: "We could not process your payment. Update your billing details to keep service active.",
+    primaryCategory: "finance_payment",
+    threatScore: 18,
+    relevanceScore: 62,
+  });
+
+  expectPrimary(event, "payment_declined");
+  assert.equal(event.sensitiveEvent.detected, true);
+  assert.equal(event.sensitiveEvent.family, "billing_lifecycle");
+  assert.ok(event.secondaryTags.includes("billing_issue"));
+  assert.equal(event.sensitiveEvent.timeSensitivity, "high");
+});
+
+test("membership welcome language can still emit new_membership as the primary event", () => {
+  const event = inferExample({
+    subject: "Welcome to the member community",
+    body: "Your membership is confirmed and you joined as a new member today.",
+    primaryCategory: "general",
+    threatScore: 6,
+    relevanceScore: 54,
   });
 
   expectPrimary(event, "new_membership");
